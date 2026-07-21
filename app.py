@@ -17,7 +17,7 @@ st.markdown("""
        which is what actually supplies the blue fill + border seen before. */
     .stButton > button,
     div[data-testid="stButton"] button,
-    div[data-testid="stColumn"] button,
+    div[data-testid="column"] button,
     button[kind="secondary"],
     button[kind="secondaryFormSubmit"],
     button[class*="st-emotion-cache"],
@@ -27,70 +27,15 @@ st.markdown("""
         border: none !important;
         box-shadow: none !important;
         color: #888 !important;
-        font-size: 1.9rem !important;
-        padding: 4px 14px !important;
+        font-size: 1.5rem !important;
+        padding: 2px 8px !important;
         width: auto !important;
-        min-height: 2.6rem !important;
-        min-width: 2.6rem !important;
+        min-height: 0 !important;
         line-height: 1 !important;
-    }
-    /* Cover + title/artist/source block. The wrapping div is ours, so
-       track-card-source's inline-vs-block behavior is fully controlled by
-       our own CSS below — no dependency on Streamlit's internal DOM. */
-    .track-card-top {
-        display: flex;
-        align-items: center;
-        gap: 0.6rem;
-        margin-bottom: 0.15rem;
-    }
-    .track-card-top img {
-        border-radius: 4px;
-        flex-shrink: 0;
-    }
-    .track-card-text {
-        min-width: 0;
-    }
-    .track-card-title {
-        font-size: 0.95rem;
-        line-height: 1.3;
-    }
-    .track-card-source {
-        color: #888 !important;
-        font-size: 0.8rem !important;
-    }
-    /* Desktop (default): source stays on the same line as the title,
-       exactly like the very first version of this layout. */
-    .track-card-source {
-        display: inline;
-    }
-    /* Mobile: source drops to its own line under cover+title. */
-    @media (max-width: 640px) {
-        .track-card-source {
-            display: block;
-            margin-top: 0.1rem;
-        }
-    }
-    /* Play/add buttons live in a column nested inside another column
-       (text column vs. controls column). Streamlit auto-stacks columns
-       when their container gets narrow — that's exactly what we want for
-       the OUTER text-vs-controls split, but NOT for the inner play/add
-       pair, which must always sit side by side. Targeting "a horizontal
-       block nested inside a column" only ever matches that inner pair
-       (the outer split isn't itself inside a column), so this is safe
-       regardless of Streamlit version and doesn't rely on any
-       container(key=...) generated class name. */
-    div[data-testid="stColumn"] div[data-testid="stHorizontalBlock"] {
-        flex-wrap: nowrap !important;
-        gap: 0.3rem !important;
-    }
-    div[data-testid="stColumn"] div[data-testid="stColumn"] {
-        width: auto !important;
-        min-width: 0 !important;
-        flex: 0 0 auto !important;
     }
     .stButton > button:hover,
     div[data-testid="stButton"] button:hover,
-    div[data-testid="stColumn"] button:hover,
+    div[data-testid="column"] button:hover,
     button[kind="secondary"]:hover,
     button[class*="st-emotion-cache"]:hover {
         color: #ddd !important;
@@ -156,6 +101,10 @@ if 'recommendations' not in st.session_state:
     st.session_state['recommendations'] = []
 if 'last_loaded_playlist' not in st.session_state:
     st.session_state['last_loaded_playlist'] = ""
+if 'now_playing_key' not in st.session_state:
+    st.session_state['now_playing_key'] = None
+
+tab_enhance, tab_mix = st.tabs(["🎧 Playlist Enhancer", "🎨 Artist Mix"])
 
 
 def get_stream_url(track):
@@ -257,6 +206,229 @@ def get_top_tracks_for_artist(real_artist, limit=4, per_album_sample=2):
         return candidate_tracks[:limit]
 
 
+def render_track_row(track, idx, key_prefix, mode, current_playlist=None):
+    """
+    Shared row renderer used by both the Playlist Enhancer and Artist Mix
+    tabs: cover + play/pause + action button on one line, full-width track
+    info below, inline audio player if this track is the one playing.
+
+    mode='enhance': action button adds the track to `current_playlist` and
+        removes it from st.session_state['recommendations'].
+    mode='mix': action button removes the track from
+        st.session_state['artist_mix_result'] (no Plex write — just curating
+        the in-progress mix before saving it).
+    """
+    thumb_path = getattr(track, 'parentThumb', None) if getattr(track, 'parentThumb', None) else getattr(track, 'thumb', None)
+    artwork_url = f"{PLEX_URL.rstrip('/')}{thumb_path}?X-Plex-Token={PLEX_TOKEN}" if thumb_path else "https://unsplash.com"
+
+    art_col, play_col, action_col, spacer_col = st.columns([0.9, 0.9, 0.9, 3.3])
+
+    with art_col:
+        st.image(artwork_url, width=48)
+
+    with play_col:
+        is_playing = st.session_state['now_playing_key'] == track.ratingKey
+        # \uFE0E forces "text presentation" on these glyphs instead of the
+        # platform's colored emoji rendering, so they pick up the grey CSS
+        # color like the rest of the icons.
+        icon = "\u23F8\uFE0E" if is_playing else "\u25B6\uFE0E"  # ⏸︎ / ▶︎
+        if st.button(icon, key=f"play_{key_prefix}_{track.ratingKey}_{idx}"):
+            st.session_state['now_playing_key'] = None if is_playing else track.ratingKey
+            st.rerun()
+
+    with action_col:
+        if mode == 'enhance':
+            if st.button("\uFF0B", key=f"add_{key_prefix}_{track.ratingKey}_{idx}"):  # ＋
+                current_playlist.addItems([track])
+                st.session_state['recommendations'].pop(idx)
+                st.toast(f"Added: {track.title}")
+                st.rerun()
+        elif mode == 'mix':
+            if st.button("\u2715\uFE0E", key=f"remove_{key_prefix}_{track.ratingKey}_{idx}"):  # ✕︎
+                st.session_state['artist_mix_result'].pop(idx)
+                st.toast(f"Removed: {track.title}")
+                st.rerun()
+
+    rec_type = getattr(track, 'recommendation_type', 'Vibe Match')
+    match_pct = getattr(track, 'match_percent', None)
+    match_seed = getattr(track, 'match_seed', None)
+    if rec_type == 'Sonic Match' and match_pct is not None and match_seed:
+        rec_type_display = f"{rec_type} ({match_seed}: {match_pct}%)"
+    elif rec_type == 'Sonic Match' and match_pct is not None:
+        rec_type_display = f"{rec_type} ({match_pct}%)"
+    else:
+        rec_type_display = rec_type
+    artist_title = getattr(track, 'grandparentTitle', 'Unknown Artist')
+    album_title = getattr(track, 'parentTitle', 'Unknown Album')
+    st.markdown(
+        f"**{track.title}** — {artist_title} · *{album_title}* · `{rec_type_display}`",
+        help=None
+    )
+
+    if st.session_state['now_playing_key'] == track.ratingKey:
+        stream_url = get_stream_url(track)
+        if stream_url:
+            st.audio(stream_url, autoplay=True)
+        else:
+            st.warning("No playable audio found for this track.")
+
+    st.markdown("<hr style='margin:2px 0; opacity:0.15;'>", unsafe_allow_html=True)
+
+
+def build_artist_mix(artist, max_total=30, max_artist=10, max_related=2, max_sonic=2, debug=None):
+    """
+    Builds a varied mix centered on one artist:
+      1. A pool of up to `max_artist` tracks from the artist itself.
+      2. Sonic matches seeded from those tracks, capped at `max_sonic` per seed.
+      3. Tracks from related artists, capped at `max_related` per artist.
+      4. Rule 5: if the pool is still short of `max_total` after the caps
+         above, progressively relax the caps in order: sonic (4) → related
+         (3) → artist (2) — pulling more from whichever leftover candidates
+         are still available, round-robin across seeds/artists so it doesn't
+         just dump everything from a single seed/artist.
+    """
+    d = debug.write if debug else (lambda *a, **k: None)
+
+    try:
+        all_own_tracks = artist.tracks()
+    except Exception as e:
+        d(f"❌ Couldn't fetch tracks for {artist.title}: `{e}`")
+        all_own_tracks = []
+
+    random.shuffle(all_own_tracks)
+    selected_own = all_own_tracks[:max_artist]
+    leftover_own = all_own_tracks[max_artist:]
+
+    for t in selected_own:
+        setattr(t, 'recommendation_type', f'{artist.title} (Artist Pick)')
+
+    pool = {}
+    for t in selected_own:
+        rk = getattr(t, 'ratingKey', None)
+        if rk:
+            pool[rk] = t
+
+    d(f"**Artist tracks:** picked {len(selected_own)} of {len(all_own_tracks)} total.")
+
+    # --- Sonic matches, seeded from the artist's own picked tracks ---
+    sonic_by_seed = {}
+    for seed in selected_own:
+        seed_name = f"{getattr(seed, 'grandparentTitle', artist.title)} - {seed.title}"
+        try:
+            matches = seed.sonicallySimilar(limit=15)
+        except Exception as e:
+            d(f"└ ❌ Sonic lookup failed for `{seed_name}`: `{e}`")
+            continue
+        candidates = []
+        for m in matches:
+            rk = getattr(m, 'ratingKey', None)
+            if not rk or rk in pool:
+                continue
+            setattr(m, 'recommendation_type', 'Sonic Match')
+            setattr(m, 'match_percent', get_sonic_match_percent(m))
+            setattr(m, 'match_seed', seed_name)
+            candidates.append(m)
+        sonic_by_seed[rk if (rk := getattr(seed, 'ratingKey', None)) else seed_name] = candidates
+        d(f"└ ✅ `{seed_name}` → {len(candidates)} sonic candidates.")
+
+    initial_sonic = []
+    for cands in sonic_by_seed.values():
+        for t in cands[:max_sonic]:
+            rk = getattr(t, 'ratingKey', None)
+            if rk and rk not in pool:
+                pool[rk] = t
+                initial_sonic.append(t)
+
+    # --- Related artists ---
+    try:
+        similar_artists = artist.similar() if hasattr(artist, 'similar') else []
+        if callable(similar_artists):
+            similar_artists = similar_artists()
+    except Exception as e:
+        d(f"❌ Similar-artist fetch failed: `{e}`")
+        similar_artists = []
+
+    try:
+        music_section = next(s for s in plex.library.sections() if s.type in ['artist', 'music'])
+    except StopIteration:
+        music_section = None
+
+    related_by_artist = {}
+    for sim in (similar_artists or []):
+        name = getattr(sim, 'tag', None)
+        if not name or music_section is None:
+            continue
+        try:
+            found = music_section.searchArtists(title=name)
+            if not found:
+                continue
+            real_artist = found[0]
+            # Ask for more than max_related upfront so there's a reserve to
+            # draw from later if Rule 5 needs to relax this cap.
+            candidates = get_top_tracks_for_artist(real_artist, limit=max_related * 3 or 6, per_album_sample=2)
+            candidates = [t for t in candidates if getattr(t, 'ratingKey', None) not in pool]
+            for t in candidates:
+                setattr(t, 'recommendation_type', f'Related Artist ({real_artist.title})')
+            related_by_artist[real_artist.ratingKey] = candidates
+            d(f"└ ✅ Related artist `{real_artist.title}` → {len(candidates)} candidates.")
+        except Exception as e:
+            d(f"└ ❌ Related artist `{name}` failed: `{e}`")
+
+    for cands in related_by_artist.values():
+        for t in cands[:max_related]:
+            rk = getattr(t, 'ratingKey', None)
+            if rk and rk not in pool:
+                pool[rk] = t
+
+    d(f"**Pool after initial pass:** {len(pool)} tracks (target {max_total}).")
+
+    def _round_robin_fill(grouped_leftovers, needed):
+        added = []
+        queues = [list(v) for v in grouped_leftovers]
+        while needed > 0 and any(queues):
+            for q in queues:
+                if needed <= 0:
+                    break
+                while q:
+                    candidate = q.pop(0)
+                    rk = getattr(candidate, 'ratingKey', None)
+                    if rk and rk not in pool:
+                        pool[rk] = candidate
+                        added.append(candidate)
+                        needed -= 1
+                        break
+        return added
+
+    # Rule 5: relax order is sonic cap (4) → related cap (3) → artist cap (2)
+    if len(pool) < max_total:
+        needed = max_total - len(pool)
+        added = _round_robin_fill([c[max_sonic:] for c in sonic_by_seed.values()], needed)
+        d(f"**Rule 5, step A (relax sonic cap):** added {len(added)} more.")
+
+    if len(pool) < max_total:
+        needed = max_total - len(pool)
+        added = _round_robin_fill([c[max_related:] for c in related_by_artist.values()], needed)
+        d(f"**Rule 5, step B (relax related-artist cap):** added {len(added)} more.")
+
+    if len(pool) < max_total:
+        needed = max_total - len(pool)
+        added_count = 0
+        for t in leftover_own:
+            if needed <= 0:
+                break
+            rk = getattr(t, 'ratingKey', None)
+            if rk and rk not in pool:
+                setattr(t, 'recommendation_type', f'{artist.title} (Artist Pick)')
+                pool[rk] = t
+                needed -= 1
+                added_count += 1
+        d(f"**Rule 5, step C (relax artist cap):** added {added_count} more, pool now {len(pool)} tracks.")
+
+    final = list(pool.values())
+    random.shuffle(final)
+    return final[:max_total]
+
+
 def generate_playlist_vibe_recommendations(playlist, count=10):
     tracks = playlist.items()
     if not tracks: return []
@@ -321,13 +493,7 @@ def generate_playlist_vibe_recommendations(playlist, count=10):
                                         debug_box.write(f"  └ ℹ️ No album tracks found for {real_artist.title}.")
                                     for top_track in top_tracks:
                                         if getattr(top_track, 'ratingKey', None) and top_track.ratingKey not in existing_keys:
-                                            # NOTE: real_artist.title would always equal this track's own
-                                            # grandparentTitle (we pulled the track FROM real_artist's albums),
-                                            # so showing it here just echoes the artist column back at the user.
-                                            # What's actually useful is which artist in their playlist this
-                                            # was found similar to — that's the seed, not real_artist.
-                                            seed_artist_name = getattr(seed, 'grandparentTitle', 'Unknown Artist')
-                                            setattr(top_track, 'recommendation_type', f'Related Artist (like {seed_artist_name})')
+                                            setattr(top_track, 'recommendation_type', f'Related Artist ({real_artist.title})')
                                             raw_pool.append(top_track)
                         except Exception as e_inner:
                             debug_box.write(f"  └ ❌ Artist Fetch Failed for {getattr(sim_artist, 'tag', 'Unknown')}: `{str(e_inner)}`")
@@ -380,126 +546,141 @@ def generate_playlist_vibe_recommendations(playlist, count=10):
     return final_pool[:count]
 
 # --- UI DRAWING ---
-st.title("🎧 Recommended for this Playlist")
-st.caption("A streamlined recommendation drawer fueled by your server's Sonic Analysis and Plexamp Related Artist mappings.")
+with tab_enhance:
+    st.title("🎧 Recommended for this Playlist")
+    st.caption("A streamlined recommendation drawer fueled by your server's Sonic Analysis and Plexamp Related Artist mappings.")
 
-# Fetch your Plex Playlists
-all_playlists = [pl for pl in plex.playlists() if pl.playlistType == "audio"]
-playlist_names = [pl.title for pl in all_playlists]
+    # Fetch your Plex Playlists
+    all_playlists = [pl for pl in plex.playlists() if pl.playlistType == "audio"]
+    playlist_names = [pl.title for pl in all_playlists]
 
-if not playlist_names:
-    st.warning("No audio playlists found on your Plex server.")
-    st.stop()
+    if not playlist_names:
+        st.warning("No audio playlists found on your Plex server.")
+        st.stop()
 
-# NATIVE SEARCHABLE DROP-DOWN (clears itself after each pick so you don't
-# have to backspace the old name before typing a new search)
-if 'playlist_selector_key' not in st.session_state:
-    st.session_state['playlist_selector_key'] = 0
-if 'chosen_playlist_name' not in st.session_state:
-    st.session_state['chosen_playlist_name'] = playlist_names[0]
+    # NATIVE SEARCHABLE DROP-DOWN (clears itself after each pick so you don't
+    # have to backspace the old name before typing a new search)
+    if 'playlist_selector_key' not in st.session_state:
+        st.session_state['playlist_selector_key'] = 0
+    if 'chosen_playlist_name' not in st.session_state:
+        st.session_state['chosen_playlist_name'] = playlist_names[0]
 
-newly_selected = st.selectbox(
-    "Search and select a playlist to enhance:",
-    playlist_names,
-    index=None,
-    placeholder="Type to search for a playlist...",
-    key=f"playlist_search_{st.session_state['playlist_selector_key']}"
-)
+    newly_selected = st.selectbox(
+        "Search and select a playlist to enhance:",
+        playlist_names,
+        index=None,
+        placeholder="Type to search for a playlist...",
+        key=f"playlist_search_{st.session_state['playlist_selector_key']}"
+    )
 
-if newly_selected is not None and newly_selected != st.session_state['chosen_playlist_name']:
-    st.session_state['chosen_playlist_name'] = newly_selected
-    st.session_state['recommendations'] = []
-    st.session_state['last_loaded_playlist'] = newly_selected
-    # Bump the key so the widget remounts blank on the next run instead of
-    # keeping the just-picked name in the search field.
-    st.session_state['playlist_selector_key'] += 1
-    st.rerun()
+    if newly_selected is not None and newly_selected != st.session_state['chosen_playlist_name']:
+        st.session_state['chosen_playlist_name'] = newly_selected
+        st.session_state['recommendations'] = []
+        st.session_state['last_loaded_playlist'] = newly_selected
+        # Bump the key so the widget remounts blank on the next run instead of
+        # keeping the just-picked name in the search field.
+        st.session_state['playlist_selector_key'] += 1
+        st.rerun()
 
-selected_pl_name = st.session_state['chosen_playlist_name']
-st.caption(f"Currently enhancing: **{selected_pl_name}**")
-current_playlist = next(pl for pl in all_playlists if pl.title == selected_pl_name)
+    selected_pl_name = st.session_state['chosen_playlist_name']
+    st.caption(f"Currently enhancing: **{selected_pl_name}**")
+    current_playlist = next(pl for pl in all_playlists if pl.title == selected_pl_name)
 
-if not st.session_state['recommendations']:
-    with st.spinner("Analyzing playlist vibe..."):
-        st.session_state['recommendations'] = generate_playlist_vibe_recommendations(current_playlist, count=10)
+    if not st.session_state['recommendations']:
+        with st.spinner("Analyzing playlist vibe..."):
+            st.session_state['recommendations'] = generate_playlist_vibe_recommendations(current_playlist, count=10)
 
-if st.button("🔄 Refresh Recommendations"):
-    with st.spinner("Fetching fresh music..."):
-        st.session_state['recommendations'] = generate_playlist_vibe_recommendations(current_playlist, count=10)
-    st.rerun()
+    if st.button("🔄 Refresh Recommendations"):
+        with st.spinner("Fetching fresh music..."):
+            st.session_state['recommendations'] = generate_playlist_vibe_recommendations(current_playlist, count=10)
+        st.rerun()
 
-st.write("---")
+    st.write("---")
 
-rec_list = st.session_state['recommendations']
-if not rec_list:
-    st.info("No recommendations found matching this playlist vibe. Try adding more tracks.")
-else:
-    if 'now_playing_key' not in st.session_state:
-        st.session_state['now_playing_key'] = None
+    rec_list = st.session_state['recommendations']
+    if not rec_list:
+        st.info("No recommendations found matching this playlist vibe. Try adding more tracks.")
+    else:
+        for idx, track in enumerate(rec_list):
+            render_track_row(track, idx, key_prefix="enhance", mode="enhance", current_playlist=current_playlist)
 
-    for idx, track in enumerate(rec_list):
-        thumb_path = getattr(track, 'parentThumb', None) if getattr(track, 'parentThumb', None) else getattr(track, 'thumb', None)
-        artwork_url = f"{PLEX_URL.rstrip('/')}{thumb_path}?X-Plex-Token={PLEX_TOKEN}" if thumb_path else "https://unsplash.com"
 
-        # Row 1: cover + title/artist locked on the same line via flex CSS
-        # (column widths don't hold up on narrow screens, hence the raw HTML).
-        rec_type = getattr(track, 'recommendation_type', 'Vibe Match')
-        match_pct = getattr(track, 'match_percent', None)
-        match_seed = getattr(track, 'match_seed', None)
-        if rec_type == 'Sonic Match' and match_pct is not None and match_seed:
-            rec_type_display = f"{rec_type} ({match_seed}: {match_pct}%)"
-        elif rec_type == 'Sonic Match' and match_pct is not None:
-            rec_type_display = f"{rec_type} ({match_pct}%)"
-        else:
-            rec_type_display = rec_type
-        artist_title = getattr(track, 'grandparentTitle', 'Unknown Artist')
-        album_title = getattr(track, 'parentTitle', 'Unknown Album')
+# --- ARTIST MIX TAB ---
+with tab_mix:
+    st.title("🎨 Build an Artist Mix")
+    st.caption("Pulls tracks from one artist, blends in sonically similar tracks, and rounds it out with related artists.")
 
-        text_col, controls_col = st.columns([5, 2])
+    if 'artist_mix_result' not in st.session_state:
+        st.session_state['artist_mix_result'] = []
+    if 'artist_mix_search_key' not in st.session_state:
+        st.session_state['artist_mix_search_key'] = 0
+    if 'artist_mix_selected' not in st.session_state:
+        st.session_state['artist_mix_selected'] = None
 
-        with text_col:
-            st.markdown(
-                f"""
-                <div class="track-card-top">
-                    <img src="{artwork_url}" width="48" height="48">
-                    <div class="track-card-text">
-                        <span class="track-card-title"><b>{track.title}</b> — {artist_title}</span>
-                        <span class="track-card-source"> · <i>{album_title}</i> · <code>{rec_type_display}</code></span>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+    try:
+        mix_music_section = next(s for s in plex.library.sections() if s.type in ['artist', 'music'])
+    except StopIteration:
+        mix_music_section = None
+        st.error("No music library section found on this Plex server.")
 
-        with controls_col:
-            # Nested columns for play/add — forced to stay side by side via
-            # the CSS rule above, regardless of how narrow controls_col gets.
-            play_col, btn_add_col = st.columns([1, 1])
+    query = st.text_input(
+        "Search for an artist:",
+        key=f"artist_mix_query_{st.session_state['artist_mix_search_key']}",
+        placeholder="Start typing an artist name..."
+    )
 
-            with play_col:
-                is_playing = st.session_state['now_playing_key'] == track.ratingKey
-                # \uFE0E forces "text presentation" on these glyphs instead of
-                # the platform's colored emoji rendering, so they pick up the
-                # grey CSS color like the rest of the icons.
-                icon = "\u23F8\uFE0E" if is_playing else "\u25B6\uFE0E"  # ⏸︎ / ▶︎
-                if st.button(icon, key=f"play_{track.ratingKey}_{idx}"):
-                    # Toggle: clicking the currently-playing track stops it,
-                    # clicking any other track switches playback to it.
-                    st.session_state['now_playing_key'] = None if is_playing else track.ratingKey
-                    st.rerun()
+    matched_artists = []
+    if query and mix_music_section:
+        try:
+            matched_artists = mix_music_section.searchArtists(title=query)[:15]
+        except Exception as e:
+            st.error(f"Artist search failed: {e}")
 
-            with btn_add_col:
-                if st.button("\uFF0B", key=f"add_{track.ratingKey}_{idx}"):  # ＋ fullwidth plus, renders as plain text
-                    current_playlist.addItems([track])
-                    st.session_state['recommendations'].pop(idx)
-                    st.toast(f"Added: {track.title}")
-                    st.rerun()
+    if matched_artists:
+        artist_names = [a.title for a in matched_artists]
+        picked_name = st.selectbox("Matching artists:", artist_names, key="artist_mix_pick")
+        st.session_state['artist_mix_selected'] = next(a for a in matched_artists if a.title == picked_name)
+    elif query:
+        st.info("No matching artists found in your library.")
 
-        if st.session_state['now_playing_key'] == track.ratingKey:
-            stream_url = get_stream_url(track)
-            if stream_url:
-                st.audio(stream_url, autoplay=True)
-            else:
-                st.warning("No playable audio found for this track.")
+    selected_artist = st.session_state['artist_mix_selected']
 
-        st.markdown("<hr style='margin:2px 0; opacity:0.15;'>", unsafe_allow_html=True)
+    with st.expander("⚙️ Mix settings"):
+        max_total = st.number_input("Max songs total", min_value=1, max_value=200, value=30, key="mix_max_total")
+        max_artist = st.number_input("Max songs from selected artist", min_value=0, max_value=100, value=10, key="mix_max_artist")
+        max_related = st.number_input("Max songs per related artist", min_value=0, max_value=20, value=2, key="mix_max_related")
+        max_sonic = st.number_input("Max sonically similar songs per seed", min_value=0, max_value=20, value=2, key="mix_max_sonic")
+
+    if selected_artist:
+        st.write(f"Selected artist: **{selected_artist.title}**")
+        if st.button("🎛️ Build Mix"):
+            with st.spinner(f"Building a mix for {selected_artist.title}..."):
+                st.session_state['artist_mix_result'] = build_artist_mix(
+                    selected_artist,
+                    max_total=int(max_total),
+                    max_artist=int(max_artist),
+                    max_related=int(max_related),
+                    max_sonic=int(max_sonic),
+                    debug=debug_box
+                )
+            st.rerun()
+
+    st.write("---")
+
+    mix_list = st.session_state['artist_mix_result']
+    if not mix_list:
+        st.info("Search for an artist above and build a mix to see tracks here.")
+    else:
+        st.caption(f"{len(mix_list)} tracks — tap ✕ to drop one before saving.")
+        for idx, track in enumerate(mix_list):
+            render_track_row(track, idx, key_prefix="mix", mode="mix")
+
+        st.write("---")
+        default_name = f"{selected_artist.title} Mix" if selected_artist else "Artist Mix"
+        playlist_name = st.text_input("New playlist name:", value=default_name, key="artist_mix_playlist_name")
+        if st.button("💾 Save Mix as New Plex Playlist"):
+            try:
+                plex.createPlaylist(title=playlist_name, items=mix_list)
+                st.success(f"Created playlist '{playlist_name}' with {len(mix_list)} tracks.")
+            except Exception as e:
+                st.error(f"Failed to create playlist: {e}")
