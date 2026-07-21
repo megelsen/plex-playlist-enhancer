@@ -67,6 +67,50 @@ st.markdown("""
         margin-bottom: 0px !important;
         line-height: 1.3 !important;
     }
+
+    /* --- MOBILE ROW PINNING ---
+       Flexbox tricks (nowrap, flex-basis, fixed widths) kept losing to
+       Streamlit's own inline styles on the column divs, which is why
+       the add button kept vanishing off-screen instead of wrapping.
+       CSS Grid sidesteps that fight entirely: once the row container
+       is display:grid with explicit track sizes, the *tracks* control
+       each column's width regardless of any width/flex-basis Streamlit
+       puts inline on the column div itself — there's nothing left for
+       their responsive JS/CSS to override. render_track_row always
+       calls st.columns([8, 1, 1]) (content, play, add) — three tracks,
+       fixed here to match: a flexible content column plus two fixed
+       40px icon columns that never move regardless of screen width. */
+    div[data-testid="stHorizontalBlock"] {
+        display: grid !important;
+        grid-template-columns: 1fr 40px 40px !important;
+        align-items: center !important;
+        gap: 0.4rem !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+        width: auto !important;
+        min-width: 0 !important;
+        max-width: none !important;
+        flex: none !important;
+    }
+    /* Track title/artwork line: prevent long titles from wrapping or
+       pushing the play/add buttons out of the row; truncate instead. */
+    .track-row-text {
+        overflow: hidden !important;
+        white-space: nowrap !important;
+        text-overflow: ellipsis !important;
+        display: flex !important;
+        align-items: center !important;
+        gap: 0.5rem !important;
+    }
+    .track-row-text img {
+        flex: 0 0 auto !important;
+        border-radius: 3px;
+    }
+    .track-row-text span {
+        overflow: hidden !important;
+        white-space: nowrap !important;
+        text-overflow: ellipsis !important;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -221,10 +265,33 @@ def render_track_row(track, idx, key_prefix, mode, current_playlist=None):
     thumb_path = getattr(track, 'parentThumb', None) if getattr(track, 'parentThumb', None) else getattr(track, 'thumb', None)
     artwork_url = f"{PLEX_URL.rstrip('/')}{thumb_path}?X-Plex-Token={PLEX_TOKEN}" if thumb_path else "https://unsplash.com"
 
-    art_col, play_col, action_col, spacer_col = st.columns([0.9, 0.9, 0.9, 3.3])
+    rec_type = getattr(track, 'recommendation_type', 'Vibe Match')
+    match_pct = getattr(track, 'match_percent', None)
+    match_seed = getattr(track, 'match_seed', None)
+    if rec_type == 'Sonic Match' and match_pct is not None and match_seed:
+        rec_type_display = f"{rec_type} ({match_seed}: {match_pct}%)"
+    elif rec_type == 'Sonic Match' and match_pct is not None:
+        rec_type_display = f"{rec_type} ({match_pct}%)"
+    else:
+        rec_type_display = rec_type
+    artist_title = getattr(track, 'grandparentTitle', 'Unknown Artist')
+    album_title = getattr(track, 'parentTitle', 'Unknown Album')
 
-    with art_col:
-        st.image(artwork_url, width=48)
+    # Single flat row of sibling columns (no nesting) — artwork is
+    # embedded as inline HTML inside the text column rather than given
+    # its own st.columns slot, so there are only 3 columns total for
+    # Streamlit's flex engine to size instead of 4, and their widths
+    # (from the ratio below) always sum to exactly 100% of the row.
+    content_col, play_col, action_col = st.columns([8, 1, 1])
+
+    with content_col:
+        st.markdown(
+            f"""<div class="track-row-text">
+                <img src="{artwork_url}" width="40" height="40" />
+                <span><strong>{track.title}</strong> — {artist_title} · <em>{album_title}</em> · <code>{rec_type_display}</code></span>
+            </div>""",
+            unsafe_allow_html=True
+        )
 
     with play_col:
         is_playing = st.session_state['now_playing_key'] == track.ratingKey
@@ -248,22 +315,6 @@ def render_track_row(track, idx, key_prefix, mode, current_playlist=None):
                 st.session_state['artist_mix_result'].pop(idx)
                 st.toast(f"Removed: {track.title}")
                 st.rerun()
-
-    rec_type = getattr(track, 'recommendation_type', 'Vibe Match')
-    match_pct = getattr(track, 'match_percent', None)
-    match_seed = getattr(track, 'match_seed', None)
-    if rec_type == 'Sonic Match' and match_pct is not None and match_seed:
-        rec_type_display = f"{rec_type} ({match_seed}: {match_pct}%)"
-    elif rec_type == 'Sonic Match' and match_pct is not None:
-        rec_type_display = f"{rec_type} ({match_pct}%)"
-    else:
-        rec_type_display = rec_type
-    artist_title = getattr(track, 'grandparentTitle', 'Unknown Artist')
-    album_title = getattr(track, 'parentTitle', 'Unknown Album')
-    st.markdown(
-        f"**{track.title}** — {artist_title} · *{album_title}* · `{rec_type_display}`",
-        help=None
-    )
 
     if st.session_state['now_playing_key'] == track.ratingKey:
         stream_url = get_stream_url(track)
@@ -612,38 +663,57 @@ with tab_mix:
 
     if 'artist_mix_result' not in st.session_state:
         st.session_state['artist_mix_result'] = []
-    if 'artist_mix_search_key' not in st.session_state:
-        st.session_state['artist_mix_search_key'] = 0
-    if 'artist_mix_selected' not in st.session_state:
-        st.session_state['artist_mix_selected'] = None
+    if 'artist_mix_selector_key' not in st.session_state:
+        st.session_state['artist_mix_selector_key'] = 0
+    if 'chosen_artist_name' not in st.session_state:
+        st.session_state['chosen_artist_name'] = None
 
     try:
         mix_music_section = next(s for s in plex.library.sections() if s.type in ['artist', 'music'])
     except StopIteration:
         mix_music_section = None
         st.error("No music library section found on this Plex server.")
+        st.stop()
 
-    query = st.text_input(
-        "Search for an artist:",
-        key=f"artist_mix_query_{st.session_state['artist_mix_search_key']}",
-        placeholder="Start typing an artist name..."
+    @st.cache_data(show_spinner=False)
+    def _get_all_artist_names(_section, section_key):
+        # Leading underscore on `_section` tells st.cache_data to skip
+        # hashing the (unhashable) Plex object; `section_key` is the
+        # actual cache key so results still refresh per-library.
+        return sorted([a.title for a in _section.searchArtists()], key=str.lower)
+
+    with st.spinner("Loading artist library..."):
+        artist_names = _get_all_artist_names(mix_music_section, mix_music_section.key)
+
+    if not artist_names:
+        st.warning("No artists found in this music library.")
+        st.stop()
+
+    # NATIVE SEARCHABLE DROP-DOWN — same pattern as the playlist selector:
+    # one dialog, options filtered live as you type, and it clears itself
+    # after each pick so you don't have to backspace the old name first.
+    newly_selected_artist = st.selectbox(
+        "Search and select an artist:",
+        artist_names,
+        index=None,
+        placeholder="Type to search for an artist...",
+        key=f"artist_search_{st.session_state['artist_mix_selector_key']}"
     )
 
-    matched_artists = []
-    if query and mix_music_section:
-        try:
-            matched_artists = mix_music_section.searchArtists(title=query)[:15]
-        except Exception as e:
-            st.error(f"Artist search failed: {e}")
+    if newly_selected_artist is not None and newly_selected_artist != st.session_state['chosen_artist_name']:
+        st.session_state['chosen_artist_name'] = newly_selected_artist
+        st.session_state['artist_mix_result'] = []
+        st.session_state['artist_mix_selector_key'] += 1
+        st.rerun()
 
-    if matched_artists:
-        artist_names = [a.title for a in matched_artists]
-        picked_name = st.selectbox("Matching artists:", artist_names, key="artist_mix_pick")
-        st.session_state['artist_mix_selected'] = next(a for a in matched_artists if a.title == picked_name)
-    elif query:
-        st.info("No matching artists found in your library.")
-
-    selected_artist = st.session_state['artist_mix_selected']
+    selected_artist = None
+    if st.session_state['chosen_artist_name']:
+        matches = mix_music_section.searchArtists(title=st.session_state['chosen_artist_name'])
+        selected_artist = next(
+            (a for a in matches if a.title == st.session_state['chosen_artist_name']),
+            matches[0] if matches else None
+        )
+        st.caption(f"Selected artist: **{st.session_state['chosen_artist_name']}**")
 
     with st.expander("⚙️ Mix settings"):
         max_total = st.number_input("Max songs total", min_value=1, max_value=200, value=30, key="mix_max_total")
@@ -652,7 +722,6 @@ with tab_mix:
         max_sonic = st.number_input("Max sonically similar songs per seed", min_value=0, max_value=20, value=2, key="mix_max_sonic")
 
     if selected_artist:
-        st.write(f"Selected artist: **{selected_artist.title}**")
         if st.button("🎛️ Build Mix"):
             with st.spinner(f"Building a mix for {selected_artist.title}..."):
                 st.session_state['artist_mix_result'] = build_artist_mix(
