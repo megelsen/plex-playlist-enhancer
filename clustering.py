@@ -37,20 +37,21 @@ PROMPT_VERSION = 2
 GEMINI_TIMEOUT_SECONDS = 180
 GEMINI_MAX_RETRIES = 3
 
-# Cap on how many fully-untagged ("core-to-perimeter" refinement candidate)
-# artists get a similar-artist lookup per build — each candidate costs one
-# Plex API call, so this bounds worst-case runtime on very large libraries.
-# Candidates are prioritized by play count, so the most-listened untagged
-# artists get refined first if the library has more than this many.
-REFINE_MAX_ARTISTS = 200
+# Cap on how many fully-untagged ("Unsorted") tracks get a sonic-similarity
+# lookup per build — each candidate costs one Plex API call, so this bounds
+# worst-case runtime on very large libraries. Candidates are prioritized by
+# play count, so the most-listened untagged tracks get refined first if the
+# library has more Unsorted tracks than this.
+REFINE_MAX_TRACKS = 300
 
-# Minimum number of similar-artist neighbors that must agree on a cluster
-# before a fully-untagged artist gets reassigned out of "Unsorted". A single
-# matching neighbor was too weak a signal and was itself contributing to
-# clusters drifting broad/mixed — this (plus requiring a clear margin over
-# the runner-up cluster, enforced in refine_unsorted_via_similarity) makes
-# the refinement pass much more conservative.
-REFINE_MIN_NEIGHBOR_VOTES = 2
+# Minimum number of sonic neighbors that must agree on a cluster before an
+# Unsorted track gets reassigned, AND the minimum margin the winning
+# cluster's vote count must have over the runner-up. Both bars exist because
+# a single matching neighbor (or a narrow plurality) was too weak a signal
+# and was itself contributing to clusters drifting broad/mixed — e.g. one
+# odd similarity match dragging an unrelated track into the wrong cluster.
+REFINE_MIN_NEIGHBOR_VOTES = 3
+REFINE_MIN_VOTE_MARGIN = 2
 
 # Disk-based cache for the tag->cluster mapping, so it survives container
 # restarts/rebuilds (unlike st.cache_data, which is in-memory only and
@@ -547,27 +548,33 @@ def _blend_cluster_tracks(cluster_name, tracks_pool, music_section, plex, total_
     return combined[:total_n]
 
 
-def refine_unsorted_via_similarity(pools, all_artists, debug=None):
+def refine_unsorted_via_sonic_neighbors(pools, debug=None):
     """
-    "Core-to-perimeter" refinement pass: tag-based assignment alone leaves
-    some artists with zero usable genre/mood signal, and every one of their
-    tracks lands in "Unsorted" regardless of how well they'd actually fit a
-    real cluster. This pass fixes that using a signal tag-voting can't see —
-    Plex's "Similar Artist" links — without any extra Gemini calls.
+    Extrapolates genre/mood for "Unsorted" tracks from Plex's sonic
+    similarity data directly, instead of relying only on genre/mood tags —
+    this is the actual "sonic analysis" signal (Plex's own audio fingerprint
+    matching), not artist-metadata similarity.
 
-    1. "Core": any artist with at least one track that landed in a real
-       (non-Unsorted) cluster gets a confident label — the majority cluster
-       among that artist's own already-assigned tracks.
-    2. "Periphery": artists with NO tracks in any real cluster (fully
-       Unsorted) are the refinement candidates.
-    3. For each periphery artist (capped at REFINE_MAX_ARTISTS, prioritized
-       by play count), look at their Plex similar-artist neighbors. If any
-       neighbors are core artists, move this artist's tracks out of
-       "Unsorted" into the majority cluster among those neighbors.
+    Deliberately operates per TRACK, not per artist: the earlier
+    artist-level approach (moving an artist's entire catalog based on
+    "Similar Artist" links) was too coarse — Plex's similarity web can
+    surface a handful of odd/crossover neighbors for any given artist, and
+    reassigning the WHOLE discography on that basis is how things like an
+    Eminem track ending up in a Metal cluster happen. Per-track voting
+    means one noisy neighbor can't drag an artist's entire catalog anywhere;
+    each track has to earn its own reassignment.
 
-    Mutates and returns `pools` in place. Artists with no core neighbors at
-    all remain in "Unsorted" — this only recovers cases where the
-    similarity graph actually has something to go on.
+    For each Unsorted track (capped at REFINE_MAX_TRACKS, prioritized by
+    play count): fetch its sonicallySimilar() neighbors, tally which
+    cluster each neighbor's OWN track already confidently belongs to (only
+    counting non-Unsorted neighbors), and only reassign if:
+      - at least REFINE_MIN_NEIGHBOR_VOTES neighbors agree, AND
+      - the winning cluster has a clear margin over the runner-up
+        (stricter than a simple plurality — ties or near-ties don't count).
+
+    Mutates and returns `pools` in place. Tracks with no strong neighbor
+    consensus stay in "Unsorted" — this only recovers cases where the
+    sonic-similarity graph gives genuinely confident, converging evidence.
     """
     d = debug.write if debug else (lambda *a, **k: None)
 
@@ -579,65 +586,29 @@ def refine_unsorted_via_similarity(pools, all_artists, debug=None):
         for t in tracks:
             track_cluster_by_key[getattr(t, 'ratingKey', None)] = cluster_name
 
-    artist_known_cluster = {}
-    artist_all_unsorted_keys = set()
-    artist_tracks_by_key = {}
-    for artist in all_artists:
-        rk = getattr(artist, 'ratingKey', None)
-        if rk is None:
-            continue
-        try:
-            a_tracks = artist.tracks()
-        except Exception:
-            continue
-        artist_tracks_by_key[rk] = a_tracks
-        votes = defaultdict(int)
-        for t in a_tracks:
-            c = track_cluster_by_key.get(getattr(t, 'ratingKey', None))
-            if c and c != "Unsorted":
-                votes[c] += 1
-        if votes:
-            artist_known_cluster[rk] = max(votes, key=votes.get)
-        else:
-            artist_all_unsorted_keys.add(rk)
+    unsorted_tracks = pools["Unsorted"]
+    candidates = sorted(unsorted_tracks, key=lambda t: getattr(t, 'viewCount', 0) or 0, reverse=True)
+    if len(candidates) > REFINE_MAX_TRACKS:
+        d(f"**Sonic-neighbor refinement:** capping to the {REFINE_MAX_TRACKS} most-played "
+          f"of {len(candidates)} Unsorted tracks.")
+        candidates = candidates[:REFINE_MAX_TRACKS]
+    else:
+        d(f"**Sonic-neighbor refinement:** checking sonic neighbors for {len(candidates)} Unsorted tracks.")
 
-    if not artist_all_unsorted_keys:
-        return pools
-
-    # O(1) neighbor lookup by title instead of re-scanning all_artists per
-    # candidate — built once up front.
-    title_to_known_cluster = {
-        a.title.lower(): artist_known_cluster[a.ratingKey]
-        for a in all_artists
-        if getattr(a, 'ratingKey', None) in artist_known_cluster
-    }
-
-    d(f"**Core-to-perimeter refinement:** {len(artist_all_unsorted_keys)} artists have no direct "
-      f"genre/mood signal at all — checking similar artists for a confident neighbor label.")
-
-    candidates = [a for a in all_artists if getattr(a, 'ratingKey', None) in artist_all_unsorted_keys]
-    candidates = sorted(candidates, key=lambda a: getattr(a, 'viewCount', 0) or 0, reverse=True)
-    if len(candidates) > REFINE_MAX_ARTISTS:
-        d(f"└ Capping refinement to the {REFINE_MAX_ARTISTS} most-played of these artists.")
-        candidates = candidates[:REFINE_MAX_ARTISTS]
-
+    reassigned = defaultdict(list)  # new_cluster -> [tracks moved into it]
     refined_count = 0
-    for artist in candidates:
-        rk = artist.ratingKey
+
+    for track in candidates:
         try:
-            similar_attr = getattr(artist, 'similar', None)
-            similar = similar_attr() if callable(similar_attr) else (similar_attr or [])
+            matches = track.sonicallySimilar(limit=20)
         except Exception:
             continue
 
         neighbor_votes = defaultdict(int)
-        for sim in (similar or []):
-            name = getattr(sim, 'tag', None)
-            if not name:
-                continue
-            known_cluster = title_to_known_cluster.get(name.lower())
-            if known_cluster:
-                neighbor_votes[known_cluster] += 1
+        for m in matches:
+            neighbor_cluster = track_cluster_by_key.get(getattr(m, 'ratingKey', None))
+            if neighbor_cluster and neighbor_cluster != "Unsorted":
+                neighbor_votes[neighbor_cluster] += 1
 
         if not neighbor_votes:
             continue
@@ -646,22 +617,25 @@ def refine_unsorted_via_similarity(pools, all_artists, debug=None):
         top_votes = sorted_votes[0]
         runner_up_votes = sorted_votes[1] if len(sorted_votes) > 1 else 0
 
-        # Require real consensus, not a single lucky match: at least 2
-        # neighbors voting for the same cluster, AND a clear margin over
-        # whatever the second-place cluster got. A single matching neighbor
-        # was too weak a signal and was itself contributing to clusters
-        # drifting broad/mixed.
-        if top_votes < REFINE_MIN_NEIGHBOR_VOTES or top_votes <= runner_up_votes:
+        # Stricter than the old artist-level version: more neighbors
+        # required, and the winner must clear the runner-up by a real
+        # margin (not just "one more vote") before a single track earns
+        # reassignment out of Unsorted.
+        if top_votes < REFINE_MIN_NEIGHBOR_VOTES or top_votes < runner_up_votes + REFINE_MIN_VOTE_MARGIN:
             continue
 
         new_cluster = max(neighbor_votes, key=neighbor_votes.get)
-        moved_tracks = artist_tracks_by_key.get(rk, [])
-        moved_keys = {getattr(t, 'ratingKey', None) for t in moved_tracks}
-        pools["Unsorted"] = [t for t in pools["Unsorted"] if getattr(t, 'ratingKey', None) not in moved_keys]
-        pools.setdefault(new_cluster, []).extend(moved_tracks)
+        reassigned[new_cluster].append(track)
         refined_count += 1
 
-    d(f"└ Reassigned {refined_count} of {len(candidates)} checked artists via similar-artist neighbor signal.")
+    if reassigned:
+        moved_keys = {getattr(t, 'ratingKey', None) for tracks in reassigned.values() for t in tracks}
+        pools["Unsorted"] = [t for t in pools["Unsorted"] if getattr(t, 'ratingKey', None) not in moved_keys]
+        for cluster_name, tracks in reassigned.items():
+            pools.setdefault(cluster_name, []).extend(tracks)
+
+    d(f"└ Reassigned {refined_count} of {len(candidates)} checked tracks via sonic-neighbor consensus "
+      f"(min {REFINE_MIN_NEIGHBOR_VOTES} votes, margin \u2265{REFINE_MIN_VOTE_MARGIN}).")
     return pools
 
 
@@ -733,7 +707,7 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
         d(f"└ `{cluster}`: {len(tracks)} tracks pooled.")
 
     if refine_unsorted and not dry_run:
-        pools = refine_unsorted_via_similarity(pools, all_artists, debug=debug)
+        pools = refine_unsorted_via_sonic_neighbors(pools, debug=debug)
 
     results = {}
     for cluster_name in clusters + (["Unsorted"] if "Unsorted" in pools else []):

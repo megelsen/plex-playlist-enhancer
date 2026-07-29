@@ -7,6 +7,7 @@ cluster as a playlist."""
 import streamlit as st
 
 from clustering import build_genre_clusters, get_all_genre_and_mood_tags, suggest_cluster_names
+from file_tags import diagnose_unsorted_tracks
 from ui_components import render_track_row
 
 
@@ -83,14 +84,15 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         )
 
         refine_unsorted = st.checkbox(
-            "Refine 'Unsorted' via similar artists (core-to-perimeter)", value=True,
+            "Refine 'Unsorted' via sonic similarity", value=True,
         )
         st.caption(
-            "Artists with zero genre/mood tags at all normally land entirely in "
-            "'Unsorted'. This checks their Plex 'Similar Artist' neighbors — if any "
-            "neighbors already have a confident cluster, this artist adopts the "
-            "majority label among them instead. No extra Gemini calls, just local "
-            "Plex lookups."
+            "Extrapolates genre/mood for 'Unsorted' tracks from Plex's own sonic-similarity "
+            "analysis instead of tags. Works per-track (not per-artist), and only reassigns a "
+            "track when at least 3 sonic neighbors agree with a clear margin \u2014 stricter than "
+            "before, since one noisy 'similar artist' match was previously enough to pull an "
+            "unrelated track (e.g. a hip-hop track landing in a Metal cluster) into the wrong "
+            "place. No extra Gemini calls, just local Plex lookups."
         )
 
     locked_clusters = [c.strip() for c in locked_input.split(",") if c.strip()]
@@ -196,3 +198,43 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                         st.success(f"Created playlist '{save_name}' with {len(tracks)} tracks.")
                     except Exception as e:
                         st.error(f"Failed to create playlist: {e}")
+
+                if cluster_name == "Unsorted":
+                    st.write("---")
+                    st.caption(
+                        "🔍 Diagnose why these tracks landed here — checks each file's own "
+                        "embedded genre/mood tags directly, bypassing Plex's database. "
+                        "Requires this app to have filesystem access to your music files "
+                        "(mount your library path into the container to enable this)."
+                    )
+                    if st.button("🔍 Inspect embedded file tags", key="inspect_unsorted_tags"):
+                        with st.spinner("Reading embedded tags from audio files..."):
+                            diagnostics = diagnose_unsorted_tracks(tracks, max_tracks=50)
+
+                        has_tags = [d for d in diagnostics if d["diagnosis"] == "has_embedded_tags"]
+                        no_tags = [d for d in diagnostics if d["diagnosis"] == "no_embedded_tags"]
+                        unreadable = [d for d in diagnostics if d["diagnosis"] == "unreadable"]
+
+                        if unreadable and len(unreadable) == len(diagnostics):
+                            st.error(
+                                f"Couldn't read any of these {len(diagnostics)} files — this app likely "
+                                f"doesn't have filesystem access to your music library. Example error: "
+                                f"`{unreadable[0]['error']}`"
+                            )
+                        else:
+                            if has_tags:
+                                st.warning(
+                                    f"**{len(has_tags)} tracks have embedded genre/mood Plex isn't showing** "
+                                    f"— try a metadata refresh in Plex for these instead of re-tagging:"
+                                )
+                                for d in has_tags:
+                                    st.write(f"- **{d['title']}** — {d['artist']} → genre: `{d['embedded_genre'] or '—'}`, mood: `{d['embedded_mood'] or '—'}`")
+                            if no_tags:
+                                st.info(
+                                    f"**{len(no_tags)} tracks genuinely have no genre/mood embedded** "
+                                    f"— these need tagging via Picard or manually in Plex:"
+                                )
+                                for d in no_tags:
+                                    st.write(f"- **{d['title']}** — {d['artist']}")
+                            if unreadable:
+                                st.caption(f"{len(unreadable)} file(s) couldn't be opened (see errors above/mount issue).")
