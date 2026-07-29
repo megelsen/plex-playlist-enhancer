@@ -83,15 +83,17 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         )
 
         refine_unsorted = st.checkbox(
-            "Refine 'Unsorted' via sonic similarity", value=True,
+            "Refine 'Unsorted' via sonic similarity", value=False,
         )
         st.caption(
             "Extrapolates genre/mood for 'Unsorted' tracks from Plex's own sonic-similarity "
-            "analysis instead of tags. Works per-track (not per-artist), and only reassigns a "
-            "track when at least 3 sonic neighbors agree with a clear margin \u2014 stricter than "
-            "before, since one noisy 'similar artist' match was previously enough to pull an "
-            "unrelated track (e.g. a hip-hop track landing in a Metal cluster) into the wrong "
-            "place. No extra Gemini calls, just local Plex lookups."
+            "analysis instead of tags. Off by default \u2014 sonic similarity is a much noisier "
+            "signal than genre tags, so even with a strict bar (6+ neighbors agreeing, a clear "
+            "margin, and a real majority share of votes) it can still occasionally misplace a "
+            "track (e.g. a loud folk-rock song getting pulled toward an unrelated aggressive-"
+            "sounding cluster). Turn on only if you'd rather have fewer, better-justified "
+            "reassignments than a fully accurate 'Unsorted' bucket. No extra Gemini calls, "
+            "just local Plex lookups."
         )
 
     locked_clusters = [c.strip() for c in locked_input.split(",") if c.strip()]

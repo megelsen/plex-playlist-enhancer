@@ -29,7 +29,7 @@ DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 # that would produce different results for the same tag list. Included in
 # the cache key so a prompt fix takes effect immediately without requiring
 # the user to manually click "Force Re-map Genres".
-PROMPT_VERSION = 2
+PROMPT_VERSION = 3
 
 # Gemini can take a while on larger tag lists (bigger prompt = longer
 # generation), so give it real headroom rather than the default requests
@@ -48,10 +48,19 @@ REFINE_MAX_TRACKS = 300
 # Unsorted track gets reassigned, AND the minimum margin the winning
 # cluster's vote count must have over the runner-up. Both bars exist because
 # a single matching neighbor (or a narrow plurality) was too weak a signal
-# and was itself contributing to clusters drifting broad/mixed — e.g. one
-# odd similarity match dragging an unrelated track into the wrong cluster.
-REFINE_MIN_NEIGHBOR_VOTES = 3
-REFINE_MIN_VOTE_MARGIN = 2
+# and was itself contributing to clusters drifting broad/mixed — e.g. a
+# folk-rock track with a loud/driving arrangement getting pulled into an
+# unrelated "aggressive" cluster on a handful of superficial sonic matches.
+# These are intentionally strict: sonic similarity is a much noisier signal
+# than genre tags, so extrapolation from it should be the exception, not
+# the default outcome, for any given Unsorted track.
+REFINE_MIN_NEIGHBOR_VOTES = 6
+REFINE_MIN_VOTE_MARGIN = 4
+# Winning cluster must also account for a real majority of ALL neighbor
+# votes cast (not just beat the runner-up), so a track with scattered,
+# inconclusive sonic matches doesn't get forced into whichever cluster
+# happened to get slightly more hits.
+REFINE_MIN_VOTE_SHARE = 0.6
 
 # Disk-based cache for the tag->cluster mapping, so it survives container
 # restarts/rebuilds (unlike st.cache_data, which is in-memory only and
@@ -191,6 +200,23 @@ CRITICAL RULES for assigning tags to clusters:
    items just because you're running short on distinct clusters.
 4. Every single tag below (genre and mood) must be assigned to exactly one
    of the {total_clusters} final cluster names. No tag left unassigned.
+5. Be conservative with invented mood/vibe cluster names (e.g. "Power &
+   Edge", "High Energy"). Only put a genre tag in such a cluster if that
+   ENTIRE genre family is unambiguously that vibe (e.g. "Death Metal" or
+   "Grindcore" really is inherently aggressive/high-energy). Do NOT put a
+   genre tag there just because SOME artists or songs in that genre can
+   sound powerful/energetic — genres like Folk Rock, Pop Rock, Anthemic
+   Indie, or Singer-Songwriter have plenty of loud/driving moments but are
+   NOT inherently "power/edge" as a genre family, and belong with their own
+   genre cluster instead. When genuinely unsure whether a tag belongs in a
+   vague vibe cluster vs. its own genre family, choose the genre family —
+   a clear, narrow cluster beats a vague one that quietly absorbs unrelated
+   music.
+6. Avoid inventing two-word abstract-adjective cluster names (e.g. "Power &
+   Edge", "Deep & Dark") unless the tag list genuinely has no better,
+   clearer organizing concept — these vague names are the most likely to
+   accidentally sweep in mismatched genres. Prefer a specific genre-family
+   or single, well-defined mood name where one fits.
 
 Genre tags to classify:
 {genre_tags}
@@ -616,12 +642,17 @@ def refine_unsorted_via_sonic_neighbors(pools, debug=None):
         sorted_votes = sorted(neighbor_votes.values(), reverse=True)
         top_votes = sorted_votes[0]
         runner_up_votes = sorted_votes[1] if len(sorted_votes) > 1 else 0
+        total_votes = sum(neighbor_votes.values())
+        vote_share = top_votes / total_votes if total_votes else 0
 
-        # Stricter than the old artist-level version: more neighbors
-        # required, and the winner must clear the runner-up by a real
-        # margin (not just "one more vote") before a single track earns
-        # reassignment out of Unsorted.
-        if top_votes < REFINE_MIN_NEIGHBOR_VOTES or top_votes < runner_up_votes + REFINE_MIN_VOTE_MARGIN:
+        # Three independent bars, all must pass: enough absolute votes,
+        # a real margin over the runner-up, AND a real majority share of
+        # all votes cast — sonic similarity is noisy enough that a track
+        # should only get pulled out of Unsorted on genuinely convergent
+        # evidence, not a narrow plurality among scattered matches.
+        if (top_votes < REFINE_MIN_NEIGHBOR_VOTES
+                or top_votes < runner_up_votes + REFINE_MIN_VOTE_MARGIN
+                or vote_share < REFINE_MIN_VOTE_SHARE):
             continue
 
         new_cluster = max(neighbor_votes, key=neighbor_votes.get)

@@ -118,7 +118,7 @@ def render_galaxy_figure(graph, tag_mapping=None, group_by_cluster=True):
                 # drawing cluster members toward their shared hub without
                 # fully overriding the real similarity edges (which get the
                 # default weight of 1).
-                layout_graph.add_edge(hub_id, n, weight=2.5)
+                layout_graph.add_edge(hub_id, n, weight=6.0)
         raw_pos = nx.spring_layout(layout_graph, dim=3, weight='weight', seed=42)
         pos = {n: raw_pos[n] for n in graph.nodes()}  # drop hub-only positions
     else:
