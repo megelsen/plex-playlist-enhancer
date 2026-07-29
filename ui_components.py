@@ -17,11 +17,13 @@ def render_track_row(track, idx, key_prefix, mode, plex_url, plex_token, current
     mode='mix': action button removes the track from
         st.session_state['artist_mix_result'] (no Plex write — just curating
         the in-progress mix before saving it).
-    mode='cluster': action button removes the track from
-        st.session_state['cluster_results'][cluster_name] (requires
-        cluster_name) — same "drop a track that doesn't fit before saving"
-        idea as mix mode, scoped to one cluster's list so removing from one
-        cluster's tab can't touch any other cluster's tracks.
+    mode='cluster': action button records the track's ratingKey in
+        st.session_state['cluster_removed_keys'][cluster_name] (requires
+        cluster_name) instead of popping it from a results list directly —
+        the Library Clusters tab recomputes its merged view fresh from the
+        raw fine-grained build plus the current merge plan on every run, so
+        a direct pop would get silently undone; tracking removed keys
+        separately lets them persist across merge-plan changes too.
     mode='view': read-only row — no destructive action, action_col stays
         empty so layout still lines up with play_col.
     """
@@ -80,7 +82,7 @@ def render_track_row(track, idx, key_prefix, mode, plex_url, plex_token, current
                 st.rerun()
         elif mode == 'cluster':
             if st.button("\u2715\uFE0E", key=f"remove_{key_prefix}_{track.ratingKey}_{idx}"):  # ✕︎
-                st.session_state['cluster_results'][cluster_name].pop(idx)
+                st.session_state.setdefault('cluster_removed_keys', {}).setdefault(cluster_name, set()).add(track.ratingKey)
                 st.toast(f"Removed: {track.title}")
                 st.rerun()
         elif mode == 'view':

@@ -148,16 +148,26 @@ def get_all_genre_and_mood_tags(music_section):
 def build_tag_cluster_mapping(genre_tags, mood_tags, locked_clusters, total_clusters, api_key, model=None,
                                timeout=GEMINI_TIMEOUT_SECONDS, max_retries=GEMINI_MAX_RETRIES):
     """
-    One Gemini call that both (a) invents the remaining cluster names beyond
-    the ones the user locked in, and (b) maps every genre AND mood tag to
-    exactly one of the final cluster names. Returns (cluster_names,
+    One Gemini call that both (a) determines the cluster names (locked ones
+    kept as-is, others invented/derived), and (b) maps every genre AND mood
+    tag to exactly one final cluster name. Returns (cluster_names,
     tag_to_cluster dict) — the dict has both genre and mood tag strings as
     keys, so callers don't need to know which kind a tag was.
 
     locked_clusters: list of cluster names the user wants kept as-is, e.g.
         ["Metal", "Fast Paced"] — these are NOT genre tags themselves, they're
-        the target buckets; Gemini must still decide which raw tags fall
-        under them.
+        target buckets that must exist if relevant tags are found for them.
+
+    total_clusters: int for a FIXED total count, or None for "auto/natural"
+        mode. Auto mode is the recommended default — a small fixed count
+        forces broad umbrella buckets to fit everything in, which is
+        exactly what causes unrelated artists to get swept into the wrong
+        cluster (e.g. an electropop artist landing in "Punk Rock" because
+        the model had to cram everything into too few buckets). Auto mode
+        instead asks Gemini to produce as many narrow, genre-coherent
+        clusters as the actual tag list warrants — a library with real
+        Metal, Punk, and Classic Rock content should get three separate
+        clusters, not one umbrella forced by a count ceiling.
 
     timeout: seconds to wait for a response before retrying. Defaults to
         GEMINI_TIMEOUT_SECONDS (180s) since a large genre+mood tag list can
@@ -168,55 +178,78 @@ def build_tag_cluster_mapping(genre_tags, mood_tags, locked_clusters, total_clus
         again.
     """
     model = model or DEFAULT_GEMINI_MODEL
-    remaining = max(total_clusters - len(locked_clusters), 0)
+    auto_mode = total_clusters is None
 
-    prompt = f"""You are organizing a music library into exactly {total_clusters} clusters.
-Clusters can represent genre families, moods/vibes, or both — whatever best
-groups the tags below.
+    if auto_mode:
+        count_instruction = f"""These {len(locked_clusters)} cluster names are FIXED and must be used exactly
+as given, if any tags genuinely belong under them:
+{locked_clusters}
 
-These {len(locked_clusters)} cluster names are FIXED and must be used exactly as given:
+Beyond those, determine the NATURAL number of additional clusters yourself
+based on what's actually in the tag list below — do not force a small,
+predetermined count. It is normal and expected to end up with anywhere from
+about 8 to 25+ clusters total for a real music library. Err strongly toward
+MORE, NARROWER clusters rather than fewer broad ones: if the library has
+real Metal, Punk, and Classic Rock content, those should be three separate
+clusters, not one "Rock/Metal/Punk" umbrella. Only merge things into one
+cluster when they are genuinely the same genre family (e.g. Black Metal +
+Death Metal + Thrash + Doom Metal can all be one "Metal" cluster — but
+Metal and Punk must NOT be merged just to reduce the total count)."""
+    else:
+        remaining = max(total_clusters - len(locked_clusters), 0)
+        count_instruction = f"""You are organizing a music library into exactly {total_clusters} clusters
+total.
+
+These {len(locked_clusters)} cluster names are FIXED and must be used exactly
+as given:
 {locked_clusters}
 
 Invent {remaining} additional cluster name(s) that best cover the remaining
-tags below (genre families or moods not covered by the fixed clusters).
+tags below (genre families or moods not covered by the fixed clusters)."""
+
+    prompt = f"""You are organizing a music library's genre and mood tags into clusters.
+Clusters can represent genre families, moods/vibes, or both — whatever best
+groups the tags below.
+
+{count_instruction}
 
 CRITICAL RULES for assigning tags to clusters:
 1. Group a genre with ALL of its subgenres, styles, and variants under one
-   umbrella. For example, if a cluster is "Metal", every metal-family tag —
-   metalcore, black metal, death metal, doom metal, nu-metal, thrash,
-   classic metal, mainstream/commercial metal, etc. — belongs in "Metal",
-   not spread across other clusters. The same applies to any other broad
-   genre family (Rock, Indie, Folk, Electronic, etc.): sweep in every
-   stylistic variant of that family.
+   umbrella ONLY when they are truly the same family. For example, if a
+   cluster is "Metal", every metal-family tag — metalcore, black metal,
+   death metal, doom metal, nu-metal, thrash, classic metal, etc. — belongs
+   in "Metal". But do NOT extend this to merging genuinely distinct
+   families (Metal ≠ Punk ≠ Classic Rock ≠ Indie Rock) just to reduce the
+   cluster count — keep genuinely distinct genre families in their own
+   clusters.
 2. Do NOT cluster or split tags by nationality, region, or language
    (e.g. "German", "Turkish", "Korean", "French") unless one of the FIXED
    cluster names explicitly asks for that. A tag like "German Rock" belongs
-   with other Rock tags in the Rock/umbrella cluster, not grouped with
-   unrelated genres just because they share a nationality modifier or a
-   vaguely similar-sounding name.
+   with other Rock tags in the Rock cluster, not grouped with unrelated
+   genres just because they share a nationality modifier.
 3. Mood tags (e.g. "Aggressive", "Chill", "Melancholic", "Upbeat") describe
    vibe, not genre — only group two mood tags together, or a mood with a
    genre, if they are actually thematically related. Do not merge unrelated
    items just because you're running short on distinct clusters.
 4. Every single tag below (genre and mood) must be assigned to exactly one
-   of the {total_clusters} final cluster names. No tag left unassigned.
-5. Be conservative with invented mood/vibe cluster names (e.g. "Power &
-   Edge", "High Energy"). Only put a genre tag in such a cluster if that
+   final cluster name. No tag left unassigned.
+5. Be very conservative with invented mood/vibe cluster names (e.g. "Power
+   & Edge", "High Energy"). Only put a genre tag in such a cluster if that
    ENTIRE genre family is unambiguously that vibe (e.g. "Death Metal" or
    "Grindcore" really is inherently aggressive/high-energy). Do NOT put a
    genre tag there just because SOME artists or songs in that genre can
    sound powerful/energetic — genres like Folk Rock, Pop Rock, Anthemic
-   Indie, or Singer-Songwriter have plenty of loud/driving moments but are
-   NOT inherently "power/edge" as a genre family, and belong with their own
-   genre cluster instead. When genuinely unsure whether a tag belongs in a
-   vague vibe cluster vs. its own genre family, choose the genre family —
-   a clear, narrow cluster beats a vague one that quietly absorbs unrelated
-   music.
+   Indie, Electropop, or Singer-Songwriter have plenty of loud/driving
+   moments but are NOT inherently "power/edge" as a genre family, and
+   belong with their own genre cluster instead. When genuinely unsure
+   whether a tag belongs in a vague vibe cluster vs. its own genre family,
+   choose the genre family — a clear, narrow cluster beats a vague one
+   that quietly absorbs unrelated music.
 6. Avoid inventing two-word abstract-adjective cluster names (e.g. "Power &
    Edge", "Deep & Dark") unless the tag list genuinely has no better,
    clearer organizing concept — these vague names are the most likely to
    accidentally sweep in mismatched genres. Prefer a specific genre-family
-   or single, well-defined mood name where one fits.
+   name where one fits.
 
 Genre tags to classify:
 {genre_tags}
@@ -227,7 +260,7 @@ Mood tags to classify:
 Respond with ONLY a JSON object in this exact shape, nothing else, no markdown
 fences, no commentary:
 {{
-  "clusters": ["Cluster1", "Cluster2", ...],   // all {total_clusters} final names
+  "clusters": ["Cluster1", "Cluster2", ...],   // all final cluster names, in any order
   "mapping": {{"tag1": "Cluster1", "tag2": "Cluster2", ...}}  // every genre AND mood tag
 }}"""
 
@@ -394,7 +427,11 @@ def build_dry_run_mapping(genre_tags, mood_tags, locked_clusters, total_clusters
     real build_tag_cluster_mapping (via the normal Build/Refresh flow) once
     you're ready to see real results.
     """
-    remaining = max(total_clusters - len(locked_clusters), 0)
+    # Auto mode has no fixed count to divide by — dry run doesn't need to
+    # simulate "natural" clustering quality, so just pick a small arbitrary
+    # filler count (enough to exercise the pipeline, not meant to be good).
+    effective_total = total_clusters if total_clusters is not None else len(locked_clusters) + 5
+    remaining = max(effective_total - len(locked_clusters), 0)
     filler_clusters = [f"Unmapped {i + 1}" for i in range(remaining)]
     clusters = list(locked_clusters) + filler_clusters
 
@@ -668,6 +705,61 @@ def refine_unsorted_via_sonic_neighbors(pools, debug=None):
     d(f"└ Reassigned {refined_count} of {len(candidates)} checked tracks via sonic-neighbor consensus "
       f"(min {REFINE_MIN_NEIGHBOR_VOTES} votes, margin \u2265{REFINE_MIN_VOTE_MARGIN}).")
     return pools
+
+
+def apply_cluster_merge_plan(raw_results, raw_tag_mapping, merge_plan):
+    """
+    Combines fine-grained clusters (e.g. from Auto mode) into user-chosen
+    groups — the "phase 2" of the two-step workflow: build natural, narrow
+    clusters first, then let the user decide which of THOSE to combine into
+    broader buckets, rather than forcing Gemini to guess the right
+    granularity upfront.
+
+    Pure local operation — no Plex or Gemini calls, so it's free and
+    instant, and can be re-applied with a different plan at any time
+    without rebuilding from scratch.
+
+    raw_results: {cluster_name: [tracks]} — the untouched fine-grained
+        build output (always kept around separately so merges are
+        non-destructive and re-pickable).
+    raw_tag_mapping: the tag->cluster dict from the fine-grained build —
+        remapped here too, so anything downstream that reads it (e.g. the
+        Library Galaxy tab's coloring) reflects the merged groups.
+    merge_plan: list of {"members": [cluster_name, ...], "new_name": str}
+        dicts. Any raw cluster name NOT listed in any group's "members"
+        passes through unchanged under its original name.
+
+    Returns (merged_results, merged_tag_mapping). Tracks are deduplicated
+    by ratingKey within a merged group (the same track could theoretically
+    appear in two narrow clusters via the sonic/related blend, though the
+    genre-purity filter makes that rare) and shuffled so the merged list
+    isn't just "all of cluster A then all of cluster B" in a visible block.
+    """
+    member_to_new_name = {}
+    for group in merge_plan:
+        for member in group["members"]:
+            member_to_new_name[member] = group["new_name"]
+
+    merged_results = defaultdict(list)
+    seen_keys_per_cluster = defaultdict(set)
+    for cluster_name, tracks in raw_results.items():
+        final_name = member_to_new_name.get(cluster_name, cluster_name)
+        for t in tracks:
+            rk = getattr(t, 'ratingKey', None)
+            if rk in seen_keys_per_cluster[final_name]:
+                continue
+            seen_keys_per_cluster[final_name].add(rk)
+            merged_results[final_name].append(t)
+
+    for tracks in merged_results.values():
+        random.shuffle(tracks)
+
+    merged_tag_mapping = {
+        tag: member_to_new_name.get(cluster_name, cluster_name)
+        for tag, cluster_name in raw_tag_mapping.items()
+    }
+
+    return dict(merged_results), merged_tag_mapping
 
 
 def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, api_key,

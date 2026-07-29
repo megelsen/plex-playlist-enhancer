@@ -6,7 +6,7 @@ cluster as a playlist."""
 
 import streamlit as st
 
-from clustering import build_genre_clusters, get_all_genre_and_mood_tags, suggest_cluster_names
+from clustering import build_genre_clusters, get_all_genre_and_mood_tags, suggest_cluster_names, apply_cluster_merge_plan
 from ui_components import render_track_row
 
 
@@ -20,6 +20,14 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
 
     if 'cluster_results' not in st.session_state:
         st.session_state['cluster_results'] = None
+    if 'cluster_results_raw' not in st.session_state:
+        st.session_state['cluster_results_raw'] = None
+    if 'cluster_tag_mapping_raw' not in st.session_state:
+        st.session_state['cluster_tag_mapping_raw'] = None
+    if 'cluster_merge_plan' not in st.session_state:
+        st.session_state['cluster_merge_plan'] = []  # [{"members": [...], "new_name": str}, ...]
+    if 'cluster_removed_keys' not in st.session_state:
+        st.session_state['cluster_removed_keys'] = {}  # {cluster_name: {ratingKey, ...}}
     if 'cluster_names_used' not in st.session_state:
         st.session_state['cluster_names_used'] = []
     if 'cluster_locked' not in st.session_state:
@@ -35,9 +43,23 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         st.stop()
 
     with st.expander("⚙️ Cluster settings", expanded=st.session_state['cluster_results'] is None):
-        total_clusters = st.number_input(
-            "Total number of clusters", min_value=2, max_value=15, value=5, key="cluster_total"
+        cluster_mode = st.radio(
+            "How many clusters?",
+            ["Auto (recommended)", "Fixed count"],
+            key="cluster_mode",
+            help="Auto lets Gemini build as many narrow, genre-coherent clusters as the "
+                 "library actually warrants (typically 8-25+). A small fixed count forces "
+                 "broad umbrella buckets to fit everything in, which is what causes unrelated "
+                 "artists to get swept into the wrong cluster.",
         )
+        if cluster_mode == "Fixed count":
+            total_clusters_input = st.number_input(
+                "Total number of clusters", min_value=2, max_value=40, value=10, key="cluster_total"
+            )
+            total_clusters = int(total_clusters_input)
+        else:
+            total_clusters = None
+            st.caption("Gemini will decide the natural number of clusters based on your library's actual genre/mood tags.")
 
         if gemini_api_key:
             if st.button("🔍 Suggest Clusters"):
@@ -45,12 +67,12 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                     try:
                         genre_tags, mood_tags = get_all_genre_and_mood_tags(cluster_music_section)
                         clusters, mapping = suggest_cluster_names(
-                            genre_tags, mood_tags, int(total_clusters), gemini_api_key
+                            genre_tags, mood_tags, total_clusters, gemini_api_key
                         )
                         st.session_state['suggested_snapshot'] = {
                             "genre_tags": genre_tags,
                             "mood_tags": mood_tags,
-                            "total_clusters": int(total_clusters),
+                            "total_clusters": total_clusters,
                             "clusters": clusters,
                             "mapping": mapping,
                         }
@@ -66,12 +88,13 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
 
         locked_input = st.text_input(
             "Locked cluster names (comma-separated, optional)",
-            placeholder="e.g. Metal, Fast Paced",
+            placeholder="e.g. Metal, Punk Rock, Classic Rock",
             key="cluster_locked",
         )
         st.caption(
-            "These are kept exactly as typed. Gemini invents any remaining clusters "
-            "and decides which genre tags belong in every bucket, locked or not."
+            "These are kept exactly as typed and always exist if relevant tags are found. "
+            "Gemini determines any remaining clusters and decides which genre/mood tags "
+            "belong in every bucket, locked or not."
         )
 
         top_n = st.number_input(
@@ -116,7 +139,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
 
     if not gemini_api_key and not dry_run:
         st.warning("Enter a Gemini API key in the sidebar to build clusters, or check 'Dry run' to test for free.")
-    elif len(locked_clusters) > total_clusters:
+    elif total_clusters is not None and len(locked_clusters) > total_clusters:
         st.error("You've locked in more cluster names than the total cluster count allows.")
     else:
         build_clicked = st.button("🧩 Build / Refresh Clusters", use_container_width=True)
@@ -141,7 +164,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                 current_genre_tags, current_mood_tags = get_all_genre_and_mood_tags(cluster_music_section)
                 same_tags = (sorted(current_genre_tags) == sorted(snap["genre_tags"]) and
                              sorted(current_mood_tags) == sorted(snap["mood_tags"]))
-                same_total = int(total_clusters) == snap["total_clusters"]
+                same_total = total_clusters == snap["total_clusters"]
                 same_clusters = sorted(locked_clusters, key=str.lower) == sorted(snap["clusters"], key=str.lower)
                 if same_tags and same_total and same_clusters:
                     preloaded = (snap["clusters"], snap["mapping"])
@@ -153,7 +176,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                         cluster_music_section,
                         plex,
                         locked_clusters=locked_clusters,
-                        total_clusters=int(total_clusters),
+                        total_clusters=total_clusters,
                         api_key=gemini_api_key,
                         top_n_per_cluster=int(top_n),
                         debug=debug_box,
@@ -162,40 +185,106 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                         preloaded_mapping=preloaded,
                         refine_unsorted=refine_unsorted,
                     )
-                    st.session_state['cluster_results'] = results
-                    st.session_state['cluster_tag_mapping'] = tag_mapping
+                    st.session_state['cluster_results_raw'] = results
+                    st.session_state['cluster_tag_mapping_raw'] = tag_mapping
+                    st.session_state['cluster_merge_plan'] = []  # fresh build invalidates any prior grouping
+                    st.session_state['cluster_removed_keys'] = {}
                     st.session_state['cluster_names_used'] = list(results.keys())
                 except Exception as e:
                     st.error(f"Failed to build clusters: {e}")
-                    st.session_state['cluster_results'] = None
+                    st.session_state['cluster_results_raw'] = None
 
     st.write("---")
 
-    cluster_results = st.session_state['cluster_results']
-    if not cluster_results:
-        st.info("Set your locked clusters and total count above, then build clusters to see them here.")
-    else:
-        cluster_tabs = st.tabs(list(cluster_results.keys()))
-        for cluster_name, sub_tab in zip(cluster_results.keys(), cluster_tabs):
-            with sub_tab:
-                tracks = cluster_results[cluster_name]
-                if not tracks:
-                    st.info("No tracks landed in this cluster.")
-                    continue
-                st.caption(f"{len(tracks)} tracks — a blend of popular plays, sonically similar picks, and related artists. Tap ✕ to drop one before saving.")
-                for idx, track in enumerate(tracks):
-                    render_track_row(
-                        track, idx, key_prefix=f"cluster_{cluster_name}", mode="cluster",
-                        plex_url=plex_url, plex_token=plex_token, cluster_name=cluster_name
-                    )
+    raw_results = st.session_state['cluster_results_raw']
+    raw_tag_mapping = st.session_state['cluster_tag_mapping_raw']
 
-                save_name = st.text_input(
-                    "Playlist name:", value=f"{cluster_name} Mix",
-                    key=f"cluster_playlist_name_{cluster_name}"
+    if not raw_results:
+        st.info("Set your options above, then build clusters to see them here.")
+        return
+
+    # --- Phase 2: combine fine-grained clusters into broader buckets ---
+    # Pure local operation (no Gemini call) — build narrow clusters first
+    # (phase 1, above), then decide here which of those to merge into a
+    # broader final bucket. The merge plan is stored separately from the
+    # raw build so it can be freely changed/reset without re-running
+    # anything against Plex or Gemini.
+    with st.expander(f"🔗 Combine clusters ({len(raw_results)} fine-grained clusters currently)"):
+        st.caption(
+            "Pick two or more of the clusters above to combine into one broader bucket. "
+            "Free and instant — no Gemini call, just relabeling and merging the track lists "
+            "you already have."
+        )
+        available_names = sorted(raw_results.keys())
+        already_grouped = {m for g in st.session_state['cluster_merge_plan'] for m in g["members"]}
+        selectable = [n for n in available_names if n not in already_grouped]
+
+        merge_members = st.multiselect(
+            "Clusters to combine", selectable, key="merge_members_select"
+        )
+        merge_name = st.text_input(
+            "Name for the combined cluster", key="merge_name_input",
+            placeholder="e.g. Heavy & Punk",
+        )
+        if st.button("➕ Add this merge group", disabled=len(merge_members) < 2 or not merge_name.strip()):
+            st.session_state['cluster_merge_plan'].append({
+                "members": merge_members, "new_name": merge_name.strip()
+            })
+            st.rerun()
+
+        if st.session_state['cluster_merge_plan']:
+            st.write("**Current merge groups:**")
+            for i, group in enumerate(st.session_state['cluster_merge_plan']):
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    st.write(f"- **{group['new_name']}** ← {', '.join(group['members'])}")
+                with col2:
+                    if st.button("✕", key=f"remove_merge_group_{i}"):
+                        st.session_state['cluster_merge_plan'].pop(i)
+                        st.rerun()
+            if st.button("↩️ Reset all merges"):
+                st.session_state['cluster_merge_plan'] = []
+                st.rerun()
+
+    if st.session_state['cluster_merge_plan']:
+        merged_results, merged_tag_mapping = apply_cluster_merge_plan(
+            raw_results, raw_tag_mapping, st.session_state['cluster_merge_plan']
+        )
+    else:
+        merged_results, merged_tag_mapping = raw_results, raw_tag_mapping
+
+    # Apply any manual per-track removals on top of the current merged view.
+    removed_keys = st.session_state['cluster_removed_keys']
+    cluster_results = {
+        name: [t for t in tracks if getattr(t, 'ratingKey', None) not in removed_keys.get(name, set())]
+        for name, tracks in merged_results.items()
+    }
+    st.session_state['cluster_results'] = cluster_results
+    st.session_state['cluster_tag_mapping'] = merged_tag_mapping
+
+    st.write("---")
+
+    cluster_tabs = st.tabs(list(cluster_results.keys()))
+    for cluster_name, sub_tab in zip(cluster_results.keys(), cluster_tabs):
+        with sub_tab:
+            tracks = cluster_results[cluster_name]
+            if not tracks:
+                st.info("No tracks left in this cluster.")
+                continue
+            st.caption(f"{len(tracks)} tracks — a blend of popular plays, sonically similar picks, and related artists. Tap ✕ to drop one before saving.")
+            for idx, track in enumerate(tracks):
+                render_track_row(
+                    track, idx, key_prefix=f"cluster_{cluster_name}", mode="cluster",
+                    plex_url=plex_url, plex_token=plex_token, cluster_name=cluster_name
                 )
-                if st.button(f"💾 Save '{cluster_name}' as Plex Playlist", key=f"save_cluster_{cluster_name}"):
-                    try:
-                        plex.createPlaylist(title=save_name, items=tracks)
-                        st.success(f"Created playlist '{save_name}' with {len(tracks)} tracks.")
-                    except Exception as e:
-                        st.error(f"Failed to create playlist: {e}")
+
+            save_name = st.text_input(
+                "Playlist name:", value=f"{cluster_name} Mix",
+                key=f"cluster_playlist_name_{cluster_name}"
+            )
+            if st.button(f"💾 Save '{cluster_name}' as Plex Playlist", key=f"save_cluster_{cluster_name}"):
+                try:
+                    plex.createPlaylist(title=save_name, items=tracks)
+                    st.success(f"Created playlist '{save_name}' with {len(tracks)} tracks.")
+                except Exception as e:
+                    st.error(f"Failed to create playlist: {e}")
