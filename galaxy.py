@@ -2,8 +2,8 @@
 an interactive 3D star map, in the spirit of Music-Manager-for-Plex's
 "Galaxy Explorer" feature. Every artist is a node; an edge exists wherever
 Plex's similarity hub connects two artists in the library. Nodes are
-colored by genre cluster when a cluster mapping is available (built in the
-Library Clusters tab), so the visual clustering and the genre clustering
+colored by genre/mood cluster when a cluster mapping is available (built in
+the Library Clusters tab), so the visual clustering and the tag clustering
 can be cross-checked against each other.
 """
 
@@ -43,6 +43,11 @@ def build_similarity_graph(music_section, max_artists=150, debug=None):
     graph = nx.Graph()
     for a in artists:
         genre_tags = {g.tag for g in getattr(a, 'genres', [])}
+        mood_tags = set()
+        try:
+            albums = a.albums()
+        except Exception:
+            albums = []
         if not genre_tags:
             # Plex usually tags genre at album level, not artist level, so an
             # artist with no direct genre tags is common, not necessarily
@@ -50,15 +55,21 @@ def build_similarity_graph(music_section, max_artists=150, debug=None):
             # clustering does (assign_track_cluster's album-first fallback),
             # or every artist without album-level genre metadata would
             # incorrectly get dumped into "Unsorted".
-            try:
-                for album in a.albums():
-                    genre_tags |= {g.tag for g in getattr(album, 'genres', [])}
-            except Exception:
-                pass
+            for album in albums:
+                genre_tags |= {g.tag for g in getattr(album, 'genres', [])}
+        # Moods only ever live at album/track level in Plex (no artist-level
+        # fallback exists, matching clustering.py's assign_track_cluster) —
+        # collected unconditionally here so an artist whose cluster
+        # membership in the Clusters tab comes mainly from mood tags (e.g. a
+        # "Chill" or "Upbeat" cluster) still gets picked up here instead of
+        # only ever showing as Uncategorized in the galaxy.
+        for album in albums:
+            mood_tags |= {m.tag for m in getattr(album, 'moods', [])}
         graph.add_node(
             a.ratingKey,
             title=a.title,
             genres=list(genre_tags),
+            moods=list(mood_tags),
         )
 
     for a in artists:
@@ -88,10 +99,10 @@ def render_galaxy_figure(graph, tag_mapping=None, group_by_cluster=True):
     (if tag_mapping is supplied) its genre cluster.
 
     Node position and node color come from two independent signals — Plex's
-    "Similar Artist" web (position) and genre-tag clustering (color) — so by
-    default they won't visually align; a library that's genuinely dominated
-    by one genre will look like one color scattered everywhere, which is
-    accurate, not a clustering bug.
+    "Similar Artist" web (position) and genre/mood-tag clustering (color) —
+    so by default they won't visually align; a library that's genuinely
+    dominated by one cluster will look like one color scattered everywhere,
+    which is accurate, not a clustering bug.
 
     group_by_cluster=True adds a gentle attractive pull between all members
     of the same cluster (via temporary hub nodes connected to every member,
@@ -105,7 +116,8 @@ def render_galaxy_figure(graph, tag_mapping=None, group_by_cluster=True):
 
     clusters_to_nodes = {}
     for n, data in graph.nodes(data=True):
-        cluster = assign_artist_cluster(data.get('genres', []), tag_mapping) if tag_mapping else "Uncategorized"
+        artist_tags = set(data.get('genres', [])) | set(data.get('moods', []))
+        cluster = assign_artist_cluster(artist_tags, tag_mapping) if tag_mapping else "Uncategorized"
         clusters_to_nodes.setdefault(cluster, []).append(n)
 
     if group_by_cluster and tag_mapping:

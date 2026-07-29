@@ -21,7 +21,7 @@ def render(plex, debug_box):
         st.error("No music library section found on this Plex server.")
         st.stop()
 
-    max_artists = st.slider("Max artists to include", min_value=30, max_value=400, value=150, step=10)
+    max_artists = st.slider("Max artists to include", min_value=30, max_value=600, value=400, step=10)
     st.caption(
         "Fetching similarity data for every artist can be slow on large libraries — "
         "this caps it to your most-played artists."
