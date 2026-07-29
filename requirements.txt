@@ -1,2 +1,5 @@
 streamlit
 plexapi
+requests
+networkx
+plotly
