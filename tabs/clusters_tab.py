@@ -44,6 +44,37 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         st.error("No music library section found on this Plex server.")
         st.stop()
 
+    # --- Step 1: scan the library's tags first. Zero-cost, no API call —
+    # doing this before the settings below means the cluster-count guidance
+    # has real numbers to work with immediately, instead of asking the user
+    # to configure things blind and find the tag scan buried further down.
+    st.subheader("1. Scan your library")
+    st.caption("Zero-cost — no Gemini call. Run this first so the cluster count below has real numbers to work from.")
+    if st.button("👀 Scan genre/mood tags"):
+        with st.spinner("Scanning library tags..."):
+            genre_tags, mood_tags = get_all_genre_and_mood_tags(cluster_music_section)
+        st.session_state['cluster_tag_counts'] = {"genre": len(genre_tags), "mood": len(mood_tags)}
+        st.session_state['cluster_tag_preview'] = {"genre_tags": genre_tags, "mood_tags": mood_tags}
+        total_tags = len(genre_tags) + len(mood_tags)
+        suggested_low = max(2, total_tags // 25)
+        suggested_high = max(suggested_low, total_tags // 15)
+        st.session_state['cluster_total'] = min(40, max(2, round((suggested_low + suggested_high) / 2)))
+
+    tag_preview = st.session_state.get('cluster_tag_preview')
+    if tag_preview:
+        with st.expander(
+            f"{len(tag_preview['genre_tags'])} genre tags, {len(tag_preview['mood_tags'])} mood tags found",
+            expanded=False,
+        ):
+            st.write("**Genre tags:**")
+            st.code(", ".join(tag_preview['genre_tags']) or "(none found)")
+            st.write("**Mood tags:**")
+            st.code(", ".join(tag_preview['mood_tags']) or "(none found)")
+
+    st.write("---")
+
+    # --- Step 2: configure how clusters should be built.
+    st.subheader("2. Configure clusters")
     with st.expander("⚙️ Cluster settings", expanded=st.session_state['cluster_results'] is None):
         total_clusters_input = st.number_input(
             "Maximum number of clusters", min_value=2, max_value=40, value=10, key="cluster_total"
@@ -61,13 +92,13 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
             suggested_high = max(suggested_low, total_tags // 15)
             st.caption(
                 f"Rule of thumb: ~1 cluster per 15\u201325 genre/mood tags. Your library has "
-                f"{total_tags} distinct tags (from the last Preview Tags scan), suggesting "
-                f"roughly {suggested_low}\u2013{suggested_high} clusters."
+                f"{total_tags} distinct tags (from step 1's scan), suggesting roughly "
+                f"{suggested_low}\u2013{suggested_high} clusters \u2014 the field above defaults "
+                f"to the midpoint of that range; adjust as you like."
             )
         else:
             st.caption(
-                "Tip: run '👀 Preview Tags' below to see your library's tag count and get a "
-                "suggested cluster range here."
+                "Tip: run the tag scan in step 1 above to get a suggested cluster range here."
             )
 
         if gemini_api_key:
@@ -85,15 +116,38 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                             "clusters": clusters,
                             "mapping": mapping,
                         }
-                        st.session_state['cluster_locked'] = ", ".join(clusters)
+                        st.session_state['suggested_review_selection'] = list(clusters)
                         st.rerun()
                     except Exception as e:
                         st.error(f"Failed to suggest clusters: {e}")
             st.caption(
                 "Suggest Clusters proposes a full set of names from scratch (one Gemini "
-                "call) and fills in the field below — edit, remove, or add your own "
-                "before building. Accepting them as-is skips a second Gemini call."
+                "call). Review the list below, uncheck any you don't want, then apply — "
+                "accepting them as-is skips a second Gemini call."
             )
+
+            snap = st.session_state.get('suggested_snapshot')
+            if snap:
+                st.write(f"**Suggested {len(snap['clusters'])} clusters** — untick any to drop them:")
+                selected = []
+                cols = st.columns(2)
+                for i, cluster_name in enumerate(snap['clusters']):
+                    with cols[i % 2]:
+                        checked = st.checkbox(
+                            cluster_name, value=True, key=f"suggest_review_{cluster_name}"
+                        )
+                        if checked:
+                            selected.append(cluster_name)
+
+                col_apply, col_dismiss = st.columns([1, 1])
+                with col_apply:
+                    if st.button("✅ Apply selected as locked clusters", disabled=not selected):
+                        st.session_state['cluster_locked'] = ", ".join(selected)
+                        st.rerun()
+                with col_dismiss:
+                    if st.button("✕ Dismiss suggestions"):
+                        st.session_state['suggested_snapshot'] = None
+                        st.rerun()
 
         locked_input = st.text_input(
             "Locked cluster names (comma-separated, optional)",
@@ -130,20 +184,10 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
 
     locked_clusters = [c.strip() for c in locked_input.split(",") if c.strip()]
 
-    # --- Zero-cost testing helpers ---
-    if st.button("👀 Preview Tags (no API call)"):
-        with st.spinner("Scanning library tags..."):
-            genre_tags, mood_tags = get_all_genre_and_mood_tags(cluster_music_section)
-        st.session_state['cluster_tag_counts'] = {"genre": len(genre_tags), "mood": len(mood_tags)}
-        st.session_state['cluster_tag_preview'] = {"genre_tags": genre_tags, "mood_tags": mood_tags}
+    st.write("---")
 
-    tag_preview = st.session_state.get('cluster_tag_preview')
-    if tag_preview:
-        st.write(f"**{len(tag_preview['genre_tags'])} genre tags:**")
-        st.code(", ".join(tag_preview['genre_tags']) or "(none found)")
-        st.write(f"**{len(tag_preview['mood_tags'])} mood tags:**")
-        st.code(", ".join(tag_preview['mood_tags']) or "(none found)")
-
+    # --- Step 3: build.
+    st.subheader("3. Build")
     dry_run = st.checkbox("🧪 Dry run (no Gemini call — test the pipeline/UI for free)")
     st.caption(
         "Uses a simple offline keyword mapper instead of Gemini. Clusters won't be "
@@ -209,12 +253,13 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                     st.session_state['cluster_results_raw'] = None
 
     st.write("---")
+    st.subheader("4. Results")
 
     raw_results = st.session_state['cluster_results_raw']
     raw_tag_mapping = st.session_state['cluster_tag_mapping_raw']
 
     if not raw_results:
-        st.info("Set your options above, then build clusters to see them here.")
+        st.info("Complete steps 1\u20133 above, then build clusters to see them here.")
         return
 
     # --- Cluster size summary, sorted largest-first, so imbalance is
@@ -231,7 +276,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
             with col1:
                 st.progress(bar_frac, text=cluster_name)
             with col2:
-                st.write(f"{count} tracks")
+                st.write(f"{count}")
 
     # --- Phase 2: combine fine-grained clusters into broader buckets ---
     # Pure local operation (no Gemini call) — build narrow clusters first

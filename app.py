@@ -67,4 +67,4 @@ with tab_clusters:
     clusters_tab.render(plex, PLEX_URL, PLEX_TOKEN, debug_box, GEMINI_API_KEY)
 
 with tab_galaxy:
-    galaxy_tab.render(plex, PLEX_URL, PLEX_TOKEN, debug_box, GEMINI_API_KEY)
+    galaxy_tab.render(plex, debug_box)
