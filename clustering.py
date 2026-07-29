@@ -62,6 +62,16 @@ REFINE_MIN_VOTE_MARGIN = 4
 # happened to get slightly more hits.
 REFINE_MIN_VOTE_SHARE = 0.6
 
+# Mechanical safety net for cluster balance: even when the Gemini prompt
+# tells the model to avoid thin/fragile clusters (see build_tag_cluster_mapping
+# rule 7), the library's actual track distribution can't be known until
+# after tag->track pooling happens locally. Any real (non-locked) cluster
+# that ends up with fewer than this many pooled tracks gets folded into
+# "Unsorted" rather than surfaced as a near-empty bucket — see
+# _fold_thin_clusters. Locked clusters are exempt since the user explicitly
+# asked for them by name.
+MIN_CLUSTER_TRACKS = 5
+
 # Disk-based cache for the tag->cluster mapping, so it survives container
 # restarts/rebuilds (unlike st.cache_data, which is in-memory only and
 # resets whenever the process restarts). Point CLUSTER_CACHE_PATH at a
@@ -158,16 +168,12 @@ def build_tag_cluster_mapping(genre_tags, mood_tags, locked_clusters, total_clus
         ["Metal", "Fast Paced"] — these are NOT genre tags themselves, they're
         target buckets that must exist if relevant tags are found for them.
 
-    total_clusters: int for a FIXED total count, or None for "auto/natural"
-        mode. Auto mode is the recommended default — a small fixed count
-        forces broad umbrella buckets to fit everything in, which is
-        exactly what causes unrelated artists to get swept into the wrong
-        cluster (e.g. an electropop artist landing in "Punk Rock" because
-        the model had to cram everything into too few buckets). Auto mode
-        instead asks Gemini to produce as many narrow, genre-coherent
-        clusters as the actual tag list warrants — a library with real
-        Metal, Punk, and Classic Rock content should get three separate
-        clusters, not one umbrella forced by a count ceiling.
+    total_clusters: int — the MAXIMUM number of clusters to produce (a
+        ceiling, not a target Gemini is forced to hit exactly). Gemini may
+        return fewer if the tag list doesn't naturally support that many
+        distinct, coherent groups. Tags that don't clearly belong anywhere
+        are left unmapped rather than stretched to fill out unused
+        cluster slots — they fall through to "Unsorted" downstream.
 
     timeout: seconds to wait for a response before retrying. Defaults to
         GEMINI_TIMEOUT_SECONDS (180s) since a large genre+mood tag list can
@@ -178,34 +184,20 @@ def build_tag_cluster_mapping(genre_tags, mood_tags, locked_clusters, total_clus
         again.
     """
     model = model or DEFAULT_GEMINI_MODEL
-    auto_mode = total_clusters is None
 
-    if auto_mode:
-        count_instruction = f"""These {len(locked_clusters)} cluster names are FIXED and must be used exactly
+    remaining = max(total_clusters - len(locked_clusters), 0)
+    count_instruction = f"""You are organizing a music library into AT MOST {total_clusters} clusters
+total. This is a ceiling, not a target — use fewer if the tags below don't
+naturally support that many distinct, coherent groups. Do not invent vague
+or overlapping clusters just to use up the full count.
+
+These {len(locked_clusters)} cluster names are FIXED and must be used exactly
 as given, if any tags genuinely belong under them:
 {locked_clusters}
 
-Beyond those, determine the NATURAL number of additional clusters yourself
-based on what's actually in the tag list below — do not force a small,
-predetermined count. It is normal and expected to end up with anywhere from
-about 8 to 25+ clusters total for a real music library. Err strongly toward
-MORE, NARROWER clusters rather than fewer broad ones: if the library has
-real Metal, Punk, and Classic Rock content, those should be three separate
-clusters, not one "Rock/Metal/Punk" umbrella. Only merge things into one
-cluster when they are genuinely the same genre family (e.g. Black Metal +
-Death Metal + Thrash + Doom Metal can all be one "Metal" cluster — but
-Metal and Punk must NOT be merged just to reduce the total count)."""
-    else:
-        remaining = max(total_clusters - len(locked_clusters), 0)
-        count_instruction = f"""You are organizing a music library into exactly {total_clusters} clusters
-total.
-
-These {len(locked_clusters)} cluster names are FIXED and must be used exactly
-as given:
-{locked_clusters}
-
-Invent {remaining} additional cluster name(s) that best cover the remaining
-tags below (genre families or moods not covered by the fixed clusters)."""
+Beyond those, invent UP TO {remaining} additional cluster name(s) that best
+cover the remaining tags below (genre families or moods not covered by the
+fixed clusters)."""
 
     prompt = f"""You are organizing a music library's genre and mood tags into clusters.
 Clusters can represent genre families, moods/vibes, or both — whatever best
@@ -231,8 +223,12 @@ CRITICAL RULES for assigning tags to clusters:
    vibe, not genre — only group two mood tags together, or a mood with a
    genre, if they are actually thematically related. Do not merge unrelated
    items just because you're running short on distinct clusters.
-4. Every single tag below (genre and mood) must be assigned to exactly one
-   final cluster name. No tag left unassigned.
+4. Only assign a tag to a cluster if it CLEARLY and confidently belongs
+   there. If a tag is vague, ambiguous, or doesn't fit any cluster well,
+   LEAVE IT OUT of the mapping entirely rather than forcing it into the
+   closest-ish bucket — it's far better to skip an uncertain tag than to
+   stretch a cluster's definition to absorb it. Omitted tags are handled
+   separately downstream, so do not invent a catch-all cluster for them.
 5. Be very conservative with invented mood/vibe cluster names (e.g. "Power
    & Edge", "High Energy"). Only put a genre tag in such a cluster if that
    ENTIRE genre family is unambiguously that vibe (e.g. "Death Metal" or
@@ -250,6 +246,13 @@ CRITICAL RULES for assigning tags to clusters:
    clearer organizing concept — these vague names are the most likely to
    accidentally sweep in mismatched genres. Prefer a specific genre-family
    name where one fits.
+7. Don't create a cluster for a thin sliver of the tag list. Each invented
+   (non-locked) cluster should be backed by a real, substantial group of
+   tags — not just one or two obscure/rare ones. If only a handful of tags
+   would go into a cluster, fold them into the closest genuinely-related
+   existing cluster instead of standing up a fragile one-off bucket. It is
+   completely fine — and expected — to end up with fewer clusters than the
+   ceiling for this reason.
 
 Genre tags to classify:
 {genre_tags}
@@ -260,8 +263,8 @@ Mood tags to classify:
 Respond with ONLY a JSON object in this exact shape, nothing else, no markdown
 fences, no commentary:
 {{
-  "clusters": ["Cluster1", "Cluster2", ...],   // all final cluster names, in any order
-  "mapping": {{"tag1": "Cluster1", "tag2": "Cluster2", ...}}  // every genre AND mood tag
+  "clusters": ["Cluster1", "Cluster2", ...],   // final cluster names actually used, in any order
+  "mapping": {{"tag1": "Cluster1", "tag2": "Cluster2", ...}}  // only tags with a clear, confident cluster — omit uncertain ones
 }}"""
 
     last_error = None
@@ -427,11 +430,7 @@ def build_dry_run_mapping(genre_tags, mood_tags, locked_clusters, total_clusters
     real build_tag_cluster_mapping (via the normal Build/Refresh flow) once
     you're ready to see real results.
     """
-    # Auto mode has no fixed count to divide by — dry run doesn't need to
-    # simulate "natural" clustering quality, so just pick a small arbitrary
-    # filler count (enough to exercise the pipeline, not meant to be good).
-    effective_total = total_clusters if total_clusters is not None else len(locked_clusters) + 5
-    remaining = max(effective_total - len(locked_clusters), 0)
+    remaining = max(total_clusters - len(locked_clusters), 0)
     filler_clusters = [f"Unmapped {i + 1}" for i in range(remaining)]
     clusters = list(locked_clusters) + filler_clusters
 
@@ -762,6 +761,47 @@ def apply_cluster_merge_plan(raw_results, raw_tag_mapping, merge_plan):
     return dict(merged_results), merged_tag_mapping
 
 
+def _fold_thin_clusters(pools, clusters, tag_mapping, locked_clusters, debug=None):
+    """
+    Mechanical balance safety net that runs after real track pooling, since
+    only then is it known how many tracks a cluster actually ended up with
+    — the Gemini prompt can avoid inventing thin clusters from the tag list
+    alone, but a cluster that looked reasonable tag-wise can still turn out
+    to cover almost no tracks in this particular library.
+
+    Any non-locked cluster with fewer than MIN_CLUSTER_TRACKS pooled tracks
+    is folded into "Unsorted": its tracks move over, its name is dropped
+    from the cluster list, and any tag that mapped to it is repointed to
+    "Unsorted" too (so Library Galaxy coloring and any other tag_mapping
+    consumer stay consistent). Locked clusters are exempt — the user asked
+    for them by name, so they're kept even if sparsely populated.
+
+    Runs BEFORE refine_unsorted_via_sonic_neighbors so folded tracks get a
+    fair shot at sonic reassignment into a real cluster rather than being
+    permanently stuck, and so sonic refinement never reinforces a cluster
+    that's about to be folded anyway.
+    """
+    d = debug.write if debug else (lambda *a, **k: None)
+    locked_set = set(locked_clusters)
+    thin = [c for c in clusters if c not in locked_set and len(pools.get(c, [])) < MIN_CLUSTER_TRACKS]
+    if not thin:
+        return pools, clusters, tag_mapping
+
+    thin_set = set(thin)
+    for cluster_name in thin:
+        tracks = pools.pop(cluster_name, [])
+        pools["Unsorted"].extend(tracks)
+        d(f"└ Folded thin cluster `{cluster_name}` ({len(tracks)} track(s)) into Unsorted "
+          f"— below the {MIN_CLUSTER_TRACKS}-track balance floor.")
+
+    remaining_clusters = [c for c in clusters if c not in thin_set]
+    folded_tag_mapping = {
+        tag: ("Unsorted" if cluster_name in thin_set else cluster_name)
+        for tag, cluster_name in tag_mapping.items()
+    }
+    return pools, remaining_clusters, folded_tag_mapping
+
+
 def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, api_key,
                           top_n_per_cluster=30, debug=None, force_remap=False, dry_run=False,
                           preloaded_mapping=None, refine_unsorted=True):
@@ -828,6 +868,9 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
 
     for cluster, tracks in pools.items():
         d(f"└ `{cluster}`: {len(tracks)} tracks pooled.")
+
+    if not dry_run:
+        pools, clusters, tag_mapping = _fold_thin_clusters(pools, clusters, tag_mapping, locked_clusters, debug=debug)
 
     if refine_unsorted and not dry_run:
         pools = refine_unsorted_via_sonic_neighbors(pools, debug=debug)

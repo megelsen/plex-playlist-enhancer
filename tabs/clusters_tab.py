@@ -34,6 +34,8 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         st.session_state['cluster_locked'] = ""
     if 'suggested_snapshot' not in st.session_state:
         st.session_state['suggested_snapshot'] = None  # {tags, total, clusters, mapping}
+    if 'cluster_tag_counts' not in st.session_state:
+        st.session_state['cluster_tag_counts'] = None  # {"genre": n, "mood": n} from last Preview Tags
 
     try:
         cluster_music_section = next(s for s in plex.library.sections() if s.type in ['artist', 'music'])
@@ -43,23 +45,30 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         st.stop()
 
     with st.expander("⚙️ Cluster settings", expanded=st.session_state['cluster_results'] is None):
-        cluster_mode = st.radio(
-            "How many clusters?",
-            ["Auto (recommended)", "Fixed count"],
-            key="cluster_mode",
-            help="Auto lets Gemini build as many narrow, genre-coherent clusters as the "
-                 "library actually warrants (typically 8-25+). A small fixed count forces "
-                 "broad umbrella buckets to fit everything in, which is what causes unrelated "
-                 "artists to get swept into the wrong cluster.",
+        total_clusters_input = st.number_input(
+            "Maximum number of clusters", min_value=2, max_value=40, value=10, key="cluster_total"
         )
-        if cluster_mode == "Fixed count":
-            total_clusters_input = st.number_input(
-                "Total number of clusters", min_value=2, max_value=40, value=10, key="cluster_total"
+        total_clusters = int(total_clusters_input)
+        st.caption(
+            "This is a ceiling, not a forced target — Gemini uses fewer if the tags don't "
+            "naturally support that many distinct groups, and skips vague/ambiguous tags "
+            "into 'Unsorted' instead of stretching them to fill out every bucket."
+        )
+        tag_counts = st.session_state['cluster_tag_counts']
+        if tag_counts:
+            total_tags = tag_counts["genre"] + tag_counts["mood"]
+            suggested_low = max(2, total_tags // 25)
+            suggested_high = max(suggested_low, total_tags // 15)
+            st.caption(
+                f"Rule of thumb: ~1 cluster per 15\u201325 genre/mood tags. Your library has "
+                f"{total_tags} distinct tags (from the last Preview Tags scan), suggesting "
+                f"roughly {suggested_low}\u2013{suggested_high} clusters."
             )
-            total_clusters = int(total_clusters_input)
         else:
-            total_clusters = None
-            st.caption("Gemini will decide the natural number of clusters based on your library's actual genre/mood tags.")
+            st.caption(
+                "Tip: run '👀 Preview Tags' below to see your library's tag count and get a "
+                "suggested cluster range here."
+            )
 
         if gemini_api_key:
             if st.button("🔍 Suggest Clusters"):
@@ -125,10 +134,15 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
     if st.button("👀 Preview Tags (no API call)"):
         with st.spinner("Scanning library tags..."):
             genre_tags, mood_tags = get_all_genre_and_mood_tags(cluster_music_section)
-        st.write(f"**{len(genre_tags)} genre tags:**")
-        st.code(", ".join(genre_tags) or "(none found)")
-        st.write(f"**{len(mood_tags)} mood tags:**")
-        st.code(", ".join(mood_tags) or "(none found)")
+        st.session_state['cluster_tag_counts'] = {"genre": len(genre_tags), "mood": len(mood_tags)}
+        st.session_state['cluster_tag_preview'] = {"genre_tags": genre_tags, "mood_tags": mood_tags}
+
+    tag_preview = st.session_state.get('cluster_tag_preview')
+    if tag_preview:
+        st.write(f"**{len(tag_preview['genre_tags'])} genre tags:**")
+        st.code(", ".join(tag_preview['genre_tags']) or "(none found)")
+        st.write(f"**{len(tag_preview['mood_tags'])} mood tags:**")
+        st.code(", ".join(tag_preview['mood_tags']) or "(none found)")
 
     dry_run = st.checkbox("🧪 Dry run (no Gemini call — test the pipeline/UI for free)")
     st.caption(
@@ -139,7 +153,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
 
     if not gemini_api_key and not dry_run:
         st.warning("Enter a Gemini API key in the sidebar to build clusters, or check 'Dry run' to test for free.")
-    elif total_clusters is not None and len(locked_clusters) > total_clusters:
+    elif len(locked_clusters) > total_clusters:
         st.error("You've locked in more cluster names than the total cluster count allows.")
     else:
         build_clicked = st.button("🧩 Build / Refresh Clusters", use_container_width=True)
@@ -202,6 +216,22 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
     if not raw_results:
         st.info("Set your options above, then build clusters to see them here.")
         return
+
+    # --- Cluster size summary, sorted largest-first, so imbalance is
+    # visible at a glance without digging through the debug log. Small
+    # clusters are the natural candidates to fold into a bigger one via
+    # the "Combine clusters" step below.
+    size_order = sorted(raw_results.items(), key=lambda kv: len(kv[1]), reverse=True)
+    with st.expander(f"📊 Cluster sizes ({len(raw_results)} clusters)", expanded=False):
+        max_size = max((len(tracks) for _, tracks in size_order), default=0)
+        for cluster_name, tracks in size_order:
+            count = len(tracks)
+            bar_frac = (count / max_size) if max_size else 0
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.progress(bar_frac, text=cluster_name)
+            with col2:
+                st.write(f"{count} tracks")
 
     # --- Phase 2: combine fine-grained clusters into broader buckets ---
     # Pure local operation (no Gemini call) — build narrow clusters first
