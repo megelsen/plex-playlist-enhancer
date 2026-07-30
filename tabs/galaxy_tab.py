@@ -7,6 +7,17 @@ import streamlit as st
 from galaxy import build_similarity_graph, render_galaxy_figure
 
 
+def _cluster_signature(tag_mapping, artist_cluster_map):
+    """Cheap content-based fingerprint of whatever's currently driving
+    galaxy node coloring, so the tab can detect 'the cluster build changed
+    since I last rendered this graph' and auto-recolor — a plain identity
+    check wouldn't work here since clusters_tab.py rebuilds these dicts
+    fresh on every render even when their contents are unchanged."""
+    mapping_part = tuple(sorted(tag_mapping.items())) if tag_mapping else None
+    artist_part = tuple(sorted(artist_cluster_map.items())) if artist_cluster_map else None
+    return (mapping_part, artist_part)
+
+
 def render(plex, debug_box):
     st.title("🌌 Library Galaxy")
     st.caption(
@@ -51,6 +62,7 @@ def render(plex, debug_box):
             )
             st.session_state['galaxy_node_count'] = graph.number_of_nodes()
             st.session_state['galaxy_edge_count'] = graph.number_of_edges()
+            st.session_state['galaxy_cluster_signature'] = _cluster_signature(tag_mapping, artist_cluster_map)
 
     # Re-laying out with the toggle flipped doesn't need a fresh Plex fetch —
     # reuse the already-built graph if we have one.
@@ -62,6 +74,28 @@ def render(plex, debug_box):
                 st.session_state['galaxy_graph'], tag_mapping=tag_mapping,
                 artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster
             )
+            st.session_state['galaxy_cluster_signature'] = _cluster_signature(tag_mapping, artist_cluster_map)
+
+    # Auto-refresh coloring when the underlying cluster build has changed
+    # since this galaxy was last rendered (e.g. you rebuilt clusters in
+    # 🗂️ Library Clusters after already building the galaxy once) — without
+    # this, the legend/bucket colors silently keep showing whatever cluster
+    # set existed at the last Build/Re-layout click, which looks like a bug
+    # (old cluster count/names) even though the underlying clusters have
+    # moved on. This is a pure local recoloring — same graph, same layout,
+    # no Plex re-fetch — so it's cheap enough to just do automatically
+    # rather than asking the user to notice and click Re-layout themselves.
+    if st.session_state.get('galaxy_graph') is not None:
+        tag_mapping = st.session_state.get('cluster_tag_mapping')
+        artist_cluster_map = st.session_state.get('cluster_artist_map')
+        current_signature = _cluster_signature(tag_mapping, artist_cluster_map)
+        if st.session_state.get('galaxy_cluster_signature') != current_signature:
+            st.session_state['galaxy_figure'] = render_galaxy_figure(
+                st.session_state['galaxy_graph'], tag_mapping=tag_mapping,
+                artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster
+            )
+            st.session_state['galaxy_cluster_signature'] = current_signature
+            st.caption("🔄 Recolored automatically to match the latest cluster build.")
 
     figure = st.session_state.get('galaxy_figure')
     if figure is not None:

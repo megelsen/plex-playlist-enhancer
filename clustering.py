@@ -1384,16 +1384,30 @@ def build_artist_similarity_graph(all_artists, sample_size=ARTIST_SONIC_SAMPLE_S
     return graph, artist_by_key, cache
 
 
-def _auto_tune_resolution(graph, target_communities, resolution_bounds=(0.2, 4.0), max_iter=8, debug=None):
+def _auto_tune_resolution(graph, target_communities, resolution_bounds=(0.2, 4.0), max_iter=10, debug=None):
     """
     Louvain's `resolution` parameter trades off community count (higher ->
     more, smaller communities; lower -> fewer, larger ones) but isn't
     directly interpretable as "give me N communities" — a fixed resolution
     of 1.0 can land anywhere from 4 to 40 communities depending on how the
-    similarity graph happens to be shaped for a given library. This does a
-    small binary search instead: try a resolution, count how many
-    communities it actually produces, and adjust up/down until the count is
-    as close to target_communities as the iteration budget affords.
+    similarity graph happens to be shaped for a given library, and how HIGH
+    a resolution is actually needed to reach a given count varies wildly
+    with graph density (a sparse artist-similarity graph, e.g. from a
+    heavily tag-driven blend with few sonic edges, can need a resolution
+    well above the old fixed upper bound of 4.0 to split into 15+ groups).
+
+    Two phases:
+      1. EXPANDING SEARCH: starting from the middle of resolution_bounds,
+         repeatedly double (if still below target) or halve (if already
+         above) the resolution being tried, so the search isn't capped by
+         whatever resolution_bounds happened to be — it escapes upward or
+         downward until it brackets the target or hits a hard sanity limit
+         (0.01 / 64.0). This is what actually fixes "settles for way fewer
+         clusters than asked for" — a fixed bounds search can only ever
+         report the best IT COULD REACH within those bounds, silently
+         falling short if the true answer needed a higher resolution.
+      2. BINARY SEARCH within whatever bracket phase 1 found, using the
+         rest of the iteration budget to refine within it.
 
     Not guaranteed to land exactly on target (Louvain's community count
     isn't perfectly monotonic in resolution, and some libraries just don't
@@ -1404,23 +1418,62 @@ def _auto_tune_resolution(graph, target_communities, resolution_bounds=(0.2, 4.0
     Returns (partition, resolution_used, community_count).
     """
     d = debug.write if debug else (lambda *a, **k: None)
-    lo, hi = resolution_bounds
+    HARD_LO, HARD_HI = 0.01, 64.0
+
     best = None  # (resolution, count, partition)
-    for i in range(max_iter):
-        mid = (lo + hi) / 2
-        partition = community_louvain.best_partition(graph, weight='weight', resolution=mid, random_state=42)
+
+    def _try(resolution):
+        nonlocal best
+        partition = community_louvain.best_partition(graph, weight='weight', resolution=resolution, random_state=42)
         count = len(set(partition.values()))
-        d(f"└ Auto-tuning granularity ({i + 1}/{max_iter}): resolution={mid:.3f} -> {count} clusters "
-          f"(target {target_communities}).")
         if best is None or abs(count - target_communities) < abs(best[1] - target_communities):
-            best = (mid, count, partition)
-        if count == target_communities:
-            break
-        elif count < target_communities:
-            lo = mid  # need MORE, smaller communities -> raise resolution
+            best = (resolution, count, partition)
+        return count
+
+    lo, hi = resolution_bounds
+    mid = (lo + hi) / 2
+    count = _try(mid)
+    d(f"└ Auto-tuning granularity (1/{max_iter}): resolution={mid:.3f} -> {count} clusters "
+      f"(target {target_communities}).")
+    iters_used = 1
+
+    # Phase 1: expand outward until the target is bracketed, or we hit the
+    # hard sanity limits — this is what lets the search reach far past the
+    # original resolution_bounds when the graph needs it.
+    while iters_used < max_iter and count != target_communities:
+        if count < target_communities:
+            if hi >= HARD_HI:
+                break
+            lo, hi = hi, min(HARD_HI, hi * 2)
         else:
-            hi = mid  # need FEWER, bigger communities -> lower resolution
+            if lo <= HARD_LO:
+                break
+            lo, hi = max(HARD_LO, lo / 2), lo
+        mid = (lo + hi) / 2
+        count = _try(mid)
+        iters_used += 1
+        d(f"└ Auto-tuning granularity ({iters_used}/{max_iter}): resolution={mid:.3f} -> {count} clusters "
+          f"(target {target_communities}).")
+
+    # Phase 2: binary search the remaining budget within [lo, hi] — by now
+    # either bracketed (one side <= target, other >= target) or we hit a
+    # hard limit and lo==hi effectively, in which case this just confirms it.
+    while iters_used < max_iter and count != target_communities and hi > lo:
+        mid = (lo + hi) / 2
+        count = _try(mid)
+        iters_used += 1
+        d(f"└ Auto-tuning granularity ({iters_used}/{max_iter}): resolution={mid:.3f} -> {count} clusters "
+          f"(target {target_communities}).")
+        if count < target_communities:
+            lo = mid
+        else:
+            hi = mid
+
     resolution, count, partition = best
+    if count < target_communities:
+        d(f"⚠️ Auto-tune couldn't reach {target_communities} clusters even at resolution={resolution:.3f} "
+          f"(hit {count}) — the similarity graph may simply not support finer splits at this edge "
+          "density; consider raising sonic/tag signal weights or lowering the target.")
     d(f"**Granularity auto-tune settled on resolution={resolution:.3f} -> {count} clusters** "
       f"(target was {target_communities}).")
     return partition, resolution, count
