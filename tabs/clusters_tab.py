@@ -78,107 +78,109 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
     with st.expander("⚙️ Cluster settings", expanded=st.session_state['cluster_results'] is None):
         clustering_mode_label = st.radio(
             "Clustering method",
-            options=["Genre/mood tags (Gemini)", "Sonic similarity (community detection)"],
+            options=[
+                "Hybrid: sonic + tags, weighted (recommended)",
+                "Genre/mood tags only (Gemini)",
+                "Sonic similarity only (track-level)",
+            ],
             index=0,
-            horizontal=True,
+            horizontal=False,
         )
-        clustering_mode = "sonic" if clustering_mode_label.startswith("Sonic") else "tags"
+        clustering_mode = "tags" if clustering_mode_label.startswith("Genre") else "sonic"
+        sonic_group_by = "track" if clustering_mode_label.startswith("Sonic") else "artist"
         st.caption(
-            "**Tags:** Gemini maps genre/mood tags to clusters, then every track is "
-            "assigned by its tags (sonic similarity can optionally recover/correct "
-            "afterward \u2014 see below). **Sonic:** cluster MEMBERSHIP itself comes "
-            "from grouping tracks that Plex's own audio analysis considers similar "
-            "(Louvain community detection on the sonic-similarity graph, same idea as "
-            "Music-Manager-for-Plex's Galaxy tab but at track level using real acoustic "
-            "data instead of artist metadata) \u2014 tags are only used afterward to "
-            "give each resulting group a readable name."
+            "**Hybrid (artist-level):** this is the real combination \u2014 every artist gets "
+            "one profile blending actual audio similarity, raw shared tags, and agreement with "
+            "your Gemini-defined clusters, and Louvain groups artists using all three signals "
+            "together in a single weighted graph (not tags-then-sonic or sonic-then-tags as two "
+            "separate passes). **Tags only:** Gemini maps tags to clusters and every track is "
+            "assigned purely by its tags (sonic can optionally recover/correct leftovers "
+            "afterward \u2014 see below). **Sonic only (track-level):** membership comes purely "
+            "from Plex's audio analysis, one node per track, no tag signal at all until naming."
         )
 
-        if clustering_mode == "sonic":
-            sonic_group_by_label = st.radio(
-                "Group by",
-                options=["Artist (recommended)", "Individual track"],
-                index=0,
-                horizontal=True,
-                key="sonic_group_by_label",
-            )
-            sonic_group_by = "artist" if sonic_group_by_label.startswith("Artist") else "track"
+        if clustering_mode == "sonic" and sonic_group_by == "artist":
+            st.write("**Hybrid signal weights**")
             st.caption(
-                "**Artist:** each artist gets one sonic profile from a small sample of its "
-                "own most-played tracks (falls back to Plex's popularity ranking for artists "
-                "with no play history), blended with that artist's + its albums' genre/mood "
-                "tags \u2014 clustering groups artists, so an artist's whole catalog stays "
-                "together. Cheap enough to run against the whole library, and profiles are "
-                "cached to disk so rebuilds skip unchanged artists entirely. "
-                "**Individual track:** the original per-track graph below \u2014 more "
-                "granular, but a single artist's tracks can split across clusters, costs one "
-                "Plex call per track, and isn't cached."
+                "How much each signal counts toward pulling two artists into the same cluster. "
+                "Values are normalized automatically, so only the ratio between them matters "
+                "\u2014 set one to 0 to exclude that signal entirely."
+            )
+            hybrid_sonic_weight = st.slider(
+                "🎧 Sonic similarity (actual audio analysis)", min_value=0.0, max_value=1.0, value=0.5, step=0.05,
+                key="hybrid_sonic_weight",
+            )
+            hybrid_cluster_agreement_weight = st.slider(
+                "🎯 Gemini cluster agreement (curated, narrow)", min_value=0.0, max_value=1.0, value=0.35, step=0.05,
+                key="hybrid_cluster_agreement_weight",
+            )
+            hybrid_tag_overlap_weight = st.slider(
+                "🏷️ Raw tag overlap (broad, noisy)", min_value=0.0, max_value=1.0, value=0.15, step=0.05,
+                key="hybrid_tag_overlap_weight",
+            )
+            st.caption(
+                "Sonic = what Plex's audio fingerprinting actually hears. Cluster agreement = "
+                "both artists' tags vote for the same cluster you asked Gemini to build \u2014 "
+                "narrow but meaningful, since it's filtered through real category definitions "
+                "rather than any incidental shared tag. Tag overlap = any shared genre/mood tag "
+                "at all \u2014 broad, catches stragglers the other two miss, but noisiest on its "
+                "own. For crisp, sharply-defined clusters, favor sonic + cluster agreement over "
+                "raw tag overlap; for looser, more inclusive clusters, raise tag overlap."
             )
 
-            if sonic_group_by == "artist":
-                sonic_artist_sample_size = st.slider(
-                    "Sampled tracks per artist", min_value=2, max_value=3, value=3, step=1,
-                    key="sonic_artist_sample_size",
-                )
-                st.caption(
-                    "How many of an artist's most-played tracks (or Plex-popular, as a "
-                    "fallback) get sonically analyzed to represent that artist."
-                )
-                sonic_tag_weight = st.slider(
-                    "Tag influence on grouping", min_value=0.0, max_value=1.0, value=0.25, step=0.05,
-                    key="sonic_tag_weight",
-                )
-                st.caption(
-                    "How much shared genre/mood tags (artist + album) count toward pulling two "
-                    "artists into the same community, alongside sonic similarity. 0 = sonic "
-                    "data only; higher values let strong tag overlap group artists even where "
-                    "Plex hasn't sonically linked them yet."
-                )
-                sonic_use_cache = st.checkbox(
-                    "Reuse cached artist profiles", value=True, key="sonic_use_cache",
-                )
-                st.caption(
-                    "Unchecking forces every artist's sample tracks to be re-analyzed against "
-                    "Plex this build, ignoring any cached profile \u2014 useful after changing "
-                    "sample size, or if you suspect a stale profile."
-                )
-                sonic_max_tracks = 1500
-                sonic_resolution = st.slider(
-                    "Community granularity", min_value=0.5, max_value=2.0, value=1.0, step=0.1,
-                    key="sonic_resolution",
-                )
-                st.caption(
-                    "Louvain's resolution parameter: lower values merge artists into fewer, "
-                    "broader communities; higher values split them into more, narrower ones."
-                )
-            else:
-                sonic_max_tracks = st.number_input(
-                    "Max tracks in sonic graph", min_value=100, max_value=5000, value=1500, step=100,
-                    key="sonic_max_tracks",
-                )
-                st.caption(
-                    "Each track in the graph costs one Plex API call (to fetch its sonic "
-                    "neighbors), so this caps runtime on large libraries \u2014 the most-played "
-                    "tracks are prioritized if your library has more than this."
-                )
-                sonic_resolution = st.slider(
-                    "Community granularity", min_value=0.5, max_value=2.0, value=1.0, step=0.1,
-                    key="sonic_resolution",
-                )
-                st.caption(
-                    "Louvain's resolution parameter: lower values merge tracks into fewer, "
-                    "broader communities; higher values split them into more, narrower ones. "
-                    "1.0 is the neutral default \u2014 adjust and rebuild to compare."
-                )
-                sonic_artist_sample_size = 3
-                sonic_tag_weight = 0.25
-                sonic_use_cache = True
+            sonic_artist_sample_size = st.slider(
+                "Sampled tracks per artist", min_value=2, max_value=3, value=3, step=1,
+                key="sonic_artist_sample_size",
+            )
+            st.caption(
+                "How many of an artist's most-played tracks (or Plex-popular, as a fallback "
+                "for artists with no play history) get sonically analyzed to represent that "
+                "artist."
+            )
+            sonic_use_cache = st.checkbox(
+                "Reuse cached artist profiles", value=True, key="sonic_use_cache",
+            )
+            st.caption(
+                "Unchecking forces every artist's sample tracks to be re-analyzed against Plex "
+                "this build, ignoring any cached profile \u2014 useful after changing sample "
+                "size, or if you suspect a stale profile."
+            )
+            sonic_max_tracks = 1500
+            sonic_resolution = st.slider(
+                "Community granularity", min_value=0.5, max_value=2.0, value=1.0, step=0.1,
+                key="sonic_resolution",
+            )
+            st.caption(
+                "Louvain's resolution parameter: lower values merge artists into fewer, "
+                "broader communities; higher values split them into more, narrower ones."
+            )
+        elif clustering_mode == "sonic":
+            sonic_max_tracks = st.number_input(
+                "Max tracks in sonic graph", min_value=100, max_value=5000, value=1500, step=100,
+                key="sonic_max_tracks",
+            )
+            st.caption(
+                "Each track in the graph costs one Plex API call (to fetch its sonic "
+                "neighbors), so this caps runtime on large libraries \u2014 the most-played "
+                "tracks are prioritized if your library has more than this."
+            )
+            sonic_resolution = st.slider(
+                "Community granularity", min_value=0.5, max_value=2.0, value=1.0, step=0.1,
+                key="sonic_resolution",
+            )
+            st.caption(
+                "Louvain's resolution parameter: lower values merge tracks into fewer, "
+                "broader communities; higher values split them into more, narrower ones. "
+                "1.0 is the neutral default \u2014 adjust and rebuild to compare."
+            )
+            sonic_artist_sample_size = 3
+            hybrid_sonic_weight, hybrid_tag_overlap_weight, hybrid_cluster_agreement_weight = 1.0, 0.0, 0.0
+            sonic_use_cache = True
         else:
-            sonic_group_by = "track"
             sonic_max_tracks = 1500
             sonic_resolution = 1.0
             sonic_artist_sample_size = 3
-            sonic_tag_weight = 0.25
+            hybrid_sonic_weight, hybrid_tag_overlap_weight, hybrid_cluster_agreement_weight = 0.5, 0.15, 0.35
             sonic_use_cache = True
 
         total_clusters_input = st.number_input(
@@ -401,7 +403,9 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                         sonic_resolution=float(sonic_resolution),
                         sonic_group_by=sonic_group_by,
                         sonic_artist_sample_size=int(sonic_artist_sample_size),
-                        sonic_tag_weight=float(sonic_tag_weight),
+                        hybrid_sonic_weight=float(hybrid_sonic_weight),
+                        hybrid_tag_overlap_weight=float(hybrid_tag_overlap_weight),
+                        hybrid_cluster_agreement_weight=float(hybrid_cluster_agreement_weight),
                         sonic_use_cache=bool(sonic_use_cache),
                     )
                     st.session_state['cluster_results_raw'] = results

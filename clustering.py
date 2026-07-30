@@ -1089,9 +1089,29 @@ def build_artist_sonic_profile(artist, sample_size=ARTIST_SONIC_SAMPLE_SIZE,
     return profile
 
 
+def _artist_majority_cluster(tags, tag_mapping):
+    """Given an artist's combined tag set and the Gemini tag->cluster
+    mapping, returns whichever cluster the artist's own tags vote for most
+    (or None if no tag maps to anything, or tag_mapping isn't supplied).
+    Used to let two artists' shared CLUSTER membership pull them together
+    in the similarity graph — a stronger, more curated signal than raw tag
+    overlap, since it's filtered through the clusters you actually defined
+    rather than any incidental shared tag."""
+    if not tag_mapping:
+        return None
+    votes = defaultdict(int)
+    for tag in tags:
+        if tag in tag_mapping:
+            votes[tag_mapping[tag]] += 1
+    if not votes:
+        return None
+    return max(votes, key=votes.get)
+
+
 def build_artist_similarity_graph(all_artists, sample_size=ARTIST_SONIC_SAMPLE_SIZE,
-                                   neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, tag_weight=0.25,
-                                   use_cache=True, debug=None):
+                                   neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
+                                   sonic_weight=0.5, tag_overlap_weight=0.15, cluster_agreement_weight=0.35,
+                                   tag_mapping=None, use_cache=True, debug=None):
     """
     Artist-level counterpart to build_sonic_similarity_graph: one node per
     ARTIST rather than per track, so Louvain groups artists directly instead
@@ -1102,18 +1122,27 @@ def build_artist_similarity_graph(all_artists, sample_size=ARTIST_SONIC_SAMPLE_S
     API calls even when it wouldn't be at full track-level (this is why
     there's no max_tracks cap here, unlike the track-level graph).
 
-    Edge weight between two artists blends two signals:
+    This is the real hybrid: edge weight between two artists blends THREE
+    independent signals, each contributing in proportion to its weight
+    (normalized to sum to 1 across whichever of the three are non-zero):
       - sonic: the stronger of either direction's neighbor-vote weight from
         build_artist_sonic_profile (max, not sum — two artists sampling into
         each other isn't "twice as similar", just confirmed from both sides).
-      - tag: Jaccard similarity of their combined genre+mood tag sets (see
-        get_artist_combined_tags), so artists whose sound Plex hasn't
-        sonically linked yet can still cluster together on strong tag
-        agreement, and vice versa.
-    final weight = (1 - tag_weight) * sonic + tag_weight * tag_jaccard.
-    An edge is only added if the blended weight is > 0 (i.e. some signal
-    exists between the pair) — most artist pairs in a library have neither
-    and simply aren't connected.
+        This is the only signal that comes from actual audio analysis.
+      - tag_overlap: Jaccard similarity of their combined genre/mood tag
+        sets (see get_artist_combined_tags) — a broad, noisy signal (any
+        shared tag counts a little), but catches real similarity that
+        neither Plex's sonic analysis nor a shared Gemini cluster caught.
+      - cluster_agreement: 1.0 if the two artists' tags vote for the SAME
+        Gemini-defined cluster (via _artist_majority_cluster), else 0 — a
+        narrow but curated signal, since it's filtered through the actual
+        cluster definitions you asked Gemini to build rather than any
+        incidental tag overlap. Requires tag_mapping; silently contributes
+        0 if it's not supplied (weight is still counted so callers can pass
+        it deliberately without tag_mapping to mean "off").
+    An edge is only added if the blended weight is > 0 (i.e. at least one
+    signal exists between the pair) — most artist pairs in a library have
+    none and simply aren't connected.
 
     Returns (graph, artist_by_key, profile_cache) — profile_cache is the
     (possibly updated) disk-cache dict; save it with
@@ -1128,11 +1157,19 @@ def build_artist_similarity_graph(all_artists, sample_size=ARTIST_SONIC_SAMPLE_S
             "(pip install networkx python-louvain)."
         )
 
+    total_weight = sonic_weight + tag_overlap_weight + cluster_agreement_weight
+    if total_weight <= 0:
+        sonic_weight, tag_overlap_weight, cluster_agreement_weight, total_weight = 1.0, 0.0, 0.0, 1.0
+    w_sonic = sonic_weight / total_weight
+    w_tag = tag_overlap_weight / total_weight
+    w_cluster = cluster_agreement_weight / total_weight
+
     cache = _load_artist_profile_cache() if use_cache else {}
     cache_hits = 0
 
     artist_by_key = {}
     profiles = {}
+    majority_cluster = {}
     for artist in all_artists:
         key = str(getattr(artist, 'ratingKey', ''))
         if not key:
@@ -1144,59 +1181,88 @@ def build_artist_similarity_graph(all_artists, sample_size=ARTIST_SONIC_SAMPLE_S
         )
         if before and cache.get(key, {}).get("fingerprint") == before:
             cache_hits += 1
+        majority_cluster[key] = _artist_majority_cluster(profiles[key]["tags"], tag_mapping)
 
-    d(f"**Artist sonic graph:** {len(artist_by_key)} artists profiled "
+    d(f"**Artist similarity graph:** {len(artist_by_key)} artists profiled "
       f"({cache_hits} reused from cache, {len(artist_by_key) - cache_hits} freshly sampled at "
-      f"{sample_size} track(s) each).")
+      f"{sample_size} track(s) each). Blend: {w_sonic:.0%} sonic / {w_tag:.0%} tag overlap / "
+      f"{w_cluster:.0%} cluster agreement.")
 
     graph = nx.Graph()
     graph.add_nodes_from(artist_by_key.keys())
 
-    edges_added = 0
+    # Sonic signal only exists between pairs with an actual neighbor vote —
+    # iterate those. Tag/cluster signal can exist between ANY pair, but
+    # checking every pair is O(n^2); since an edge with zero sonic weight
+    # still needs tag/cluster weight to justify existing, we only add those
+    # for pairs that share at least one tag (cheap to detect) — two artists
+    # with zero tag overlap AND zero sonic link have no real evidence of
+    # similarity anyway, so skipping them is a fidelity/runtime tradeoff
+    # worth taking at library scale.
+    tags_by_key = {k: set(p["tags"]) for k, p in profiles.items()}
+    tag_to_artists = defaultdict(set)
+    for key, tags in tags_by_key.items():
+        for tag in tags:
+            tag_to_artists[tag].add(key)
+
+    candidate_pairs = set()
     for key, profile in profiles.items():
-        tags_a = set(profile["tags"])
-        for neighbor_key, sonic_w in profile["neighbors"].items():
-            if neighbor_key not in artist_by_key or neighbor_key == key:
-                continue
-            other_w = profiles.get(neighbor_key, {}).get("neighbors", {}).get(key, 0.0)
-            sonic = max(sonic_w, other_w)
+        for neighbor_key in profile["neighbors"]:
+            if neighbor_key in artist_by_key and neighbor_key != key:
+                candidate_pairs.add(tuple(sorted((key, neighbor_key))))
+    for tag, keys in tag_to_artists.items():
+        keys = list(keys)
+        if len(keys) > 1 and len(keys) <= 200:  # skip near-universal tags — no discriminative value
+            for i in range(len(keys)):
+                for j in range(i + 1, len(keys)):
+                    candidate_pairs.add(tuple(sorted((keys[i], keys[j]))))
 
-            tags_b = set(profiles.get(neighbor_key, {}).get("tags", []))
-            union = tags_a | tags_b
-            tag_sim = (len(tags_a & tags_b) / len(union)) if union else 0.0
+    edges_added = 0
+    for key, neighbor_key in candidate_pairs:
+        sonic = max(
+            profiles.get(key, {}).get("neighbors", {}).get(neighbor_key, 0.0),
+            profiles.get(neighbor_key, {}).get("neighbors", {}).get(key, 0.0),
+        )
+        tags_a, tags_b = tags_by_key.get(key, set()), tags_by_key.get(neighbor_key, set())
+        union = tags_a | tags_b
+        tag_sim = (len(tags_a & tags_b) / len(union)) if union else 0.0
+        same_cluster = (
+            majority_cluster.get(key) is not None
+            and majority_cluster.get(key) == majority_cluster.get(neighbor_key)
+        )
+        cluster_sim = 1.0 if same_cluster else 0.0
 
-            weight = (1 - tag_weight) * sonic + tag_weight * tag_sim
-            if weight <= 0:
-                continue
-            if graph.has_edge(key, neighbor_key):
-                existing = graph[key][neighbor_key].get('weight', 0)
-                graph[key][neighbor_key]['weight'] = max(existing, weight)
-            else:
-                graph.add_edge(key, neighbor_key, weight=weight)
-                edges_added += 1
+        weight = w_sonic * sonic + w_tag * tag_sim + w_cluster * cluster_sim
+        if weight <= 0:
+            continue
+        graph.add_edge(key, neighbor_key, weight=weight)
+        edges_added += 1
 
-    d(f"└ Artist graph built: {graph.number_of_nodes()} artists, {edges_added} similarity edges "
-      f"(sonic + {tag_weight:.0%} tag blend).")
+    d(f"└ Artist graph built: {graph.number_of_nodes()} artists, {edges_added} similarity edges.")
 
     return graph, artist_by_key, cache
 
 
 def build_artist_sonic_clusters(music_section, tag_mapping=None, sample_size=ARTIST_SONIC_SAMPLE_SIZE,
-                                 neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, tag_weight=0.25,
+                                 neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
+                                 sonic_weight=0.5, tag_overlap_weight=0.15, cluster_agreement_weight=0.35,
                                  resolution=1.0, use_cache=True, debug=None):
     """
     Artist-level counterpart to build_sonic_clusters: Louvain community
-    detection over build_artist_similarity_graph (sampled-track sonic
-    profile + rolled-up artist/album tags), so membership is decided per
-    ARTIST — every track from an artist lands in the same community as the
-    rest of that artist's catalog, rather than different tracks by the same
-    artist potentially splitting across communities the way pure track-level
-    clustering allows.
+    detection over build_artist_similarity_graph — a genuine hybrid blend of
+    sonic profile, raw tag overlap, and Gemini cluster agreement (see that
+    function's docstring for the three-way weighting) — so membership is
+    decided per ARTIST using all three signals together, not tags-then-sonic
+    or sonic-then-tags as two separate passes. Every track from an artist
+    lands in the same community as the rest of that artist's catalog.
 
     Naming works the same way as build_sonic_clusters: each community is
     named after whichever tag_mapping cluster its member artists' tags vote
-    for most, purely for a readable label — membership itself already came
-    from the graph before tags are consulted here.
+    for most, for a readable label — this reuses the same majority-cluster
+    signal that also fed the graph weighting above, so a community's name
+    should usually agree with what pulled its members together in the first
+    place (though membership can still be swayed by sonic/tag-overlap signal
+    even when cluster_agreement_weight isn't the dominant one).
 
     Returns (results, community_tag_votes) — results is
     {cluster_name: [tracks]} (every track from every artist in that
@@ -1211,7 +1277,9 @@ def build_artist_sonic_clusters(music_section, tag_mapping=None, sample_size=ART
 
     graph, artist_by_key, cache = build_artist_similarity_graph(
         all_artists, sample_size=sample_size, neighbor_limit=neighbor_limit,
-        tag_weight=tag_weight, use_cache=use_cache, debug=debug
+        sonic_weight=sonic_weight, tag_overlap_weight=tag_overlap_weight,
+        cluster_agreement_weight=cluster_agreement_weight, tag_mapping=tag_mapping,
+        use_cache=use_cache, debug=debug
     )
     if use_cache:
         _save_artist_profile_cache(cache)
@@ -1224,7 +1292,7 @@ def build_artist_sonic_clusters(music_section, tag_mapping=None, sample_size=ART
     for key, community_id in partition.items():
         communities[community_id].append(artist_by_key[key])
 
-    d(f"**Louvain found {len(communities)} raw artist sonic communities** (resolution={resolution}).")
+    d(f"**Louvain found {len(communities)} raw artist communities** (resolution={resolution}).")
 
     results = defaultdict(list)
     community_tag_votes = {}
@@ -1418,10 +1486,11 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
                           reassign_tagged_via_sonic=False, sonic_propagation_rounds=2,
                           clustering_mode="tags", sonic_max_tracks=SONIC_GRAPH_MAX_TRACKS,
                           sonic_neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, sonic_resolution=1.0,
-                          sonic_group_by="track", sonic_artist_sample_size=ARTIST_SONIC_SAMPLE_SIZE,
-                          sonic_tag_weight=0.25, sonic_use_cache=True):
+                          sonic_group_by="artist", sonic_artist_sample_size=ARTIST_SONIC_SAMPLE_SIZE,
+                          hybrid_sonic_weight=0.5, hybrid_tag_overlap_weight=0.15,
+                          hybrid_cluster_agreement_weight=0.35, sonic_use_cache=True):
     """
-    Full pipeline. Two fundamentally different clustering_mode options:
+    Full pipeline. clustering_mode options:
 
     - "tags" (default): collect genre+mood tags -> tag/cluster mapping
       (disk + memory cached, or reused from a prior Suggest step) -> assign
@@ -1430,31 +1499,45 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
       mistagged ones (see refine_unsorted_via_sonic_neighbors) -> blend each
       cluster's final track list from popular + sonically-similar +
       related-artist picks (_blend_cluster_tracks). Tags decide membership;
-      sonic analysis only corrects afterward.
+      sonic analysis only corrects afterward. `sonic_weight` here controls
+      that correction pass only (see refine_unsorted_via_sonic_neighbors) —
+      it is unrelated to the hybrid_* weights below.
 
-    - "sonic": membership itself comes from Louvain community detection on
-      a sonic-similarity graph — tracks/artists that Plex's own audio
-      analysis considers close get grouped together directly, with no tag
-      involved in deciding who belongs where. The (still Gemini-built) tag
-      mapping is only used to NAME each resulting community after its
-      majority tag-cluster, purely for human-readable labels.
-      `sonic_group_by` picks which graph gets built:
-        - "track" (default): build_sonic_clusters — one node per track,
-          capped at sonic_max_tracks, no caching (see its docstring).
-        - "artist": build_artist_sonic_clusters — one node per artist, its
-          profile built from `sonic_artist_sample_size` sampled tracks
-          (most-played, falling back to Plex-popular) blended with that
-          artist's + its albums' genre/mood tags (sonic_tag_weight controls
-          the blend). Profiles are disk-cached per artist
-          (sonic_use_cache=False to force fresh sampling), so this is
-          affordable at full-library scale and keeps an artist's whole
-          catalog together in one community instead of letting individual
-          tracks by the same artist land in different ones.
+    - "sonic": membership comes from Louvain community detection over a
+      similarity graph that genuinely BLENDS sonic and tag signal together
+      at the graph-edge level (not tags-then-sonic or sonic-then-tags as two
+      separate passes). `sonic_group_by` picks which graph:
+        - "artist" (default, recommended): build_artist_sonic_clusters —
+          one node per artist, profile built from `sonic_artist_sample_size`
+          sampled top tracks (most-played, falling back to Plex-popular).
+          Each edge weight is a 3-way blend, each independently weighted:
+            - hybrid_sonic_weight: real audio-fingerprint similarity
+              between artists' sampled tracks (get_sonic_match_percent).
+            - hybrid_tag_overlap_weight: raw Jaccard similarity of the
+              artists' own + album genre/mood tags — broad, catches
+              similarity the other two signals miss.
+            - hybrid_cluster_agreement_weight: 1.0 if both artists' tags
+              vote into the SAME Gemini-defined cluster, else 0 — narrow
+              but curated, since it's filtered through the actual cluster
+              names you asked Gemini to build. Requires a real tag_mapping;
+              contributes nothing if dry_run built a throwaway one.
+          Weights are normalized to sum to 1 automatically, so e.g.
+          (0.5, 0.15, 0.35) and (1.0, 0.3, 0.7) produce the same blend.
+          Set any one to 0 to exclude that signal entirely (e.g. sonic=0,
+          cluster=1 reproduces pure tag-cluster grouping at artist level).
+          Profiles are disk-cached per artist (sonic_use_cache=False to
+          force fresh sampling), so this is affordable at full-library
+          scale and keeps an artist's whole catalog in one community.
+        - "track": build_sonic_clusters — one node per track, capped at
+          sonic_max_tracks, sonic-only (no tag signal in membership, tags
+          only name the result afterward), no caching. Kept for comparison
+          against the hybrid artist mode above.
 
     Returns (results, tag_mapping) — results is {cluster_name: [tracks]},
     tag_mapping is the raw tag->cluster dict (handy for coloring the
     Library Galaxy tab by cluster without re-deriving it, and used in
-    "sonic" mode only for community naming).
+    "sonic" mode for community naming and, in "artist" grouping, for the
+    cluster_agreement signal too).
 
     Set dry_run=True (tags mode only) to skip Gemini entirely and use
     build_dry_run_mapping instead — useful for testing the rest of the
@@ -1483,17 +1566,20 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
 
     if clustering_mode == "sonic":
         if sonic_group_by == "artist":
-            d("**Sonic-first mode (artist-level):** cluster membership comes from Louvain "
-              "community detection over per-artist sonic profiles (sampled top tracks + "
-              "artist/album tags); tags are only used to name the resulting communities.")
+            d("**Hybrid mode (artist-level):** cluster membership comes from Louvain community "
+              f"detection over a blended graph — {hybrid_sonic_weight:g} sonic / "
+              f"{hybrid_tag_overlap_weight:g} tag overlap / {hybrid_cluster_agreement_weight:g} "
+              "Gemini cluster agreement (normalized). All three signals decide membership together.")
             sonic_pools, community_tag_votes = build_artist_sonic_clusters(
                 music_section, tag_mapping=tag_mapping, sample_size=sonic_artist_sample_size,
-                neighbor_limit=sonic_neighbor_limit, tag_weight=sonic_tag_weight,
+                neighbor_limit=sonic_neighbor_limit, sonic_weight=hybrid_sonic_weight,
+                tag_overlap_weight=hybrid_tag_overlap_weight,
+                cluster_agreement_weight=hybrid_cluster_agreement_weight,
                 resolution=sonic_resolution, use_cache=sonic_use_cache, debug=debug
             )
-            tag_suffix = "Sonic Community (Artist)"
+            tag_suffix = "Hybrid Community"
         else:
-            d("**Sonic-first mode (track-level):** cluster membership comes from Louvain "
+            d("**Sonic-only mode (track-level):** cluster membership comes from Louvain "
               "community detection on the sonic-similarity graph; tags are only used to "
               "name the resulting communities.")
             sonic_pools, community_tag_votes = build_sonic_clusters(
