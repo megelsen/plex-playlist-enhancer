@@ -91,18 +91,33 @@ def build_similarity_graph(music_section, max_artists=150, debug=None):
     return graph
 
 
-def render_galaxy_figure(graph, tag_mapping=None, group_by_cluster=True):
+def render_galaxy_figure(graph, tag_mapping=None, artist_cluster_map=None, group_by_cluster=True):
     """
     Lays the graph out in 3D using a spring (force-directed) layout and
     renders it as an interactive Plotly figure: drag to rotate (works at
     any zoom level), scroll to zoom, hover a node to see its title and
-    (if tag_mapping is supplied) its genre cluster.
+    cluster.
 
     Node position and node color come from two independent signals — Plex's
-    "Similar Artist" web (position) and genre/mood-tag clustering (color) —
-    so by default they won't visually align; a library that's genuinely
-    dominated by one cluster will look like one color scattered everywhere,
-    which is accurate, not a clustering bug.
+    "Similar Artist" web (position) and cluster membership (color) — so by
+    default they won't visually align; a library that's genuinely dominated
+    by one cluster will look like one color scattered everywhere, which is
+    accurate, not a clustering bug.
+
+    Coloring prefers `artist_cluster_map` — {artist_ratingKey: cluster_name}
+    from clustering.build_artist_cluster_map, i.e. what Library Clusters'
+    last build ACTUALLY decided for each artist — over re-deriving
+    membership from tags via tag_mapping. The two agree in Tags mode (tag
+    IS the membership decision there), but can genuinely differ in
+    Hybrid/Sonic mode, where an artist's cluster comes from the similarity
+    graph and may disagree with what its tags alone would suggest — using
+    artist_cluster_map is what makes the galaxy reflect the SAME clusters
+    you see in the Library Clusters tab, in whichever mode built them,
+    rather than silently re-running a tags-only guess in the background.
+    tag_mapping is still accepted as a fallback for artists missing from
+    artist_cluster_map (e.g. an artist with zero tracks in any cluster's
+    final track list) and for backward compatibility when no cluster build
+    has happened yet at all.
 
     group_by_cluster=True adds a gentle attractive pull between all members
     of the same cluster (via temporary hub nodes connected to every member,
@@ -114,13 +129,19 @@ def render_galaxy_figure(graph, tag_mapping=None, group_by_cluster=True):
     if graph.number_of_nodes() == 0:
         return None
 
+    have_cluster_signal = bool(artist_cluster_map) or bool(tag_mapping)
+
     clusters_to_nodes = {}
     for n, data in graph.nodes(data=True):
-        artist_tags = set(data.get('genres', [])) | set(data.get('moods', []))
-        cluster = assign_artist_cluster(artist_tags, tag_mapping) if tag_mapping else "Uncategorized"
-        clusters_to_nodes.setdefault(cluster, []).append(n)
+        cluster = None
+        if artist_cluster_map:
+            cluster = artist_cluster_map.get(n) or artist_cluster_map.get(str(n))
+        if cluster is None and tag_mapping:
+            artist_tags = set(data.get('genres', [])) | set(data.get('moods', []))
+            cluster = assign_artist_cluster(artist_tags, tag_mapping)
+        clusters_to_nodes.setdefault(cluster or "Uncategorized", []).append(n)
 
-    if group_by_cluster and tag_mapping:
+    if group_by_cluster and have_cluster_signal:
         layout_graph = graph.copy()
         for cluster_name, node_ids in clusters_to_nodes.items():
             hub_id = f"__hub__{cluster_name}"

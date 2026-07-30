@@ -12,7 +12,8 @@ def render(plex, debug_box):
     st.caption(
         "A 3D star map of your artists, connected by Plex's 'Similar Artist' data — "
         "artists with more/stronger connections drift closer together. Build clusters "
-        "in the 🗂️ Library Clusters tab first to color nodes by genre cluster."
+        "in the 🗂️ Library Clusters tab first (any mode) to color nodes by the clusters "
+        "that build actually produced."
     )
 
     try:
@@ -31,11 +32,11 @@ def render(plex, debug_box):
         "Pull same-cluster artists together",
         value=True,
         help="Node position normally comes only from Plex's 'Similar Artist' data, which "
-             "is independent from genre-cluster color — so a genre-dominant library can "
+             "is independent from cluster color — so a cluster-dominant library can "
              "look like one color scattered everywhere, correctly. This adds a gentle pull "
              "between same-cluster artists so the coloring is also visually legible, "
              "without discarding the real similarity structure. Requires clusters built in "
-             "🗂️ Library Clusters first.",
+             "🗂️ Library Clusters first (any clustering mode — Hybrid, Tags, or Sonic).",
     )
 
     if st.button("🌟 Build Galaxy"):
@@ -43,8 +44,10 @@ def render(plex, debug_box):
             graph = build_similarity_graph(section, max_artists=int(max_artists), debug=debug_box)
             st.session_state['galaxy_graph'] = graph
             tag_mapping = st.session_state.get('cluster_tag_mapping')
+            artist_cluster_map = st.session_state.get('cluster_artist_map')
             st.session_state['galaxy_figure'] = render_galaxy_figure(
-                graph, tag_mapping=tag_mapping, group_by_cluster=group_by_cluster
+                graph, tag_mapping=tag_mapping, artist_cluster_map=artist_cluster_map,
+                group_by_cluster=group_by_cluster
             )
             st.session_state['galaxy_node_count'] = graph.number_of_nodes()
             st.session_state['galaxy_edge_count'] = graph.number_of_edges()
@@ -54,8 +57,10 @@ def render(plex, debug_box):
     if st.session_state.get('galaxy_graph') is not None and st.button("🔄 Re-layout with current toggle"):
         with st.spinner("Re-laying out the galaxy..."):
             tag_mapping = st.session_state.get('cluster_tag_mapping')
+            artist_cluster_map = st.session_state.get('cluster_artist_map')
             st.session_state['galaxy_figure'] = render_galaxy_figure(
-                st.session_state['galaxy_graph'], tag_mapping=tag_mapping, group_by_cluster=group_by_cluster
+                st.session_state['galaxy_graph'], tag_mapping=tag_mapping,
+                artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster
             )
 
     figure = st.session_state.get('galaxy_figure')
@@ -86,7 +91,7 @@ def render(plex, debug_box):
                 "displaylogo": False,
             },
         )
-        if not st.session_state.get('cluster_tag_mapping'):
-            st.info("All nodes are 'Uncategorized' right now — build clusters in 🗂️ Library Clusters to color them by genre.")
+        if not st.session_state.get('cluster_tag_mapping') and not st.session_state.get('cluster_artist_map'):
+            st.info("All nodes are 'Uncategorized' right now — build clusters in 🗂️ Library Clusters to color them.")
     else:
         st.info("Click 'Build Galaxy' to render your library's artist similarity map.")

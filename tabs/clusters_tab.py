@@ -6,7 +6,10 @@ cluster as a playlist."""
 
 import streamlit as st
 
-from clustering import build_genre_clusters, get_all_genre_and_mood_tags, suggest_cluster_names, apply_cluster_merge_plan
+from clustering import (
+    build_genre_clusters, get_all_genre_and_mood_tags, suggest_cluster_names, apply_cluster_merge_plan,
+    build_artist_cluster_map, save_cluster_results_cache, load_cluster_results_cache, clear_artist_scan_cache,
+)
 from ui_components import render_track_row
 
 
@@ -36,6 +39,21 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         st.session_state['suggested_snapshot'] = None  # {tags, total, clusters, mapping}
     if 'cluster_tag_counts' not in st.session_state:
         st.session_state['cluster_tag_counts'] = None  # {"genre": n, "mood": n} from last Preview Tags
+    if 'cluster_artist_map' not in st.session_state:
+        st.session_state['cluster_artist_map'] = None  # {artist_ratingKey: cluster_name}, for Library Galaxy
+    if 'cluster_cache_checked' not in st.session_state:
+        # Runs once per session: if nothing's been built yet THIS session,
+        # try loading the last build from disk so a restarted app doesn't
+        # show an empty Results section — costs zero Gemini/Plex calls
+        # beyond plex.fetchItem per cached track.
+        st.session_state['cluster_cache_checked'] = True
+        if st.session_state['cluster_results_raw'] is None:
+            cached_results, cached_mapping = load_cluster_results_cache(plex, debug=debug_box)
+            if cached_results:
+                st.session_state['cluster_results_raw'] = cached_results
+                st.session_state['cluster_tag_mapping_raw'] = cached_mapping
+                st.session_state['cluster_names_used'] = list(cached_results.keys())
+                st.session_state['cluster_artist_map'] = build_artist_cluster_map(cached_results)
 
     try:
         cluster_music_section = next(s for s in plex.library.sections() if s.type in ['artist', 'music'])
@@ -50,7 +68,15 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
     # to configure things blind and find the tag scan buried further down.
     st.subheader("1. Scan your library")
     st.caption("Zero-cost — no Gemini call. Run this first so the cluster count below has real numbers to work from.")
+    force_rescan = st.checkbox(
+        "Force rescan library (ignore cached artist scan)", value=False, key="force_rescan_artists",
+        help="The library's artist list is cached in-memory for a while so Scan/Configure/Build don't each "
+             "re-fetch it from Plex separately. Check this if you've added/changed music since your last scan "
+             "this session and want fresh data immediately.",
+    )
     if st.button("👀 Scan genre/mood tags"):
+        if force_rescan:
+            clear_artist_scan_cache()
         with st.spinner("Scanning library tags..."):
             genre_tags, mood_tags = get_all_genre_and_mood_tags(cluster_music_section)
         st.session_state['cluster_tag_counts'] = {"genre": len(genre_tags), "mood": len(mood_tags)}
@@ -146,14 +172,26 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                 "size, or if you suspect a stale profile."
             )
             sonic_max_tracks = 1500
-            sonic_resolution = st.slider(
-                "Community granularity", min_value=0.5, max_value=2.0, value=1.0, step=0.1,
-                key="sonic_resolution",
+            sonic_auto_tune_clusters = st.checkbox(
+                "Auto-tune granularity to target cluster count", value=True, key="sonic_auto_tune_clusters",
             )
             st.caption(
-                "Louvain's resolution parameter: lower values merge artists into fewer, "
-                "broader communities; higher values split them into more, narrower ones."
+                "When checked, 'Maximum number of clusters' below also acts as a target here \u2014 "
+                "a quick search finds whichever Louvain granularity lands closest to that many "
+                "clusters, instead of using a single fixed value that might land far from what "
+                "you asked for (e.g. 4 clusters when you wanted ~15). Uncheck for manual control."
             )
+            if sonic_auto_tune_clusters:
+                sonic_resolution = 1.0
+            else:
+                sonic_resolution = st.slider(
+                    "Community granularity", min_value=0.2, max_value=4.0, value=1.0, step=0.1,
+                    key="sonic_resolution",
+                )
+                st.caption(
+                    "Louvain's resolution parameter: lower values merge artists into fewer, "
+                    "broader communities; higher values split them into more, narrower ones."
+                )
         elif clustering_mode == "sonic":
             sonic_max_tracks = st.number_input(
                 "Max tracks in sonic graph", min_value=100, max_value=5000, value=1500, step=100,
@@ -164,21 +202,31 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                 "neighbors), so this caps runtime on large libraries \u2014 the most-played "
                 "tracks are prioritized if your library has more than this."
             )
-            sonic_resolution = st.slider(
-                "Community granularity", min_value=0.5, max_value=2.0, value=1.0, step=0.1,
-                key="sonic_resolution",
+            sonic_auto_tune_clusters = st.checkbox(
+                "Auto-tune granularity to target cluster count", value=True, key="sonic_auto_tune_clusters_track",
             )
             st.caption(
-                "Louvain's resolution parameter: lower values merge tracks into fewer, "
-                "broader communities; higher values split them into more, narrower ones. "
-                "1.0 is the neutral default \u2014 adjust and rebuild to compare."
+                "When checked, 'Maximum number of clusters' below also acts as a target here. "
+                "Uncheck for manual control over Louvain's resolution parameter directly."
             )
+            if sonic_auto_tune_clusters:
+                sonic_resolution = 1.0
+            else:
+                sonic_resolution = st.slider(
+                    "Community granularity", min_value=0.2, max_value=4.0, value=1.0, step=0.1,
+                    key="sonic_resolution",
+                )
+                st.caption(
+                    "Louvain's resolution parameter: lower values merge tracks into fewer, "
+                    "broader communities; higher values split them into more, narrower ones."
+                )
             sonic_artist_sample_size = 3
             hybrid_sonic_weight, hybrid_tag_overlap_weight, hybrid_cluster_agreement_weight = 1.0, 0.0, 0.0
             sonic_use_cache = True
         else:
             sonic_max_tracks = 1500
             sonic_resolution = 1.0
+            sonic_auto_tune_clusters = True
             sonic_artist_sample_size = 3
             hybrid_sonic_weight, hybrid_tag_overlap_weight, hybrid_cluster_agreement_weight = 0.5, 0.15, 0.35
             sonic_use_cache = True
@@ -382,6 +430,8 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
 
             with st.spinner("Analyzing genres and building clusters..."):
                 try:
+                    if force_rescan:
+                        clear_artist_scan_cache()
                     results, tag_mapping = build_genre_clusters(
                         cluster_music_section,
                         plex,
@@ -407,12 +457,15 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                         hybrid_tag_overlap_weight=float(hybrid_tag_overlap_weight),
                         hybrid_cluster_agreement_weight=float(hybrid_cluster_agreement_weight),
                         sonic_use_cache=bool(sonic_use_cache),
+                        sonic_auto_tune_clusters=bool(sonic_auto_tune_clusters),
                     )
                     st.session_state['cluster_results_raw'] = results
                     st.session_state['cluster_tag_mapping_raw'] = tag_mapping
                     st.session_state['cluster_merge_plan'] = []  # fresh build invalidates any prior grouping
                     st.session_state['cluster_removed_keys'] = {}
                     st.session_state['cluster_names_used'] = list(results.keys())
+                    st.session_state['cluster_artist_map'] = build_artist_cluster_map(results)
+                    save_cluster_results_cache(results, tag_mapping)
                 except Exception as e:
                     st.error(f"Failed to build clusters: {e}")
                     st.session_state['cluster_results_raw'] = None
@@ -501,6 +554,22 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
     }
     st.session_state['cluster_results'] = cluster_results
     st.session_state['cluster_tag_mapping'] = merged_tag_mapping
+    # Keep the artist-cluster map (used by Library Galaxy) in sync with
+    # what's actually shown here — merges/removals change membership
+    # without a fresh build, so it needs refreshing on every render, not
+    # just right after "Build Clusters". The disk cache, though, is only
+    # written when membership actually changed since the last save (cheap
+    # signature check) — this whole block re-runs on every Streamlit
+    # interaction (e.g. clicking play on an unrelated track row), and a
+    # full JSON write every single rerun would be needless disk churn.
+    st.session_state['cluster_artist_map'] = build_artist_cluster_map(cluster_results)
+    results_signature = tuple(sorted(
+        (name, tuple(sorted(getattr(t, 'ratingKey', None) for t in tracks)))
+        for name, tracks in cluster_results.items()
+    ))
+    if st.session_state.get('cluster_results_cache_signature') != results_signature:
+        save_cluster_results_cache(cluster_results, merged_tag_mapping)
+        st.session_state['cluster_results_cache_signature'] = results_signature
 
     st.write("---")
 

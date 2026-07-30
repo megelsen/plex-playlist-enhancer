@@ -30,6 +30,20 @@ except ImportError:
 
 from plex_helpers import get_sonic_match_percent, get_top_tracks_for_artist
 
+# In-process cache of music_section.searchArtists() results. A full-library
+# artist scan is the single most repeated Plex round-trip in this file —
+# get_all_genre_and_mood_tags, build_sonic_clusters, and
+# build_artist_sonic_clusters each used to call searchArtists() separately,
+# so a single "Build Clusters" click could scan the whole library 2-3 times
+# over. Keyed by section (not by anything about the caller), so all three
+# share one fetch per TTL window regardless of which functions are called
+# in what order. This is intentionally NOT disk-backed — artists are live
+# plexapi objects (can't be JSON-serialized), so this only helps within one
+# running process/session, not across restarts (that's what
+# ARTIST_PROFILE_CACHE_PATH and CLUSTER_RESULTS_CACHE_PATH are for).
+_ARTIST_SCAN_CACHE = {}
+ARTIST_SCAN_TTL_SECONDS = 900  # long enough to cover one scan->configure->build session
+
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 # Cap on how many tracks get pulled into the sonic-similarity graph for
@@ -158,6 +172,45 @@ def _save_disk_cache(key, clusters, mapping):
         pass
 
 
+def get_cached_artists(music_section, debug=None, force_refresh=False):
+    """
+    Shared front door for the full-library artist scan (see
+    _ARTIST_SCAN_CACHE above) — every function in this file that needs
+    "every artist in the library" should call this instead of
+    music_section.searchArtists() directly, so repeated calls within one
+    build (or across the Scan Tags -> Configure -> Build steps in the UI)
+    reuse the same fetch instead of re-hitting Plex each time.
+    force_refresh=True bypasses the cache and re-scans regardless of TTL —
+    wired to the UI's "Force rescan library" option for when the user knows
+    their library changed mid-session.
+    """
+    d = debug.write if debug else (lambda *a, **k: None)
+    section_key = str(getattr(music_section, 'key', None) or getattr(music_section, 'title', 'default'))
+    cached = _ARTIST_SCAN_CACHE.get(section_key)
+    now = time.time()
+    if not force_refresh and cached and (now - cached["fetched_at"]) < ARTIST_SCAN_TTL_SECONDS:
+        d(f"Reusing cached artist scan for `{section_key}` — {len(cached['artists'])} artists, "
+          f"{int(now - cached['fetched_at'])}s old.")
+        return cached["artists"]
+    try:
+        artists = music_section.searchArtists()
+    except Exception as e:
+        d(f"❌ Artist scan failed: `{e}` — {'falling back to stale cache' if cached else 'no prior cache to fall back on'}.")
+        artists = cached["artists"] if cached else []
+    _ARTIST_SCAN_CACHE[section_key] = {"artists": artists, "fetched_at": now}
+    d(f"Scanned `{section_key}`: {len(artists)} artists (fresh Plex fetch).")
+    return artists
+
+
+def clear_artist_scan_cache():
+    """Drops the in-process artist scan cache (see _ARTIST_SCAN_CACHE) so
+    the next call to get_cached_artists does a fresh Plex fetch regardless
+    of TTL. Wired to the UI's 'Force rescan library' checkbox — simpler
+    than threading a force_refresh flag through every function that
+    ultimately calls get_cached_artists."""
+    _ARTIST_SCAN_CACHE.clear()
+
+
 def get_all_genre_and_mood_tags(music_section):
     """
     Collects every distinct genre AND mood tag in the library at album
@@ -171,10 +224,7 @@ def get_all_genre_and_mood_tags(music_section):
     """
     genre_tags = set()
     mood_tags = set()
-    try:
-        artists = music_section.searchArtists()
-    except Exception:
-        artists = []
+    artists = get_cached_artists(music_section)
     for artist in artists:
         artist_genres = {g.tag for g in getattr(artist, 'genres', [])}
         try:
@@ -927,6 +977,97 @@ def apply_cluster_merge_plan(raw_results, raw_tag_mapping, merge_plan):
     return dict(merged_results), merged_tag_mapping
 
 
+def build_artist_cluster_map(results):
+    """
+    Given a final {cluster_name: [tracks]} build output (any clustering_mode
+    — tags, hybrid, or sonic), derives a {artist_ratingKey: cluster_name}
+    map by majority vote of each artist's OWN tracks across whichever
+    cluster(s) they ended up in.
+
+    This is what the build actually decided, as opposed to independently
+    re-deriving membership from tags via assign_artist_cluster — the two
+    agree in Tags mode (where tag IS the membership decision) but can
+    genuinely differ in Hybrid/Sonic mode, where membership comes from the
+    similarity graph and an artist's tags might disagree with where their
+    sonic profile actually landed them. Library Galaxy uses this so its
+    node coloring reflects the real build, not a separate tag-only guess.
+    """
+    votes = defaultdict(lambda: defaultdict(int))
+    for cluster_name, tracks in results.items():
+        for t in tracks:
+            artist_key = getattr(t, 'grandparentRatingKey', None)
+            if artist_key is not None:
+                votes[artist_key][cluster_name] += 1
+    return {artist_key: max(counts, key=counts.get) for artist_key, counts in votes.items()}
+
+
+# Disk path for the last successful cluster BUILD (as track ratingKeys, not
+# live plexapi objects — those can't be JSON-serialized). Distinct from
+# CLUSTER_CACHE_PATH (which only caches the tag->cluster mapping, i.e. the
+# Gemini call) — this caches the actual final track lists, so re-opening the
+# app after a restart can show last time's results immediately instead of
+# an empty Results section, without re-running Gemini OR re-scanning Plex
+# OR re-analyzing any sonic profiles.
+CLUSTER_RESULTS_CACHE_PATH = os.environ.get("CLUSTER_RESULTS_CACHE_PATH", "/app/data/cluster_results.json")
+
+
+def save_cluster_results_cache(results, tag_mapping):
+    """Persists the current cluster build to disk as track ratingKeys, for
+    load_cluster_results_cache to rehydrate on a future app start. Call
+    this any time `results` changes (fresh build, merge, or manual track
+    removal) — best-effort, silently does nothing on failure since this is
+    a convenience cache, not a source of truth."""
+    try:
+        os.makedirs(os.path.dirname(CLUSTER_RESULTS_CACHE_PATH), exist_ok=True)
+        payload = {
+            "tag_mapping": tag_mapping,
+            "clusters": {name: [getattr(t, 'ratingKey', None) for t in tracks] for name, tracks in results.items()},
+        }
+        with open(CLUSTER_RESULTS_CACHE_PATH, "w") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+
+def load_cluster_results_cache(plex, debug=None):
+    """
+    Rehydrates the last cached cluster build (see save_cluster_results_cache)
+    back into real Plex track objects via plex.fetchItem, so a saved build
+    survives an app/container restart instead of forcing a full rebuild.
+
+    Returns (results, tag_mapping), or (None, None) if there's no cache
+    file, it's unreadable, or every cached ratingKey has since vanished
+    from the library (tracks removed/library changed) — any individual
+    missing ratingKey is just skipped rather than failing the whole load,
+    since a few stale entries shouldn't discard an otherwise-good cache.
+    """
+    d = debug.write if debug else (lambda *a, **k: None)
+    try:
+        with open(CLUSTER_RESULTS_CACHE_PATH, "r") as f:
+            payload = json.load(f)
+    except Exception:
+        return None, None
+
+    results = {}
+    missing = 0
+    for name, keys in payload.get("clusters", {}).items():
+        tracks = []
+        for key in keys:
+            try:
+                tracks.append(plex.fetchItem(key))
+            except Exception:
+                missing += 1
+                continue
+        if tracks:
+            results[name] = tracks
+    if not results:
+        return None, None
+    total = sum(len(t) for t in results.values())
+    d(f"**Loaded {total} tracks across {len(results)} clusters from disk cache** "
+      f"({missing} stale ratingKey(s) skipped) — no rebuild needed.")
+    return results, payload.get("tag_mapping")
+
+
 def _fold_thin_clusters(pools, clusters, tag_mapping, locked_clusters, debug=None):
     """
     Mechanical balance safety net that runs after real track pooling, since
@@ -1243,10 +1384,52 @@ def build_artist_similarity_graph(all_artists, sample_size=ARTIST_SONIC_SAMPLE_S
     return graph, artist_by_key, cache
 
 
+def _auto_tune_resolution(graph, target_communities, resolution_bounds=(0.2, 4.0), max_iter=8, debug=None):
+    """
+    Louvain's `resolution` parameter trades off community count (higher ->
+    more, smaller communities; lower -> fewer, larger ones) but isn't
+    directly interpretable as "give me N communities" — a fixed resolution
+    of 1.0 can land anywhere from 4 to 40 communities depending on how the
+    similarity graph happens to be shaped for a given library. This does a
+    small binary search instead: try a resolution, count how many
+    communities it actually produces, and adjust up/down until the count is
+    as close to target_communities as the iteration budget affords.
+
+    Not guaranteed to land exactly on target (Louvain's community count
+    isn't perfectly monotonic in resolution, and some libraries just don't
+    have a natural partition at every possible count) — returns whichever
+    of the tried candidates landed closest, along with the resolution that
+    produced it, so the caller can report what was actually used.
+
+    Returns (partition, resolution_used, community_count).
+    """
+    d = debug.write if debug else (lambda *a, **k: None)
+    lo, hi = resolution_bounds
+    best = None  # (resolution, count, partition)
+    for i in range(max_iter):
+        mid = (lo + hi) / 2
+        partition = community_louvain.best_partition(graph, weight='weight', resolution=mid, random_state=42)
+        count = len(set(partition.values()))
+        d(f"└ Auto-tuning granularity ({i + 1}/{max_iter}): resolution={mid:.3f} -> {count} clusters "
+          f"(target {target_communities}).")
+        if best is None or abs(count - target_communities) < abs(best[1] - target_communities):
+            best = (mid, count, partition)
+        if count == target_communities:
+            break
+        elif count < target_communities:
+            lo = mid  # need MORE, smaller communities -> raise resolution
+        else:
+            hi = mid  # need FEWER, bigger communities -> lower resolution
+    resolution, count, partition = best
+    d(f"**Granularity auto-tune settled on resolution={resolution:.3f} -> {count} clusters** "
+      f"(target was {target_communities}).")
+    return partition, resolution, count
+
+
 def build_artist_sonic_clusters(music_section, tag_mapping=None, sample_size=ARTIST_SONIC_SAMPLE_SIZE,
                                  neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
                                  sonic_weight=0.5, tag_overlap_weight=0.15, cluster_agreement_weight=0.35,
-                                 resolution=1.0, use_cache=True, debug=None):
+                                 resolution=1.0, target_clusters=None, use_cache=True, debug=None):
     """
     Artist-level counterpart to build_sonic_clusters: Louvain community
     detection over build_artist_similarity_graph — a genuine hybrid blend of
@@ -1264,16 +1447,20 @@ def build_artist_sonic_clusters(music_section, tag_mapping=None, sample_size=ART
     place (though membership can still be swayed by sonic/tag-overlap signal
     even when cluster_agreement_weight isn't the dominant one).
 
+    If target_clusters is given, `resolution` is ignored and
+    _auto_tune_resolution searches for whichever resolution produces
+    closest to that many communities instead of using a fixed one — this is
+    what lets "Maximum number of clusters" in the UI actually steer Hybrid
+    mode's community count the same way it steers Gemini's tag-cluster
+    count, rather than resolution being a separate, unrelated dial.
+
     Returns (results, community_tag_votes) — results is
     {cluster_name: [tracks]} (every track from every artist in that
     community), community_tag_votes is {cluster_name: {tag_cluster: count}}.
     """
     d = debug.write if debug else (lambda *a, **k: None)
 
-    try:
-        all_artists = music_section.searchArtists()
-    except Exception:
-        all_artists = []
+    all_artists = get_cached_artists(music_section, debug=debug)
 
     graph, artist_by_key, cache = build_artist_similarity_graph(
         all_artists, sample_size=sample_size, neighbor_limit=neighbor_limit,
@@ -1287,7 +1474,10 @@ def build_artist_sonic_clusters(music_section, tag_mapping=None, sample_size=ART
     if graph.number_of_nodes() == 0:
         return {}, {}
 
-    partition = community_louvain.best_partition(graph, weight='weight', resolution=resolution, random_state=42)
+    if target_clusters:
+        partition, resolution, _ = _auto_tune_resolution(graph, target_clusters, debug=debug)
+    else:
+        partition = community_louvain.best_partition(graph, weight='weight', resolution=resolution, random_state=42)
     communities = defaultdict(list)
     for key, community_id in partition.items():
         communities[community_id].append(artist_by_key[key])
@@ -1404,7 +1594,8 @@ def build_sonic_similarity_graph(all_artists, max_tracks=SONIC_GRAPH_MAX_TRACKS,
 
 
 def build_sonic_clusters(music_section, tag_mapping=None, max_tracks=SONIC_GRAPH_MAX_TRACKS,
-                          neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, resolution=1.0, debug=None):
+                          neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, resolution=1.0,
+                          target_clusters=None, debug=None):
     """
     Clusters the library FROM the sonic-similarity graph itself, via Louvain
     community detection — this is the "sonic analysis actually building the
@@ -1418,7 +1609,10 @@ def build_sonic_clusters(music_section, tag_mapping=None, max_tracks=SONIC_GRAPH
          purely by acoustic-similarity structure (modularity optimization).
          `resolution` controls granularity: >1.0 yields more, smaller
          communities; <1.0 yields fewer, larger ones (same knob as
-         Music-Manager-for-Plex uses on their artist graph).
+         Music-Manager-for-Plex uses on their artist graph). If
+         target_clusters is given, resolution is ignored and
+         _auto_tune_resolution searches for whichever resolution produces
+         closest to that many communities instead.
       3. NAMING (only place tags/Gemini are involved in this mode): each
          community is named after whichever tag-based cluster is most
          common among its member tracks (via assign_track_cluster against
@@ -1435,10 +1629,7 @@ def build_sonic_clusters(music_section, tag_mapping=None, max_tracks=SONIC_GRAPH
     """
     d = debug.write if debug else (lambda *a, **k: None)
 
-    try:
-        all_artists = music_section.searchArtists()
-    except Exception:
-        all_artists = []
+    all_artists = get_cached_artists(music_section, debug=debug)
 
     graph, track_by_key = build_sonic_similarity_graph(
         all_artists, max_tracks=max_tracks, neighbor_limit=neighbor_limit, debug=debug
@@ -1447,7 +1638,10 @@ def build_sonic_clusters(music_section, tag_mapping=None, max_tracks=SONIC_GRAPH
     if graph.number_of_nodes() == 0:
         return {}, {}
 
-    partition = community_louvain.best_partition(graph, weight='weight', resolution=resolution, random_state=42)
+    if target_clusters:
+        partition, resolution, _ = _auto_tune_resolution(graph, target_clusters, debug=debug)
+    else:
+        partition = community_louvain.best_partition(graph, weight='weight', resolution=resolution, random_state=42)
     communities = defaultdict(list)
     for key, community_id in partition.items():
         communities[community_id].append(track_by_key[key])
@@ -1488,7 +1682,8 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
                           sonic_neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, sonic_resolution=1.0,
                           sonic_group_by="artist", sonic_artist_sample_size=ARTIST_SONIC_SAMPLE_SIZE,
                           hybrid_sonic_weight=0.5, hybrid_tag_overlap_weight=0.15,
-                          hybrid_cluster_agreement_weight=0.35, sonic_use_cache=True):
+                          hybrid_cluster_agreement_weight=0.35, sonic_use_cache=True,
+                          sonic_auto_tune_clusters=True):
     """
     Full pipeline. clustering_mode options:
 
@@ -1532,6 +1727,16 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
           sonic_max_tracks, sonic-only (no tag signal in membership, tags
           only name the result afterward), no caching. Kept for comparison
           against the hybrid artist mode above.
+      `sonic_auto_tune_clusters` (default True): when set, `total_clusters`
+      also acts as a target community count for sonic/hybrid mode — a
+      small search over Louvain's resolution parameter (see
+      _auto_tune_resolution) looks for whichever resolution lands closest
+      to that many communities, instead of using `sonic_resolution` as a
+      fixed value. This is what makes "Maximum number of clusters" actually
+      steer Hybrid mode's output count the way it already steers Gemini's
+      tag-cluster count — without it, resolution=1.0 can land anywhere from
+      a handful to dozens of communities depending on the library. Set to
+      False to use `sonic_resolution` directly instead (manual control).
 
     Returns (results, tag_mapping) — results is {cluster_name: [tracks]},
     tag_mapping is the raw tag->cluster dict (handy for coloring the
@@ -1575,7 +1780,9 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
                 neighbor_limit=sonic_neighbor_limit, sonic_weight=hybrid_sonic_weight,
                 tag_overlap_weight=hybrid_tag_overlap_weight,
                 cluster_agreement_weight=hybrid_cluster_agreement_weight,
-                resolution=sonic_resolution, use_cache=sonic_use_cache, debug=debug
+                resolution=sonic_resolution,
+                target_clusters=total_clusters if sonic_auto_tune_clusters else None,
+                use_cache=sonic_use_cache, debug=debug
             )
             tag_suffix = "Hybrid Community"
         else:
@@ -1584,7 +1791,8 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
               "name the resulting communities.")
             sonic_pools, community_tag_votes = build_sonic_clusters(
                 music_section, tag_mapping=tag_mapping, max_tracks=sonic_max_tracks,
-                neighbor_limit=sonic_neighbor_limit, resolution=sonic_resolution, debug=debug
+                neighbor_limit=sonic_neighbor_limit, resolution=sonic_resolution,
+                target_clusters=total_clusters if sonic_auto_tune_clusters else None, debug=debug
             )
             tag_suffix = "Sonic Community"
 
@@ -1596,10 +1804,7 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
         return results, tag_mapping
 
     pools = defaultdict(list)
-    try:
-        all_artists = music_section.searchArtists()
-    except Exception:
-        all_artists = []
+    all_artists = get_cached_artists(music_section, debug=debug)
 
     for artist in all_artists:
         try:
