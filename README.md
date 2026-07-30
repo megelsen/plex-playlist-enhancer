@@ -12,10 +12,16 @@ organize music across three tools:
   tracks, sonically similar tracks, and tracks from related artists, then
   save it as a new Plex playlist.
 - **🗂️ Library Clusters** — groups your *entire* library into a handful of
-  genre/mood sections (e.g. Metal, Indie, Folk). You can lock in cluster
-  names you already know you want; an LLM (Google Gemini by default) invents
-  the rest and sorts every genre tag in your library into one of them. Each
-  cluster shows its most-played tracks and can be saved as a playlist.
+  sections (e.g. Metal, Indie, Folk). Two ways to decide what goes where:
+  **Hybrid** (recommended) blends real audio similarity, shared tags, and
+  agreement with your Gemini-defined clusters into one weighted graph, then
+  groups artists via Louvain community detection — each weight is
+  adjustable, so you can lean toward crisp sonic-driven clusters or looser
+  tag-driven ones. Or go **Tags-only**, where an LLM (Google Gemini by
+  default) invents cluster names and sorts every genre/mood tag in your
+  library into one of them, with optional sonic-similarity correction for
+  leftover/mistagged tracks afterward. Each cluster shows its most-played
+  tracks and can be saved as a playlist.
 
 All three tabs share a mobile-friendly UI with in-browser play/pause preview
 streamed directly from Plex.
@@ -31,6 +37,16 @@ streamed directly from Plex.
 - Clusters the whole library by genre/mood via a single cached LLM call —
   re-running "Build Clusters" costs nothing extra unless your library's
   genre tags actually change or you explicitly force a re-map.
+- Hybrid clustering mode blends real audio similarity, shared genre/mood
+  tags, and agreement with your Gemini-defined clusters into one weighted
+  graph (Louvain community detection at the artist level), with each
+  signal's weight independently adjustable — favor sonic + cluster
+  agreement for crisp, sharply-defined clusters, or raw tag overlap for
+  looser, more inclusive ones.
+- Per-artist sonic profiles (used by hybrid/sonic clustering) are cached to
+  disk, keyed per artist, so re-running "Build Clusters" against an
+  unchanged library re-analyzes nothing — only new or changed artists cost
+  a fresh Plex sonic-similarity lookup.
 - In-browser play/pause preview streamed directly from Plex.
 - One-tap "add to playlist" per suggestion; save any mix or cluster as a new
   Plex playlist.
@@ -51,7 +67,7 @@ plex-playlist-enhancer/
 ├── ui_components.py          # shared track-row renderer
 ├── recommendations.py        # Playlist Enhancer's recommendation engine
 ├── artist_mix.py              # Artist Mix builder
-├── clustering.py              # Library Clusters: genre tag collection + Gemini mapping
+├── clustering.py              # Library Clusters: tag mapping, sonic profiles, hybrid/Louvain clustering
 ├── tabs/
 │   ├── enhance_tab.py         # 🎧 Playlist Enhancer UI
 │   ├── mix_tab.py             # 🎨 Artist Mix UI
@@ -67,7 +83,11 @@ plex-playlist-enhancer/
 - (Optional, for Library Clusters) a [Google Gemini API key](https://aistudio.google.com/app/apikey)
   — the free tier is plenty for this; the only LLM call in the app is a
   single one-time genre-tag mapping, cached so it doesn't re-run on every
-  click
+  click. Not needed for Sonic-only clustering, since that mode doesn't
+  involve Gemini for membership (only for optional community naming).
+- `networkx` and `python-louvain` (both in `requirements.txt`) power Library
+  Clusters' Hybrid and Sonic clustering modes (Louvain community detection).
+  Tags-only clustering doesn't need either.
 - Python packages listed in `requirements.txt`
 
 ## Setup
@@ -143,12 +163,19 @@ services:
       - PLEX_URL=${PLEX_URL}
       - PLEX_TOKEN=${PLEX_TOKEN}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - CLUSTER_CACHE_PATH=/app/data/cluster_mapping.json
+      - ARTIST_PROFILE_CACHE_PATH=/app/data/artist_sonic_profiles.json
+    volumes:
+      - ./data:/app/data
     restart: unless-stopped
 ```
 
 `PLEX_URL`/`PLEX_TOKEN`/`GEMINI_API_KEY` are left blank in the compose file
 itself and pulled from your environment (or a local `.env` file — see below)
-rather than committed to the repo.
+rather than committed to the repo. The `./data` volume is what makes the two
+cluster caches survive a rebuild — without it, both are recomputed from
+scratch (an extra Gemini call, and a fresh sonic-analysis pass per artist)
+every time the container restarts.
 
 ### Dockerfile (place inside `plex-playlist-enhancer/`)
 
@@ -193,9 +220,14 @@ The app will then be available at `http://<host>:8502`.
 | `PLEX_URL`            | Base URL of your Plex server                          | `http://localhost:32400`  |
 | `PLEX_TOKEN`          | Your Plex authentication token                        | *(none — required)*       |
 | `GEMINI_API_KEY`      | Google Gemini API key, used only by Library Clusters  | *(none — optional)*       |
+| `CLUSTER_CACHE_PATH`  | Disk path for the cached tag → cluster mapping         | `/app/data/cluster_mapping.json` |
+| `ARTIST_PROFILE_CACHE_PATH` | Disk path for cached per-artist sonic profiles (Hybrid/Sonic-artist clustering) | `/app/data/artist_sonic_profiles.json` |
 
 These are just defaults for the sidebar fields — you can always override them
-in the running app itself.
+in the running app itself. The two cache paths are the exception: they're
+read once at process start (not sidebar-editable), and only matter if you
+want cluster/sonic-profile caching to survive container restarts — point
+them at a mounted volume in Docker (see below) for that.
 
 ## Notes
 
@@ -210,6 +242,13 @@ in the running app itself.
   so re-running "Build / Refresh Clusters" only re-scans tracks and play
   counts — it does **not** call the LLM again unless the underlying tags
   change or you explicitly click "Force Re-map Genres."
+- Hybrid/Sonic-artist clustering also caches a per-artist sonic profile
+  (sampled top tracks + their audio-similarity matches), keyed on that
+  artist's own last-updated timestamp — so a rebuild only re-analyzes
+  artists that actually changed, not the whole library. Both caches persist
+  to disk (`CLUSTER_CACHE_PATH` / `ARTIST_PROFILE_CACHE_PATH`) rather than
+  just in-memory, so they survive container restarts if you've mounted a
+  volume for them (see Docker setup above).
 
 ## License
 
