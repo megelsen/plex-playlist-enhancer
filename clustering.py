@@ -21,9 +21,25 @@ from collections import defaultdict
 import requests
 import streamlit as st
 
+try:
+    import networkx as nx
+    import community as community_louvain  # python-louvain
+    HAS_SONIC_GRAPH_DEPS = True
+except ImportError:
+    HAS_SONIC_GRAPH_DEPS = False
+
 from plex_helpers import get_sonic_match_percent, get_top_tracks_for_artist
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+# Cap on how many tracks get pulled into the sonic-similarity graph for
+# community-detection clustering (build_sonic_communities). Each node costs
+# one Plex sonicallySimilar() call, so this bounds worst-case runtime the
+# same way REFINE_MAX_TRACKS does for the tag-refinement pass. Prioritized
+# by play count, so the graph is built from the library's most-listened
+# tracks first on very large libraries.
+SONIC_GRAPH_MAX_TRACKS = 1500
+SONIC_GRAPH_NEIGHBOR_LIMIT = 15
 
 # Bumped whenever build_tag_cluster_mapping's prompt logic changes in a way
 # that would produce different results for the same tag list. Included in
@@ -77,6 +93,30 @@ MIN_CLUSTER_TRACKS = 5
 # resets whenever the process restarts). Point CLUSTER_CACHE_PATH at a
 # mounted volume in Docker so it actually persists across rebuilds.
 DISK_CACHE_PATH = os.environ.get("CLUSTER_CACHE_PATH", "/app/data/cluster_mapping.json")
+
+# Disk-based cache for per-artist sonic profiles (used by the artist-level
+# sonic clustering mode — see build_artist_similarity_graph). Each artist's
+# profile costs `sample_size` sonicallySimilar() Plex calls to compute, so
+# caching this is what makes rebuilds with the same library fast: unlike the
+# tag mapping cache above (one blob, invalidated as a whole), this is a
+# per-artist dict so a single new/changed artist doesn't force recomputing
+# everyone else's profile.
+ARTIST_PROFILE_CACHE_PATH = os.environ.get("ARTIST_PROFILE_CACHE_PATH", "/app/data/artist_sonic_profiles.json")
+
+# Bumped whenever build_artist_sonic_profile's sampling/scoring logic changes
+# in a way that would produce different profiles for the same artist+params
+# — included in each entry's cache key so old entries are ignored (and
+# naturally overwritten) after a logic change, without needing to wipe the
+# whole cache file.
+ARTIST_PROFILE_VERSION = 1
+
+# How many of an artist's tracks get sonically sampled to build its profile.
+# Kept small on purpose: this is a per-ARTIST cost (not per-track), so the
+# whole library is affordable even at library scale, and 2-3 well-chosen
+# tracks (most-played, or Plex's own popularity ranking as a fallback for
+# artists with no play history) are a reasonable stand-in for "what this
+# artist sounds like" without sampling every track.
+ARTIST_SONIC_SAMPLE_SIZE = 3
 
 
 def _disk_cache_key(genre_tags, mood_tags, locked_clusters, total_clusters):
@@ -610,99 +650,225 @@ def _blend_cluster_tracks(cluster_name, tracks_pool, music_section, plex, total_
     return combined[:total_n]
 
 
-def refine_unsorted_via_sonic_neighbors(pools, debug=None):
+def _sonic_thresholds_for_weight(sonic_weight):
     """
-    Extrapolates genre/mood for "Unsorted" tracks from Plex's sonic
-    similarity data directly, instead of relying only on genre/mood tags —
-    this is the actual "sonic analysis" signal (Plex's own audio fingerprint
-    matching), not artist-metadata similarity.
+    Maps a 0.0-1.0 sonic_weight dial to neighbor-vote thresholds for
+    RECOVERING Unsorted tracks. 0.0 keeps the original conservative
+    defaults; 1.0 relaxes them to the most permissive floor still
+    considered safe (never fully disabled).
 
-    Deliberately operates per TRACK, not per artist: the earlier
-    artist-level approach (moving an artist's entire catalog based on
-    "Similar Artist" links) was too coarse — Plex's similarity web can
-    surface a handful of odd/crossover neighbors for any given artist, and
-    reassigning the WHOLE discography on that basis is how things like an
-    Eminem track ending up in a Metal cluster happen. Per-track voting
-    means one noisy neighbor can't drag an artist's entire catalog anywhere;
-    each track has to earn its own reassignment.
+    Returns (min_votes, min_margin, min_share).
+    """
+    w = max(0.0, min(1.0, sonic_weight))
+    min_votes = round(REFINE_MIN_NEIGHBOR_VOTES - w * 3)     # 6  -> 3
+    min_margin = round(REFINE_MIN_VOTE_MARGIN - w * 2)       # 4  -> 2
+    min_share = REFINE_MIN_VOTE_SHARE - w * 0.15             # .6 -> .45
+    return max(min_votes, 2), max(min_margin, 1), max(min_share, 0.4)
 
-    For each Unsorted track (capped at REFINE_MAX_TRACKS, prioritized by
-    play count): fetch its sonicallySimilar() neighbors, tally which
-    cluster each neighbor's OWN track already confidently belongs to (only
-    counting non-Unsorted neighbors), and only reassign if:
-      - at least REFINE_MIN_NEIGHBOR_VOTES neighbors agree, AND
-      - the winning cluster has a clear margin over the runner-up
-        (stricter than a simple plurality — ties or near-ties don't count).
 
-    Mutates and returns `pools` in place. Tracks with no strong neighbor
-    consensus stay in "Unsorted" — this only recovers cases where the
-    sonic-similarity graph gives genuinely confident, converging evidence.
+def _sonic_thresholds_for_reassignment(sonic_weight):
+    """
+    Same idea, but for PULLING a track OUT of a cluster it already tag-
+    matched into — deliberately a stricter floor than recovery thresholds
+    at every weight level, since a tagged track already has real evidence
+    behind its current cluster and should only move on genuinely lopsided
+    sonic consensus, not just a mild lean.
+    """
+    w = max(0.0, min(1.0, sonic_weight))
+    min_votes = round(REFINE_MIN_NEIGHBOR_VOTES - w * 2)     # 6  -> 4
+    min_margin = round((REFINE_MIN_VOTE_MARGIN + 2) - w * 2) # 6  -> 4
+    min_share = (REFINE_MIN_VOTE_SHARE + 0.15) - w * 0.15    # .75 -> .6
+    return max(min_votes, 3), max(min_margin, 2), max(min_share, 0.55)
+
+
+def refine_unsorted_via_sonic_neighbors(pools, sonic_weight=0.0, reassign_tagged=False,
+                                         max_tracks_to_check=REFINE_MAX_TRACKS,
+                                         propagation_rounds=2, debug=None):
+    """
+    Uses Plex's own sonic-similarity graph (audio fingerprint matching, not
+    artist metadata) as a second signal alongside genre/mood tags.
+
+    This runs WEIGHTED, MULTI-ROUND label propagation over a cached
+    similarity graph, rather than a single one-shot vote against a frozen
+    tag-based snapshot:
+
+    - WEIGHTED: each neighbor's vote is scaled by its actual sonic match
+      score (via get_sonic_match_percent), not counted as a flat "1 vote"
+      regardless of how close the match actually is.
+    - MULTI-ROUND: candidate tracks' labels are re-evaluated over
+      `propagation_rounds` passes, using each other's UPDATED labels from
+      the previous round. This lets sonic influence propagate transitively
+      through the candidate pool (track A can pull track B, which in turn
+      helps pull track C, across rounds) instead of only ever comparing a
+      track to the original tag-based labels once. Each track's own sonic
+      neighbor list is fetched only once total (cached) no matter how many
+      rounds run, so this doesn't multiply the Plex API cost.
+
+    Two things happen, both driven by `sonic_weight`, and gated per-track
+    by its ORIGINAL tag-based cluster (frozen for the whole run, so the
+    bar a track has to clear doesn't shift as other tracks flip around
+    it):
+
+    1. RECOVERY: tracks that started as "Unsorted" get the more permissive,
+       weight-scaled bar (see _sonic_thresholds_for_weight).
+    2. REASSIGNMENT (opt-in via reassign_tagged=True): tracks that started
+       with a real tag-based cluster get the stricter bar
+       (_sonic_thresholds_for_reassignment) before sonic consensus is
+       allowed to move them elsewhere.
+
+    Deliberately operates per TRACK, not per artist — an artist's whole
+    discography moving off a handful of "Similar Artist" crossover links
+    is how things like an Eminem track ending up in a Metal cluster
+    happen. Per-track voting (even with propagation) means influence has
+    to actually accumulate through real neighbor agreement, not a single
+    noisy link.
+
+    Candidates are capped at max_tracks_to_check total (Unsorted tracks
+    prioritized first, then tagged tracks by play count if reassignment is
+    on) since each candidate costs one Plex API call (once, cached).
+
+    Mutates and returns `pools` in place.
     """
     d = debug.write if debug else (lambda *a, **k: None)
 
-    if "Unsorted" not in pools or not pools["Unsorted"]:
+    has_unsorted = bool(pools.get("Unsorted"))
+    if not has_unsorted and not reassign_tagged:
         return pools
 
-    track_cluster_by_key = {}
+    # Frozen baseline: every track's tag-based cluster before any sonic
+    # influence. Used both as the initial label snapshot AND to decide,
+    # per track, which threshold tier (recovery vs reassignment) applies —
+    # that decision must not shift mid-run just because a track's label
+    # happens to change in an earlier round.
+    baseline_cluster_by_key = {}
+    track_by_key = {}
     for cluster_name, tracks in pools.items():
         for t in tracks:
-            track_cluster_by_key[getattr(t, 'ratingKey', None)] = cluster_name
+            key = getattr(t, 'ratingKey', None)
+            baseline_cluster_by_key[key] = cluster_name
+            track_by_key[key] = t
 
-    unsorted_tracks = pools["Unsorted"]
-    candidates = sorted(unsorted_tracks, key=lambda t: getattr(t, 'viewCount', 0) or 0, reverse=True)
-    if len(candidates) > REFINE_MAX_TRACKS:
-        d(f"**Sonic-neighbor refinement:** capping to the {REFINE_MAX_TRACKS} most-played "
-          f"of {len(candidates)} Unsorted tracks.")
-        candidates = candidates[:REFINE_MAX_TRACKS]
+    unsorted_candidates = sorted(
+        pools.get("Unsorted", []), key=lambda t: getattr(t, 'viewCount', 0) or 0, reverse=True
+    )
+    candidates = list(unsorted_candidates)
+    if reassign_tagged:
+        tagged_candidates = [
+            t for cluster_name, tracks in pools.items() if cluster_name != "Unsorted" for t in tracks
+        ]
+        tagged_candidates.sort(key=lambda t: getattr(t, 'viewCount', 0) or 0, reverse=True)
+        candidates += tagged_candidates
+
+    if len(candidates) > max_tracks_to_check:
+        d(f"**Sonic-neighbor pass (weight={sonic_weight:.2f}, {propagation_rounds} round(s)):** "
+          f"capping to the {max_tracks_to_check} highest-priority of {len(candidates)} candidate tracks.")
+        candidates = candidates[:max_tracks_to_check]
     else:
-        d(f"**Sonic-neighbor refinement:** checking sonic neighbors for {len(candidates)} Unsorted tracks.")
+        d(f"**Sonic-neighbor pass (weight={sonic_weight:.2f}, {propagation_rounds} round(s)):** "
+          f"checking sonic neighbors for {len(candidates)} candidate tracks"
+          f"{' (recovery + tagged reassignment)' if reassign_tagged else ' (recovery only)'}.")
 
-    reassigned = defaultdict(list)  # new_cluster -> [tracks moved into it]
-    refined_count = 0
+    candidate_keys = [getattr(t, 'ratingKey', None) for t in candidates]
 
-    for track in candidates:
+    # Fetch + cache each candidate's sonic neighbors ONCE regardless of how
+    # many propagation rounds run. Weight each neighbor by its actual match
+    # score rather than counting every match as a flat "1 vote".
+    neighbor_cache = {}
+    for track, key in zip(candidates, candidate_keys):
         try:
             matches = track.sonicallySimilar(limit=20)
         except Exception:
+            neighbor_cache[key] = []
             continue
-
-        neighbor_votes = defaultdict(int)
+        weighted_neighbors = []
         for m in matches:
-            neighbor_cluster = track_cluster_by_key.get(getattr(m, 'ratingKey', None))
-            if neighbor_cluster and neighbor_cluster != "Unsorted":
-                neighbor_votes[neighbor_cluster] += 1
+            mk = getattr(m, 'ratingKey', None)
+            if not mk:
+                continue
+            pct = get_sonic_match_percent(m)
+            weight = (pct / 100.0) if pct is not None else 0.5
+            weighted_neighbors.append((mk, weight))
+        neighbor_cache[key] = weighted_neighbors
 
-        if not neighbor_votes:
+    recover_min_votes, recover_min_margin, recover_min_share = _sonic_thresholds_for_weight(sonic_weight)
+    reassign_min_votes, reassign_min_margin, reassign_min_share = _sonic_thresholds_for_reassignment(sonic_weight)
+
+    # current_labels starts as the tag-based baseline and evolves across
+    # rounds ONLY for candidate tracks — everything else stays fixed, so
+    # non-candidate neighbors always vote with their real tag-based label.
+    current_labels = dict(baseline_cluster_by_key)
+
+    for round_num in range(propagation_rounds):
+        next_labels = dict(current_labels)
+        changed_this_round = 0
+        for key in candidate_keys:
+            original_cluster = baseline_cluster_by_key.get(key, "Unsorted")
+            neighbors = neighbor_cache.get(key, [])
+            if not neighbors:
+                continue
+
+            weighted_votes = defaultdict(float)
+            for nk, w in neighbors:
+                ncluster = current_labels.get(nk)
+                if ncluster and ncluster != "Unsorted":
+                    weighted_votes[ncluster] += w
+            if not weighted_votes:
+                continue
+
+            sorted_votes = sorted(weighted_votes.values(), reverse=True)
+            top_votes = sorted_votes[0]
+            runner_up_votes = sorted_votes[1] if len(sorted_votes) > 1 else 0
+            total_votes = sum(weighted_votes.values())
+            vote_share = top_votes / total_votes if total_votes else 0
+            new_cluster = max(weighted_votes, key=weighted_votes.get)
+
+            if original_cluster == "Unsorted":
+                if (top_votes < recover_min_votes
+                        or top_votes < runner_up_votes + recover_min_margin
+                        or vote_share < recover_min_share):
+                    continue
+            else:
+                if not reassign_tagged or new_cluster == original_cluster:
+                    continue
+                if (top_votes < reassign_min_votes
+                        or top_votes < runner_up_votes + reassign_min_margin
+                        or vote_share < reassign_min_share):
+                    continue
+
+            if next_labels.get(key) != new_cluster:
+                next_labels[key] = new_cluster
+                changed_this_round += 1
+
+        current_labels = next_labels
+        d(f"└ Round {round_num + 1}/{propagation_rounds}: {changed_this_round} label change(s).")
+        if changed_this_round == 0:
+            break
+
+    # Apply the final labels: move any candidate whose label differs from
+    # its tag-based baseline into its new cluster.
+    recovered_count = 0
+    moved_count = 0
+    moved_from = defaultdict(set)
+    moved_to = defaultdict(list)
+    for key in candidate_keys:
+        original_cluster = baseline_cluster_by_key.get(key, "Unsorted")
+        final_cluster = current_labels.get(key, original_cluster)
+        if final_cluster == original_cluster:
             continue
+        moved_from[original_cluster].add(key)
+        moved_to[final_cluster].append(track_by_key[key])
+        if original_cluster == "Unsorted":
+            recovered_count += 1
+        else:
+            moved_count += 1
 
-        sorted_votes = sorted(neighbor_votes.values(), reverse=True)
-        top_votes = sorted_votes[0]
-        runner_up_votes = sorted_votes[1] if len(sorted_votes) > 1 else 0
-        total_votes = sum(neighbor_votes.values())
-        vote_share = top_votes / total_votes if total_votes else 0
+    for from_cluster, keys in moved_from.items():
+        pools[from_cluster] = [t for t in pools.get(from_cluster, []) if getattr(t, 'ratingKey', None) not in keys]
+    for to_cluster, tracks in moved_to.items():
+        pools.setdefault(to_cluster, []).extend(tracks)
 
-        # Three independent bars, all must pass: enough absolute votes,
-        # a real margin over the runner-up, AND a real majority share of
-        # all votes cast — sonic similarity is noisy enough that a track
-        # should only get pulled out of Unsorted on genuinely convergent
-        # evidence, not a narrow plurality among scattered matches.
-        if (top_votes < REFINE_MIN_NEIGHBOR_VOTES
-                or top_votes < runner_up_votes + REFINE_MIN_VOTE_MARGIN
-                or vote_share < REFINE_MIN_VOTE_SHARE):
-            continue
-
-        new_cluster = max(neighbor_votes, key=neighbor_votes.get)
-        reassigned[new_cluster].append(track)
-        refined_count += 1
-
-    if reassigned:
-        moved_keys = {getattr(t, 'ratingKey', None) for tracks in reassigned.values() for t in tracks}
-        pools["Unsorted"] = [t for t in pools["Unsorted"] if getattr(t, 'ratingKey', None) not in moved_keys]
-        for cluster_name, tracks in reassigned.items():
-            pools.setdefault(cluster_name, []).extend(tracks)
-
-    d(f"└ Reassigned {refined_count} of {len(candidates)} checked tracks via sonic-neighbor consensus "
-      f"(min {REFINE_MIN_NEIGHBOR_VOTES} votes, margin \u2265{REFINE_MIN_VOTE_MARGIN}).")
+    d(f"└ Recovered {recovered_count} Unsorted track(s); reassigned {moved_count} already-tagged "
+      f"track(s) via sonic-neighbor propagation (weight={sonic_weight:.2f}).")
     return pools
 
 
@@ -802,37 +968,501 @@ def _fold_thin_clusters(pools, clusters, tag_mapping, locked_clusters, debug=Non
     return pools, remaining_clusters, folded_tag_mapping
 
 
+def _load_artist_profile_cache():
+    """Returns the {"artist_ratingKey": {...profile...}} disk cache dict, or
+    an empty dict if the file doesn't exist / can't be read / is malformed.
+    Same best-effort pattern as _load_disk_cache."""
+    try:
+        with open(ARTIST_PROFILE_CACHE_PATH, "r") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_artist_profile_cache(cache):
+    """Best-effort full-file write of the artist profile cache. Called once
+    per build (not once per artist) — build_artist_similarity_graph mutates
+    the in-memory dict as it goes and this persists the final result."""
+    try:
+        os.makedirs(os.path.dirname(ARTIST_PROFILE_CACHE_PATH), exist_ok=True)
+        with open(ARTIST_PROFILE_CACHE_PATH, "w") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass
+
+
+def _artist_fingerprint(artist, sample_size, neighbor_limit):
+    """Cache-invalidation fingerprint for one artist's profile: changes if
+    the artist's own Plex data changes (updatedAt), if the sampling/neighbor
+    params change, or if ARTIST_PROFILE_VERSION is bumped. viewCount isn't
+    included — a play-count bump alone doesn't necessarily change which
+    tracks would be sampled, and re-sonic-analyzing on every single play
+    would defeat the point of caching."""
+    updated_at = getattr(artist, 'updatedAt', None)
+    updated_at = updated_at.isoformat() if hasattr(updated_at, 'isoformat') else str(updated_at)
+    payload = json.dumps({
+        "updated_at": updated_at,
+        "sample_size": sample_size,
+        "neighbor_limit": neighbor_limit,
+        "version": ARTIST_PROFILE_VERSION,
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def get_artist_combined_tags(artist):
+    """Combined genre+mood tag set for one artist: the artist's own genre
+    tags, plus every genre+mood tag on any of its albums. Same
+    album-is-more-precise idea as get_all_genre_and_mood_tags, but rolled up
+    to a single artist instead of scanned across the whole library — this is
+    the tag signal that feeds an artist's sonic profile (see
+    build_artist_sonic_profile) rather than the tag-cluster pipeline."""
+    tags = {g.tag for g in getattr(artist, 'genres', [])}
+    try:
+        albums = artist.albums()
+    except Exception:
+        albums = []
+    for album in albums:
+        tags |= {g.tag for g in getattr(album, 'genres', [])}
+        tags |= {m.tag for m in getattr(album, 'moods', [])}
+    return tags
+
+
+def build_artist_sonic_profile(artist, sample_size=ARTIST_SONIC_SAMPLE_SIZE,
+                                neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, cache=None, debug=None):
+    """
+    Builds one artist's combined sonic+tag profile:
+      1. Sample `sample_size` tracks via get_top_tracks_for_artist — most-
+         played first, falling back to Plex's own popularity ranking for
+         artists with no play history (that fallback already lives in
+         get_top_tracks_for_artist; this just reuses it).
+      2. Run sonicallySimilar() on each sampled track and roll the matches
+         up from TRACK to ARTIST: each match's own artist (grandparentTitle
+         / grandparentRatingKey) gets a vote weighted by the match score, so
+         an artist whose sampled tracks sonically resemble three different
+         Artist X tracks accumulates a stronger link to X than one with a
+         single marginal match.
+      3. Attach the artist's combined genre+mood tags (see
+         get_artist_combined_tags) alongside the sonic votes, so the tag
+         signal travels with the profile instead of being a separate lookup.
+
+    Returns {"tags": [...], "neighbors": {artist_ratingKey: weight, ...}}.
+    Cached to disk per-artist (keyed on _artist_fingerprint) — pass the same
+    `cache` dict across all artists in one build (load once via
+    _load_artist_profile_cache, save once via _save_artist_profile_cache)
+    so repeat builds against an unchanged library do zero Plex sonic calls.
+    """
+    d = debug.write if debug else (lambda *a, **k: None)
+    artist_key = str(getattr(artist, 'ratingKey', ''))
+    fingerprint = _artist_fingerprint(artist, sample_size, neighbor_limit)
+
+    if cache is not None:
+        cached = cache.get(artist_key)
+        if cached and cached.get("fingerprint") == fingerprint:
+            return {"tags": cached["tags"], "neighbors": {k: v for k, v in cached["neighbors"].items()}}
+
+    tags = sorted(get_artist_combined_tags(artist))
+
+    try:
+        sample_tracks = get_top_tracks_for_artist(artist, limit=sample_size, per_album_sample=1)
+    except Exception as e:
+        d(f"└ ❌ Couldn't sample tracks for artist `{getattr(artist, 'title', '?')}`: `{e}`")
+        sample_tracks = []
+
+    neighbor_weights = defaultdict(float)
+    for track in sample_tracks:
+        try:
+            matches = track.sonicallySimilar(limit=neighbor_limit)
+        except Exception:
+            continue
+        for m in matches:
+            m_artist_key = str(getattr(m, 'grandparentRatingKey', '') or '')
+            if not m_artist_key or m_artist_key == artist_key:
+                continue
+            pct = get_sonic_match_percent(m)
+            weight = (pct / 100.0) if pct is not None else 0.5
+            neighbor_weights[m_artist_key] = max(neighbor_weights[m_artist_key], weight)
+
+    profile = {"tags": tags, "neighbors": dict(neighbor_weights)}
+    if cache is not None:
+        cache[artist_key] = {"fingerprint": fingerprint, "tags": tags, "neighbors": profile["neighbors"]}
+    return profile
+
+
+def build_artist_similarity_graph(all_artists, sample_size=ARTIST_SONIC_SAMPLE_SIZE,
+                                   neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, tag_weight=0.25,
+                                   use_cache=True, debug=None):
+    """
+    Artist-level counterpart to build_sonic_similarity_graph: one node per
+    ARTIST rather than per track, so Louvain groups artists directly instead
+    of grouping individual tracks that then need re-rolling-up into artists
+    afterward. Each artist's profile is built from a small sample of its
+    most-played (or Plex-popular, if unplayed) tracks — see
+    build_artist_sonic_profile — so the whole library is affordable in Plex
+    API calls even when it wouldn't be at full track-level (this is why
+    there's no max_tracks cap here, unlike the track-level graph).
+
+    Edge weight between two artists blends two signals:
+      - sonic: the stronger of either direction's neighbor-vote weight from
+        build_artist_sonic_profile (max, not sum — two artists sampling into
+        each other isn't "twice as similar", just confirmed from both sides).
+      - tag: Jaccard similarity of their combined genre+mood tag sets (see
+        get_artist_combined_tags), so artists whose sound Plex hasn't
+        sonically linked yet can still cluster together on strong tag
+        agreement, and vice versa.
+    final weight = (1 - tag_weight) * sonic + tag_weight * tag_jaccard.
+    An edge is only added if the blended weight is > 0 (i.e. some signal
+    exists between the pair) — most artist pairs in a library have neither
+    and simply aren't connected.
+
+    Returns (graph, artist_by_key, profile_cache) — profile_cache is the
+    (possibly updated) disk-cache dict; save it with
+    _save_artist_profile_cache once the caller is done, so successive builds
+    within the same process share one write instead of one per artist.
+    """
+    d = debug.write if debug else (lambda *a, **k: None)
+
+    if not HAS_SONIC_GRAPH_DEPS:
+        raise ImportError(
+            "Sonic community-detection clustering requires 'networkx' and 'python-louvain' "
+            "(pip install networkx python-louvain)."
+        )
+
+    cache = _load_artist_profile_cache() if use_cache else {}
+    cache_hits = 0
+
+    artist_by_key = {}
+    profiles = {}
+    for artist in all_artists:
+        key = str(getattr(artist, 'ratingKey', ''))
+        if not key:
+            continue
+        artist_by_key[key] = artist
+        before = cache.get(key, {}).get("fingerprint")
+        profiles[key] = build_artist_sonic_profile(
+            artist, sample_size=sample_size, neighbor_limit=neighbor_limit, cache=cache, debug=debug
+        )
+        if before and cache.get(key, {}).get("fingerprint") == before:
+            cache_hits += 1
+
+    d(f"**Artist sonic graph:** {len(artist_by_key)} artists profiled "
+      f"({cache_hits} reused from cache, {len(artist_by_key) - cache_hits} freshly sampled at "
+      f"{sample_size} track(s) each).")
+
+    graph = nx.Graph()
+    graph.add_nodes_from(artist_by_key.keys())
+
+    edges_added = 0
+    for key, profile in profiles.items():
+        tags_a = set(profile["tags"])
+        for neighbor_key, sonic_w in profile["neighbors"].items():
+            if neighbor_key not in artist_by_key or neighbor_key == key:
+                continue
+            other_w = profiles.get(neighbor_key, {}).get("neighbors", {}).get(key, 0.0)
+            sonic = max(sonic_w, other_w)
+
+            tags_b = set(profiles.get(neighbor_key, {}).get("tags", []))
+            union = tags_a | tags_b
+            tag_sim = (len(tags_a & tags_b) / len(union)) if union else 0.0
+
+            weight = (1 - tag_weight) * sonic + tag_weight * tag_sim
+            if weight <= 0:
+                continue
+            if graph.has_edge(key, neighbor_key):
+                existing = graph[key][neighbor_key].get('weight', 0)
+                graph[key][neighbor_key]['weight'] = max(existing, weight)
+            else:
+                graph.add_edge(key, neighbor_key, weight=weight)
+                edges_added += 1
+
+    d(f"└ Artist graph built: {graph.number_of_nodes()} artists, {edges_added} similarity edges "
+      f"(sonic + {tag_weight:.0%} tag blend).")
+
+    return graph, artist_by_key, cache
+
+
+def build_artist_sonic_clusters(music_section, tag_mapping=None, sample_size=ARTIST_SONIC_SAMPLE_SIZE,
+                                 neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, tag_weight=0.25,
+                                 resolution=1.0, use_cache=True, debug=None):
+    """
+    Artist-level counterpart to build_sonic_clusters: Louvain community
+    detection over build_artist_similarity_graph (sampled-track sonic
+    profile + rolled-up artist/album tags), so membership is decided per
+    ARTIST — every track from an artist lands in the same community as the
+    rest of that artist's catalog, rather than different tracks by the same
+    artist potentially splitting across communities the way pure track-level
+    clustering allows.
+
+    Naming works the same way as build_sonic_clusters: each community is
+    named after whichever tag_mapping cluster its member artists' tags vote
+    for most, purely for a readable label — membership itself already came
+    from the graph before tags are consulted here.
+
+    Returns (results, community_tag_votes) — results is
+    {cluster_name: [tracks]} (every track from every artist in that
+    community), community_tag_votes is {cluster_name: {tag_cluster: count}}.
+    """
+    d = debug.write if debug else (lambda *a, **k: None)
+
+    try:
+        all_artists = music_section.searchArtists()
+    except Exception:
+        all_artists = []
+
+    graph, artist_by_key, cache = build_artist_similarity_graph(
+        all_artists, sample_size=sample_size, neighbor_limit=neighbor_limit,
+        tag_weight=tag_weight, use_cache=use_cache, debug=debug
+    )
+    if use_cache:
+        _save_artist_profile_cache(cache)
+
+    if graph.number_of_nodes() == 0:
+        return {}, {}
+
+    partition = community_louvain.best_partition(graph, weight='weight', resolution=resolution, random_state=42)
+    communities = defaultdict(list)
+    for key, community_id in partition.items():
+        communities[community_id].append(artist_by_key[key])
+
+    d(f"**Louvain found {len(communities)} raw artist sonic communities** (resolution={resolution}).")
+
+    results = defaultdict(list)
+    community_tag_votes = {}
+    for community_id, artists in communities.items():
+        name = f"Sonic Cluster {community_id}"
+        vote_counts = {}
+        if tag_mapping:
+            votes = defaultdict(int)
+            for artist in artists:
+                for tag in get_artist_combined_tags(artist):
+                    if tag in tag_mapping:
+                        votes[tag_mapping[tag]] += 1
+            vote_counts = dict(votes)
+            named_votes = {k: v for k, v in votes.items() if k != "Unsorted"}
+            if named_votes:
+                name = max(named_votes, key=named_votes.get)
+            elif votes:
+                name = f"Sonic Cluster {community_id} (Unsorted)"
+
+        tracks = []
+        for artist in artists:
+            try:
+                tracks.extend(artist.tracks())
+            except Exception:
+                continue
+
+        community_tag_votes[name] = vote_counts
+        results[name].extend(tracks)
+        d(f"└ Community {community_id}: {len(artists)} artists / {len(tracks)} tracks -> named `{name}` "
+          f"(tag votes: {vote_counts or 'n/a'}).")
+
+    return dict(results), community_tag_votes
+
+
+def build_sonic_similarity_graph(all_artists, max_tracks=SONIC_GRAPH_MAX_TRACKS,
+                                  neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, debug=None):
+    """
+    Builds an undirected, weighted graph of the library's own tracks using
+    Plex's sonicallySimilar() as the edge source — the same "similarity
+    graph -> community detection" approach as Music-Manager-for-Plex's
+    Galaxy tab (see their process_galaxy_data), but at TRACK level using
+    real acoustic similarity, rather than at artist level using the
+    "Similar Artist" metadata hub.
+
+    One node per track (up to max_tracks, capped by play count so the most-
+    listened tracks are prioritized on large libraries — each node costs one
+    Plex API call). One edge per sonicallySimilar() match between two
+    tracks that are both in the graph, weighted by the actual match score
+    (get_sonic_match_percent) so Louvain gives closer sonic matches more
+    pull than marginal ones, instead of treating every link as equally
+    strong.
+
+    Returns (graph, track_by_key) where track_by_key maps ratingKey -> the
+    actual plexapi Track object (graph nodes are bare ratingKeys, since
+    networkx/Louvain need hashable, comparison-friendly node IDs).
+    """
+    d = debug.write if debug else (lambda *a, **k: None)
+
+    if not HAS_SONIC_GRAPH_DEPS:
+        raise ImportError(
+            "Sonic community-detection clustering requires 'networkx' and 'python-louvain' "
+            "(pip install networkx python-louvain)."
+        )
+
+    all_tracks = []
+    for artist in all_artists:
+        try:
+            all_tracks.extend(artist.tracks())
+        except Exception:
+            continue
+
+    if len(all_tracks) > max_tracks:
+        all_tracks = sorted(all_tracks, key=lambda t: getattr(t, 'viewCount', 0) or 0, reverse=True)
+        all_tracks = all_tracks[:max_tracks]
+        d(f"**Sonic graph:** library has more tracks than the {max_tracks}-track cap — "
+          f"using the {max_tracks} most-played.")
+    else:
+        d(f"**Sonic graph:** building from all {len(all_tracks)} tracks.")
+
+    track_by_key = {getattr(t, 'ratingKey', None): t for t in all_tracks}
+    graph = nx.Graph()
+    graph.add_nodes_from(track_by_key.keys())
+
+    edges_added = 0
+    for track in all_tracks:
+        key = getattr(track, 'ratingKey', None)
+        try:
+            matches = track.sonicallySimilar(limit=neighbor_limit)
+        except Exception:
+            continue
+        for m in matches:
+            mk = getattr(m, 'ratingKey', None)
+            if not mk or mk not in track_by_key or mk == key:
+                continue
+            pct = get_sonic_match_percent(m)
+            weight = (pct / 100.0) if pct is not None else 0.5
+            # Two tracks can each nominate the other; keep the stronger of
+            # the two match scores if the edge already exists rather than
+            # overwriting with whichever direction happened to run last.
+            if graph.has_edge(key, mk):
+                existing = graph[key][mk].get('weight', 0)
+                graph[key][mk]['weight'] = max(existing, weight)
+            else:
+                graph.add_edge(key, mk, weight=weight)
+                edges_added += 1
+
+    d(f"└ Graph built: {graph.number_of_nodes()} tracks, {edges_added} sonic similarity edges.")
+    return graph, track_by_key
+
+
+def build_sonic_clusters(music_section, tag_mapping=None, max_tracks=SONIC_GRAPH_MAX_TRACKS,
+                          neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, resolution=1.0, debug=None):
+    """
+    Clusters the library FROM the sonic-similarity graph itself, via Louvain
+    community detection — this is the "sonic analysis actually building the
+    clusters" mode, as opposed to tag-based clustering with sonic evidence
+    only nudging leftover/uncertain tracks afterward.
+
+    Pipeline:
+      1. build_sonic_similarity_graph — one node per track, edges from
+         sonicallySimilar(), weighted by match score.
+      2. community_louvain.best_partition — groups tracks into communities
+         purely by acoustic-similarity structure (modularity optimization).
+         `resolution` controls granularity: >1.0 yields more, smaller
+         communities; <1.0 yields fewer, larger ones (same knob as
+         Music-Manager-for-Plex uses on their artist graph).
+      3. NAMING (only place tags/Gemini are involved in this mode): each
+         community is named after whichever tag-based cluster is most
+         common among its member tracks (via assign_track_cluster against
+         the supplied tag_mapping) — tags describe the community after the
+         fact, they don't decide its membership. Communities with no clear
+         tag majority (or if tag_mapping is None) get a generic "Sonic
+         Cluster N" name instead. Two communities that land on the same
+         tag-majority name are merged together in the result.
+
+    Returns (results, community_tag_votes) where results is
+    {cluster_name: [tracks]} and community_tag_votes is
+    {cluster_name: {tag_cluster: count, ...}} for transparency/debugging
+    (e.g. showing how "pure" a community's naming vote actually was).
+    """
+    d = debug.write if debug else (lambda *a, **k: None)
+
+    try:
+        all_artists = music_section.searchArtists()
+    except Exception:
+        all_artists = []
+
+    graph, track_by_key = build_sonic_similarity_graph(
+        all_artists, max_tracks=max_tracks, neighbor_limit=neighbor_limit, debug=debug
+    )
+
+    if graph.number_of_nodes() == 0:
+        return {}, {}
+
+    partition = community_louvain.best_partition(graph, weight='weight', resolution=resolution, random_state=42)
+    communities = defaultdict(list)
+    for key, community_id in partition.items():
+        communities[community_id].append(track_by_key[key])
+
+    d(f"**Louvain found {len(communities)} raw sonic communities** (resolution={resolution}).")
+
+    results = defaultdict(list)
+    community_tag_votes = {}
+    for community_id, tracks in communities.items():
+        name = f"Sonic Cluster {community_id}"
+        vote_counts = {}
+        if tag_mapping:
+            votes = defaultdict(int)
+            for t in tracks:
+                votes[assign_track_cluster(t, tag_mapping)] += 1
+            vote_counts = dict(votes)
+            # "Unsorted" only wins the naming vote if it's the ONLY thing
+            # present — a community that's mostly one real genre with a
+            # few tag-less stragglers should still be named for the genre.
+            named_votes = {k: v for k, v in votes.items() if k != "Unsorted"}
+            if named_votes:
+                name = max(named_votes, key=named_votes.get)
+            elif votes:
+                name = f"Sonic Cluster {community_id} (Unsorted)"
+        community_tag_votes[name] = vote_counts
+        results[name].extend(tracks)
+        d(f"└ Community {community_id}: {len(tracks)} tracks -> named `{name}` "
+          f"(tag votes: {vote_counts or 'n/a'}).")
+
+    return dict(results), community_tag_votes
+
+
 def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, api_key,
                           top_n_per_cluster=30, debug=None, force_remap=False, dry_run=False,
-                          preloaded_mapping=None, refine_unsorted=True):
+                          preloaded_mapping=None, refine_unsorted=True, sonic_weight=0.0,
+                          reassign_tagged_via_sonic=False, sonic_propagation_rounds=2,
+                          clustering_mode="tags", sonic_max_tracks=SONIC_GRAPH_MAX_TRACKS,
+                          sonic_neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT, sonic_resolution=1.0,
+                          sonic_group_by="track", sonic_artist_sample_size=ARTIST_SONIC_SAMPLE_SIZE,
+                          sonic_tag_weight=0.25, sonic_use_cache=True):
     """
-    Full pipeline: collect genre+mood tags -> tag/cluster mapping (disk +
-    memory cached, or reused from a prior Suggest step) -> assign every
-    track in the library to a cluster -> blend each cluster's final track
-    list from popular + sonically-similar + related-artist picks (see
-    _blend_cluster_tracks), same spirit as Artist Mix.
+    Full pipeline. Two fundamentally different clustering_mode options:
+
+    - "tags" (default): collect genre+mood tags -> tag/cluster mapping
+      (disk + memory cached, or reused from a prior Suggest step) -> assign
+      every track in the library to a cluster BY TAG -> optionally let
+      sonic-neighbor consensus recover Unsorted tracks and/or reassign
+      mistagged ones (see refine_unsorted_via_sonic_neighbors) -> blend each
+      cluster's final track list from popular + sonically-similar +
+      related-artist picks (_blend_cluster_tracks). Tags decide membership;
+      sonic analysis only corrects afterward.
+
+    - "sonic": membership itself comes from Louvain community detection on
+      a sonic-similarity graph — tracks/artists that Plex's own audio
+      analysis considers close get grouped together directly, with no tag
+      involved in deciding who belongs where. The (still Gemini-built) tag
+      mapping is only used to NAME each resulting community after its
+      majority tag-cluster, purely for human-readable labels.
+      `sonic_group_by` picks which graph gets built:
+        - "track" (default): build_sonic_clusters — one node per track,
+          capped at sonic_max_tracks, no caching (see its docstring).
+        - "artist": build_artist_sonic_clusters — one node per artist, its
+          profile built from `sonic_artist_sample_size` sampled tracks
+          (most-played, falling back to Plex-popular) blended with that
+          artist's + its albums' genre/mood tags (sonic_tag_weight controls
+          the blend). Profiles are disk-cached per artist
+          (sonic_use_cache=False to force fresh sampling), so this is
+          affordable at full-library scale and keeps an artist's whole
+          catalog together in one community instead of letting individual
+          tracks by the same artist land in different ones.
 
     Returns (results, tag_mapping) — results is {cluster_name: [tracks]},
     tag_mapping is the raw tag->cluster dict (handy for coloring the
-    Library Galaxy tab by cluster without re-deriving it).
+    Library Galaxy tab by cluster without re-deriving it, and used in
+    "sonic" mode only for community naming).
 
-    Set dry_run=True to skip Gemini entirely and use build_dry_run_mapping
-    instead — useful for testing the rest of the pipeline (track
-    assignment, blending, UI, playlist saving) at zero cost while iterating.
-    Clusters won't be meaningful in dry_run mode, just structurally present.
+    Set dry_run=True (tags mode only) to skip Gemini entirely and use
+    build_dry_run_mapping instead — useful for testing the rest of the
+    pipeline at zero cost while iterating.
 
     preloaded_mapping: optional (clusters, tag_mapping) tuple from a prior
     suggest_cluster_names() call — if the user accepted the suggestions
     unchanged, this skips a second Gemini call entirely.
-
-    The tag/cluster mapping is cached on two layers (see
-    get_tag_cluster_mapping): in-memory for the process's lifetime, and on
-    disk so it survives container restarts/rebuilds. It only re-runs when
-    the tag lists, locked clusters, total count, or prompt version change,
-    or when force_remap=True. Track assignment and the popular/sonic/related
-    blend are pure-local plexapi/Python work with no LLM cost, so those
-    always run fresh to pick up newly added tracks, updated play counts, or
-    new sonic/related matches.
     """
     d = debug.write if debug else (lambda *a, **k: None)
 
@@ -850,6 +1480,34 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
             genre_tags, mood_tags, locked_clusters, total_clusters, api_key, force_remap=force_remap
         )
     d(f"**Final clusters:** {clusters}")
+
+    if clustering_mode == "sonic":
+        if sonic_group_by == "artist":
+            d("**Sonic-first mode (artist-level):** cluster membership comes from Louvain "
+              "community detection over per-artist sonic profiles (sampled top tracks + "
+              "artist/album tags); tags are only used to name the resulting communities.")
+            sonic_pools, community_tag_votes = build_artist_sonic_clusters(
+                music_section, tag_mapping=tag_mapping, sample_size=sonic_artist_sample_size,
+                neighbor_limit=sonic_neighbor_limit, tag_weight=sonic_tag_weight,
+                resolution=sonic_resolution, use_cache=sonic_use_cache, debug=debug
+            )
+            tag_suffix = "Sonic Community (Artist)"
+        else:
+            d("**Sonic-first mode (track-level):** cluster membership comes from Louvain "
+              "community detection on the sonic-similarity graph; tags are only used to "
+              "name the resulting communities.")
+            sonic_pools, community_tag_votes = build_sonic_clusters(
+                music_section, tag_mapping=tag_mapping, max_tracks=sonic_max_tracks,
+                neighbor_limit=sonic_neighbor_limit, resolution=sonic_resolution, debug=debug
+            )
+            tag_suffix = "Sonic Community"
+
+        results = {}
+        for cluster_name, tracks in sonic_pools.items():
+            results[cluster_name] = _select_popular(tracks, min(top_n_per_cluster, len(tracks)))
+            for t in results[cluster_name]:
+                setattr(t, 'recommendation_type', f'{cluster_name} ({tag_suffix})')
+        return results, tag_mapping
 
     pools = defaultdict(list)
     try:
@@ -872,8 +1530,11 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
     if not dry_run:
         pools, clusters, tag_mapping = _fold_thin_clusters(pools, clusters, tag_mapping, locked_clusters, debug=debug)
 
-    if refine_unsorted and not dry_run:
-        pools = refine_unsorted_via_sonic_neighbors(pools, debug=debug)
+    if (refine_unsorted or reassign_tagged_via_sonic) and not dry_run:
+        pools = refine_unsorted_via_sonic_neighbors(
+            pools, sonic_weight=sonic_weight, reassign_tagged=reassign_tagged_via_sonic,
+            propagation_rounds=sonic_propagation_rounds, debug=debug
+        )
 
     results = {}
     for cluster_name in clusters + (["Unsorted"] if "Unsorted" in pools else []):
