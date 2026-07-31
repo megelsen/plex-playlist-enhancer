@@ -39,26 +39,23 @@ def render(plex, debug_box):
         "this caps it to your most-played artists."
     )
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        group_by_cluster = st.checkbox(
-            "Pull same-cluster artists together",
-            value=True,
-            help="Node position normally comes only from Plex's 'Similar Artist' data, which "
-                 "is independent from cluster color — so a cluster-dominant library can "
-                 "look like one color scattered everywhere, correctly. This adds a gentle pull "
-                 "between same-cluster artists so the coloring is also visually legible, "
-                 "without discarding the real similarity structure. Requires clusters built in "
-                 "🗂️ Library Clusters first (any clustering mode — Hybrid, Tags, or Sonic).",
-        )
-    with col_b:
-        show_legend = st.checkbox(
-            "Show legend",
-            value=True,
-            help="The cluster legend now floats on top of the chart instead of pushing it "
-                 "into a separate column, but on small screens it can still cover part of "
-                 "the view — toggle it off to give the whole screen to the galaxy itself.",
-        )
+    group_by_cluster = st.checkbox(
+        "Pull same-cluster artists together",
+        value=True,
+        help="Node position normally comes only from Plex's 'Similar Artist' data, which "
+             "is independent from cluster color — so a cluster-dominant library can "
+             "look like one color scattered everywhere, correctly. This adds a gentle pull "
+             "between same-cluster artists so the coloring is also visually legible, "
+             "without discarding the real similarity structure. Requires clusters built in "
+             "🗂️ Library Clusters first (any clustering mode — Hybrid, Tags, or Sonic).",
+    )
+    show_legend = st.checkbox(
+        "Show legend",
+        value=True,
+        help="The cluster legend now floats on top of the chart instead of pushing it "
+             "into a separate column, but on small screens it can still cover part of "
+             "the view — toggle it off to give the whole screen to the galaxy itself.",
+    )
 
     if st.button("🌟 Build Galaxy"):
         with st.spinner("Fetching similarity links and laying out the galaxy..."):
