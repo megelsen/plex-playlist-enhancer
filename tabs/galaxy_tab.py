@@ -39,16 +39,26 @@ def render(plex, debug_box):
         "this caps it to your most-played artists."
     )
 
-    group_by_cluster = st.checkbox(
-        "Pull same-cluster artists together",
-        value=True,
-        help="Node position normally comes only from Plex's 'Similar Artist' data, which "
-             "is independent from cluster color — so a cluster-dominant library can "
-             "look like one color scattered everywhere, correctly. This adds a gentle pull "
-             "between same-cluster artists so the coloring is also visually legible, "
-             "without discarding the real similarity structure. Requires clusters built in "
-             "🗂️ Library Clusters first (any clustering mode — Hybrid, Tags, or Sonic).",
-    )
+    col_a, col_b = st.columns(2)
+    with col_a:
+        group_by_cluster = st.checkbox(
+            "Pull same-cluster artists together",
+            value=True,
+            help="Node position normally comes only from Plex's 'Similar Artist' data, which "
+                 "is independent from cluster color — so a cluster-dominant library can "
+                 "look like one color scattered everywhere, correctly. This adds a gentle pull "
+                 "between same-cluster artists so the coloring is also visually legible, "
+                 "without discarding the real similarity structure. Requires clusters built in "
+                 "🗂️ Library Clusters first (any clustering mode — Hybrid, Tags, or Sonic).",
+        )
+    with col_b:
+        show_legend = st.checkbox(
+            "Show legend",
+            value=True,
+            help="The cluster legend now floats on top of the chart instead of pushing it "
+                 "into a separate column, but on small screens it can still cover part of "
+                 "the view — toggle it off to give the whole screen to the galaxy itself.",
+        )
 
     if st.button("🌟 Build Galaxy"):
         with st.spinner("Fetching similarity links and laying out the galaxy..."):
@@ -58,7 +68,7 @@ def render(plex, debug_box):
             artist_cluster_map = st.session_state.get('cluster_artist_map')
             st.session_state['galaxy_figure'] = render_galaxy_figure(
                 graph, tag_mapping=tag_mapping, artist_cluster_map=artist_cluster_map,
-                group_by_cluster=group_by_cluster
+                group_by_cluster=group_by_cluster, show_legend=show_legend
             )
             st.session_state['galaxy_node_count'] = graph.number_of_nodes()
             st.session_state['galaxy_edge_count'] = graph.number_of_edges()
@@ -72,7 +82,8 @@ def render(plex, debug_box):
             artist_cluster_map = st.session_state.get('cluster_artist_map')
             st.session_state['galaxy_figure'] = render_galaxy_figure(
                 st.session_state['galaxy_graph'], tag_mapping=tag_mapping,
-                artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster
+                artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster,
+                show_legend=show_legend
             )
             st.session_state['galaxy_cluster_signature'] = _cluster_signature(tag_mapping, artist_cluster_map)
 
@@ -89,13 +100,23 @@ def render(plex, debug_box):
         tag_mapping = st.session_state.get('cluster_tag_mapping')
         artist_cluster_map = st.session_state.get('cluster_artist_map')
         current_signature = _cluster_signature(tag_mapping, artist_cluster_map)
-        if st.session_state.get('galaxy_cluster_signature') != current_signature:
+        cluster_changed = st.session_state.get('galaxy_cluster_signature') != current_signature
+        # The "Show legend" checkbox has no dedicated button — flipping it
+        # should take effect immediately on the next rerun (which Streamlit
+        # already triggers on checkbox change), so it's tracked the same
+        # way as the cluster signature rather than requiring a manual
+        # Re-layout click just to hide/show the legend.
+        legend_changed = st.session_state.get('galaxy_show_legend') != show_legend
+        if cluster_changed or legend_changed:
             st.session_state['galaxy_figure'] = render_galaxy_figure(
                 st.session_state['galaxy_graph'], tag_mapping=tag_mapping,
-                artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster
+                artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster,
+                show_legend=show_legend
             )
             st.session_state['galaxy_cluster_signature'] = current_signature
-            st.caption("🔄 Recolored automatically to match the latest cluster build.")
+            st.session_state['galaxy_show_legend'] = show_legend
+            if cluster_changed:
+                st.caption("🔄 Recolored automatically to match the latest cluster build.")
 
     figure = st.session_state.get('galaxy_figure')
     if figure is not None:
@@ -113,6 +134,20 @@ def render(plex, debug_box):
                 width: 100% !important;
                 margin-left: auto !important;
                 margin-right: auto !important;
+            }
+            /* On narrow (mobile) viewports, Streamlit's default page
+            padding still eats noticeable width off both sides of the
+            chart on top of anything stPlotlyChart itself does — shrinking
+            that padding is what lets the 3D scene actually reach the
+            edges of the screen instead of sitting in a letterboxed strip. */
+            @media (max-width: 640px) {
+                .block-container {
+                    padding-left: 0.5rem !important;
+                    padding-right: 0.5rem !important;
+                }
+                div[data-testid="stPlotlyChart"] > div {
+                    height: 75vh !important;
+                }
             }
             </style>""",
             unsafe_allow_html=True,

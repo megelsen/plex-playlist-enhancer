@@ -91,7 +91,8 @@ def build_similarity_graph(music_section, max_artists=150, debug=None):
     return graph
 
 
-def render_galaxy_figure(graph, tag_mapping=None, artist_cluster_map=None, group_by_cluster=True):
+def render_galaxy_figure(graph, tag_mapping=None, artist_cluster_map=None, group_by_cluster=True,
+                          show_legend=True):
     """
     Lays the graph out in 3D using a spring (force-directed) layout and
     renders it as an interactive Plotly figure: drag to rotate (works at
@@ -197,8 +198,24 @@ def render_galaxy_figure(graph, tag_mapping=None, artist_cluster_map=None, group
     fig = go.Figure(data=[edge_trace] + node_traces)
     fig.update_layout(
         margin=dict(l=0, r=0, b=0, t=0),
-        showlegend=True,
-        legend=dict(bgcolor='rgba(0,0,0,0)'),
+        showlegend=show_legend,
+        # Legend is positioned as a floating overlay INSIDE the plot area
+        # (x/y anchored near the top-left corner, semi-transparent
+        # background) rather than Plotly's default of a separate column
+        # outside the plot. The default column is what strangles the 3D
+        # scene down to a sliver on narrow/mobile viewports — an overlay
+        # costs zero horizontal layout space, so the scene fills the full
+        # container width whether or not the legend is currently shown.
+        legend=dict(
+            bgcolor='rgba(0,0,0,0.4)',
+            bordercolor='rgba(255,255,255,0.15)',
+            borderwidth=1,
+            font=dict(color='white', size=11),
+            x=0.01,
+            y=0.99,
+            xanchor='left',
+            yanchor='top',
+        ),
         scene=dict(
             # Axes have no inherent meaning (spring-layout positions are
             # just whatever minimizes edge crossing/tension), so they stay
