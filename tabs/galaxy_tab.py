@@ -65,7 +65,8 @@ def render(plex, debug_box):
             artist_cluster_map = st.session_state.get('cluster_artist_map')
             st.session_state['galaxy_figure'] = render_galaxy_figure(
                 graph, tag_mapping=tag_mapping, artist_cluster_map=artist_cluster_map,
-                group_by_cluster=group_by_cluster, show_legend=show_legend
+                group_by_cluster=group_by_cluster, show_legend=show_legend,
+                camera_zoom=st.session_state.get('galaxy_camera_zoom', 1.0)
             )
             st.session_state['galaxy_node_count'] = graph.number_of_nodes()
             st.session_state['galaxy_edge_count'] = graph.number_of_edges()
@@ -80,7 +81,7 @@ def render(plex, debug_box):
             st.session_state['galaxy_figure'] = render_galaxy_figure(
                 st.session_state['galaxy_graph'], tag_mapping=tag_mapping,
                 artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster,
-                show_legend=show_legend
+                show_legend=show_legend, camera_zoom=st.session_state.get('galaxy_camera_zoom', 1.0)
             )
             st.session_state['galaxy_cluster_signature'] = _cluster_signature(tag_mapping, artist_cluster_map)
 
@@ -98,20 +99,23 @@ def render(plex, debug_box):
         artist_cluster_map = st.session_state.get('cluster_artist_map')
         current_signature = _cluster_signature(tag_mapping, artist_cluster_map)
         cluster_changed = st.session_state.get('galaxy_cluster_signature') != current_signature
-        # The "Show legend" checkbox has no dedicated button — flipping it
-        # should take effect immediately on the next rerun (which Streamlit
-        # already triggers on checkbox change), so it's tracked the same
-        # way as the cluster signature rather than requiring a manual
-        # Re-layout click just to hide/show the legend.
+        # The "Show legend" checkbox and the zoom buttons have no dedicated
+        # rebuild step — each should take effect on the very next rerun
+        # (which Streamlit already triggers on checkbox/button interaction),
+        # so both are tracked the same way as the cluster signature rather
+        # than requiring a manual Re-layout click.
         legend_changed = st.session_state.get('galaxy_show_legend') != show_legend
-        if cluster_changed or legend_changed:
+        camera_zoom = st.session_state.get('galaxy_camera_zoom', 1.0)
+        zoom_changed = st.session_state.get('galaxy_camera_zoom_rendered') != camera_zoom
+        if cluster_changed or legend_changed or zoom_changed:
             st.session_state['galaxy_figure'] = render_galaxy_figure(
                 st.session_state['galaxy_graph'], tag_mapping=tag_mapping,
                 artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster,
-                show_legend=show_legend
+                show_legend=show_legend, camera_zoom=camera_zoom
             )
             st.session_state['galaxy_cluster_signature'] = current_signature
             st.session_state['galaxy_show_legend'] = show_legend
+            st.session_state['galaxy_camera_zoom_rendered'] = camera_zoom
             if cluster_changed:
                 st.caption("🔄 Recolored automatically to match the latest cluster build.")
 
@@ -149,12 +153,49 @@ def render(plex, debug_box):
             </style>""",
             unsafe_allow_html=True,
         )
+        # Plotly's 3D scenes don't support pinch-to-zoom on touch devices
+        # (the scrollZoom config option only wires up desktop mouse-wheel
+        # zoom), so these buttons drive the camera distance directly —
+        # each click nudges galaxy_camera_zoom, which the render calls
+        # above pick up and re-apply to the figure's camera.eye.
+        zoom_in, zoom_out, zoom_reset = st.columns(3)
+        with zoom_in:
+            if st.button("🔍➕ Zoom in", use_container_width=True):
+                st.session_state['galaxy_camera_zoom'] = max(
+                    0.3, st.session_state.get('galaxy_camera_zoom', 1.0) * 0.8
+                )
+                st.rerun()
+        with zoom_out:
+            if st.button("🔍➖ Zoom out", use_container_width=True):
+                st.session_state['galaxy_camera_zoom'] = min(
+                    3.0, st.session_state.get('galaxy_camera_zoom', 1.0) * 1.25
+                )
+                st.rerun()
+        with zoom_reset:
+            if st.button("↺ Reset zoom", use_container_width=True):
+                st.session_state['galaxy_camera_zoom'] = 1.0
+                st.rerun()
+
         st.plotly_chart(
             figure,
             use_container_width=True,
             config={
-                "scrollZoom": True,  # pinch/scroll to zoom, including on mobile
+                "scrollZoom": True,  # desktop mouse-wheel zoom; touch pinch-zoom isn't
+                                     # supported by Plotly's gl3d camera, hence the buttons above
                 "displaylogo": False,
+                # Clicking a dragmode button (Pan / Orbit / Turntable) in
+                # Plotly's 3D modebar forces the camera back to its default
+                # position/zoom, even when re-selecting the mode that's
+                # already active — that's what was resetting zoom on mobile
+                # whenever pan or orbit got tapped. The scene's dragmode is
+                # already pinned to 'orbit' in the layout, so these buttons
+                # are pure liability here and are removed rather than
+                # worked around. Desktop wheel-zoom (scrollZoom above) and
+                # the mobile zoom buttons below are independent of this and
+                # unaffected by removing them.
+                "modeBarButtonsToRemove": [
+                    "pan3d", "orbitRotation", "tableRotation", "zoom3d",
+                ],
             },
         )
         if not st.session_state.get('cluster_tag_mapping') and not st.session_state.get('cluster_artist_map'):

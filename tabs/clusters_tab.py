@@ -43,6 +43,8 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         st.session_state['cluster_tag_counts'] = None  # {"genre": n, "mood": n} from last Preview Tags
     if 'cluster_artist_map' not in st.session_state:
         st.session_state['cluster_artist_map'] = None  # {artist_ratingKey: cluster_name}, for Library Galaxy
+    if 'cluster_saved_playlists' not in st.session_state:
+        st.session_state['cluster_saved_playlists'] = {}  # {cluster_name: playlist_name}, which clusters are already saved to Plex
     if 'cluster_cache_checked' not in st.session_state:
         # Runs once per session: if nothing's been built yet THIS session,
         # try loading the last build from disk so a restarted app doesn't
@@ -50,12 +52,13 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         # beyond plex.fetchItem per cached track.
         st.session_state['cluster_cache_checked'] = True
         if st.session_state['cluster_results_raw'] is None:
-            cached_results, cached_mapping = load_cluster_results_cache(plex, debug=debug_box)
+            cached_results, cached_mapping, cached_saved_playlists = load_cluster_results_cache(plex, debug=debug_box)
             if cached_results:
                 st.session_state['cluster_results_raw'] = cached_results
                 st.session_state['cluster_tag_mapping_raw'] = cached_mapping
                 st.session_state['cluster_names_used'] = list(cached_results.keys())
                 st.session_state['cluster_artist_map'] = build_artist_cluster_map(cached_results)
+                st.session_state['cluster_saved_playlists'] = cached_saved_playlists or {}
 
     try:
         cluster_music_section = next(s for s in plex.library.sections() if s.type in ['artist', 'music'])
@@ -83,6 +86,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                 'cluster_removed_keys': {},
                 'cluster_names_used': [],
                 'cluster_artist_map': None,
+                'cluster_saved_playlists': {},
                 'cluster_tag_counts': None,
                 'cluster_tag_preview': None,
                 'suggested_snapshot': None,
@@ -295,7 +299,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                 "connection on its own \u2014 0 uses pure Similar-Artist topology."
             )
             sonic_artist_sample_size = st.slider(
-                "Sampled tracks per artist", min_value=2, max_value=3, value=3, step=1,
+                "Sampled tracks per artist", min_value=3, max_value=10, value=6, step=1,
                 key="sonic_artist_sample_size",
             )
             st.caption(
@@ -319,7 +323,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
             )
         else:
             sonic_boost = 0.5
-            sonic_artist_sample_size = 3
+            sonic_artist_sample_size = 6
             sonic_use_cache = True
 
         if clustering_mode == "tags":
@@ -466,7 +470,8 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                     st.session_state['cluster_removed_keys'] = {}
                     st.session_state['cluster_names_used'] = list(results.keys())
                     st.session_state['cluster_artist_map'] = build_artist_cluster_map(results)
-                    save_cluster_results_cache(results, tag_mapping)
+                    st.session_state['cluster_saved_playlists'] = {}  # fresh build invalidates prior "already saved" status too
+                    save_cluster_results_cache(results, tag_mapping, st.session_state['cluster_saved_playlists'])
                 except Exception as e:
                     st.error(f"Failed to build clusters: {e}")
                     st.session_state['cluster_results_raw'] = None
@@ -569,7 +574,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         for name, tracks in cluster_results.items()
     ))
     if st.session_state.get('cluster_results_cache_signature') != results_signature:
-        save_cluster_results_cache(cluster_results, merged_tag_mapping)
+        save_cluster_results_cache(cluster_results, merged_tag_mapping, st.session_state['cluster_saved_playlists'])
         st.session_state['cluster_results_cache_signature'] = results_signature
 
     st.write("---")
@@ -588,13 +593,25 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                     plex_url=plex_url, plex_token=plex_token, cluster_name=cluster_name
                 )
 
+            already_saved_name = st.session_state['cluster_saved_playlists'].get(cluster_name)
+            if already_saved_name:
+                st.success(f"✅ Already saved as Plex playlist **'{already_saved_name}'** — saving again below will update/re-create it.")
+
             save_name = st.text_input(
-                "Playlist name:", value=f"{cluster_name} Mix",
+                "Playlist name:", value=already_saved_name or f"{cluster_name} Mix",
                 key=f"cluster_playlist_name_{cluster_name}"
             )
             if st.button(f"💾 Save '{cluster_name}' as Plex Playlist", key=f"save_cluster_{cluster_name}"):
                 try:
                     plex.createPlaylist(title=save_name, items=tracks)
                     st.success(f"Created playlist '{save_name}' with {len(tracks)} tracks.")
+                    # Remember this cluster's saved-playlist name and persist it
+                    # to disk (alongside the tracks/mapping) so the "already
+                    # saved" status above survives a reload/restart instead of
+                    # only living in this session's memory.
+                    st.session_state['cluster_saved_playlists'][cluster_name] = save_name
+                    save_cluster_results_cache(
+                        cluster_results, merged_tag_mapping, st.session_state['cluster_saved_playlists']
+                    )
                 except Exception as e:
                     st.error(f"Failed to create playlist: {e}")

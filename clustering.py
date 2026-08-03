@@ -1075,17 +1075,24 @@ def build_artist_cluster_map(results):
 CLUSTER_RESULTS_CACHE_PATH = os.environ.get("CLUSTER_RESULTS_CACHE_PATH", "/app/data/cluster_results.json")
 
 
-def save_cluster_results_cache(results, tag_mapping):
+def save_cluster_results_cache(results, tag_mapping, saved_playlists=None):
     """Persists the current cluster build to disk as track ratingKeys, for
     load_cluster_results_cache to rehydrate on a future app start. Call
     this any time `results` changes (fresh build, merge, or manual track
     removal) — best-effort, silently does nothing on failure since this is
-    a convenience cache, not a source of truth."""
+    a convenience cache, not a source of truth.
+
+    `saved_playlists` is an optional {cluster_name: playlist_name} map
+    recording which clusters have already been saved out as a real Plex
+    playlist (and under what name) — persisted alongside the tracks so
+    "already saved" status survives an app/container restart too, instead
+    of being forgotten the moment the in-memory session ends."""
     try:
         os.makedirs(os.path.dirname(CLUSTER_RESULTS_CACHE_PATH), exist_ok=True)
         payload = {
             "tag_mapping": tag_mapping,
             "clusters": {name: [getattr(t, 'ratingKey', None) for t in tracks] for name, tracks in results.items()},
+            "saved_playlists": saved_playlists or {},
         }
         with open(CLUSTER_RESULTS_CACHE_PATH, "w") as f:
             json.dump(payload, f)
@@ -1099,18 +1106,21 @@ def load_cluster_results_cache(plex, debug=None):
     back into real Plex track objects via plex.fetchItem, so a saved build
     survives an app/container restart instead of forcing a full rebuild.
 
-    Returns (results, tag_mapping), or (None, None) if there's no cache
-    file, it's unreadable, or every cached ratingKey has since vanished
-    from the library (tracks removed/library changed) — any individual
-    missing ratingKey is just skipped rather than failing the whole load,
-    since a few stale entries shouldn't discard an otherwise-good cache.
+    Returns (results, tag_mapping, saved_playlists), or (None, None, {}) if
+    there's no cache file, it's unreadable, or every cached ratingKey has
+    since vanished from the library (tracks removed/library changed) — any
+    individual missing ratingKey is just skipped rather than failing the
+    whole load, since a few stale entries shouldn't discard an otherwise-
+    good cache. `saved_playlists` is the {cluster_name: playlist_name} map
+    of clusters already saved to Plex as of the last save, restored here
+    too so that status isn't silently forgotten on reload.
     """
     d = debug.write if debug else (lambda *a, **k: None)
     try:
         with open(CLUSTER_RESULTS_CACHE_PATH, "r") as f:
             payload = json.load(f)
     except Exception:
-        return None, None
+        return None, None, {}
 
     results = {}
     missing = 0
@@ -1125,11 +1135,11 @@ def load_cluster_results_cache(plex, debug=None):
         if tracks:
             results[name] = tracks
     if not results:
-        return None, None
+        return None, None, {}
     total = sum(len(t) for t in results.values())
     d(f"**Loaded {total} tracks across {len(results)} clusters from disk cache** "
       f"({missing} stale ratingKey(s) skipped) — no rebuild needed.")
-    return results, payload.get("tag_mapping")
+    return results, payload.get("tag_mapping"), payload.get("saved_playlists", {})
 
 
 def _fold_thin_clusters(pools, clusters, tag_mapping, locked_clusters, debug=None):
@@ -1256,6 +1266,20 @@ def _most_common_tag(tag_iterable):
     return max(counts, key=counts.get)
 
 
+# Tags that are uselessly generic as a CLUSTER NAME no matter how rare they
+# happen to be in a given library — unlike the frequency-based genericity
+# check in _name_communities (which flags a tag only if it's the dominant
+# tag for a large fraction of communities), these carry no descriptive
+# content at all even when only one community happens to have them as its
+# top tag (e.g. a handful of poorly-tagged artists whose only genre is the
+# literal catch-all "Music"). Matched case-insensitively.
+ALWAYS_GENERIC_NAME_TAGS = {"music", "other", "unknown", "misc", "miscellaneous", "various", "general"}
+
+
+def _is_always_generic_tag(tag):
+    return tag is not None and tag.strip().lower() in ALWAYS_GENERIC_NAME_TAGS
+
+
 def _representative_names(items, is_track, max_names=2):
     """
     Picks up to max_names representative ARTIST names for a community,
@@ -1322,24 +1346,29 @@ def _llm_name_fallback_communities(fallback_info, api_key, model=None, timeout=6
         items.append(f'{{"id": "{cid}", "artists": "{artists}", "hint_tags": "{tags}"}}')
 
     prompt = f"""You are naming groups of musical artists that were clustered together by
-real listening/similarity data, but whose genre/mood TAGS were too generic in
-this library to produce a good name on their own — trust your own knowledge
-of these artists' actual sound more than the hint tags, which may be vague or
-even misleading.
+real listening/similarity data. Each group's genre tags were too generic (or
+absent) in this library to produce a good name on their own — some groups do
+have a mood hint (e.g. "Aggressive", "Dreamy"), but a bare mood by itself is a
+weak, repetitive name that doesn't say what the music actually IS. Trust your
+own knowledge of these artists' actual sound more than the hint tags, which
+may be vague, misleading, or (for mood) just one dimension of a fuller vibe.
 
 For each group below, invent a short, evocative 2-4 word name that captures
-what these artists actually sound like (e.g. "Epic Folk Metal", "Balkan
-Gypsy Punk", "Melancholic Post-Rock", "90s Alt Rock"). Be specific and
-confident — avoid vague filler like "Great Music" or "Mixed Bag". If you
-don't recognize enough of a group's artists to name it well, OMIT that
-group's id from your response rather than guessing badly.
+what these artists actually sound like — genre-forward when there's a clear
+one (e.g. "Epic Folk Metal", "Balkan Gypsy Punk", "Melancholic Post-Rock",
+"90s Alt Rock"), or a regional/vibe-forward name when that fits better (e.g.
+"Anatolian Vibes", "Iberian Ska-Punk", "Sun-Bleached Surf Rock"). Be specific
+and confident — avoid vague filler like "Great Music", "Mixed Bag", or
+reusing the mood hint verbatim as the whole name. If you don't recognize
+enough of a group's artists to name it well, OMIT that group's id from your
+response rather than guessing badly.
 
 Groups:
 {chr(10).join(items)}
 
 Respond with ONLY a JSON object mapping id -> name, nothing else, no markdown
 fences, no commentary:
-{{"0": "Epic Folk Metal", "2": "Balkan Gypsy Punk"}}"""
+{{"0": "Epic Folk Metal", "2": "Anatolian Vibes"}}"""
 
     try:
         resp = requests.post(
@@ -1383,23 +1412,31 @@ def _name_communities(community_members, tag_mapping, is_track, generic_tag_thre
     everywhere" end up being the same tag over and over.
 
     Two passes decide whether a tag can name a community at all (as
-    before); a third pass tries an LLM name for whatever's left, and only
-    the bare artist-name format is used if that's unavailable too:
+    before); a third pass tries an LLM name for anything without a usable
+    GENRE label (mood alone is too weak/repetitive a descriptor to use as
+    a first choice — see below), and only the bare artist-name format is
+    used if that's unavailable too:
       1. For every community, find its dominant genre tag and dominant
          mood tag, AND tally how many DIFFERENT communities share that
          same dominant tag.
       2. A tag is only used as the label if fewer than
          `generic_tag_threshold` (default 25%) of all communities share it
          as their dominant tag — i.e. it's somewhat specific to this
-         community, not just the library's overall default.
-      3. Whatever's left (tags too generic everywhere) is sent to Gemini in
-         ONE batched call (see _llm_name_fallback_communities) — a short,
-         evocative genre/vibe name based on the community's representative
-         artists, since Gemini's own knowledge of those artists is a
-         better signal than metadata that couldn't discriminate between
-         communities at all. Anything Gemini can't confidently name (or if
-         api_key is None, e.g. dry run) falls back to bare representative
-         artist names ("Artist1 & Artist2 Mix").
+         community, not just the library's overall default — AND it isn't
+         on the hardcoded always-generic list (ALWAYS_GENERIC_NAME_TAGS,
+         e.g. "Music", "Other") regardless of frequency.
+      3. Whatever's left with no usable GENRE (whether or not it has a
+         mood) is sent to Gemini in ONE batched call
+         (see _llm_name_fallback_communities) — a short, evocative
+         genre/vibe/regional name based on the community's representative
+         artists (with the mood, if any, offered only as a hint), since
+         Gemini's own knowledge of those artists is a better signal than a
+         single mood word that's often shared across otherwise very
+         different communities. Priority order for the final name is
+         genre > LLM name > bare mood > representative artist names —
+         mood is a last resort, not a first choice, and is only used when
+         Gemini couldn't confidently improve on it (no api key, dry run,
+         or it didn't recognize enough of the group).
 
     community_members: dict {community_id: [artist_or_track, ...]}
     api_key: Gemini API key for pass 3; pass None to skip it entirely
@@ -1448,7 +1485,7 @@ def _name_communities(community_members, tag_mapping, is_track, generic_tag_thre
     max_users = max(1, round(generic_tag_threshold * n_communities))
 
     def _is_generic(tag, users_by_tag):
-        return tag is not None and len(users_by_tag.get(tag, ())) > max_users
+        return tag is not None and (len(users_by_tag.get(tag, ())) > max_users or _is_always_generic_tag(tag))
 
     generic_genres = {t for t in genre_users if _is_generic(t, genre_users)}
     generic_moods = {t for t in mood_users if _is_generic(t, mood_users)}
@@ -1459,24 +1496,34 @@ def _name_communities(community_members, tag_mapping, is_track, generic_tag_thre
           f"(shared by more than {generic_tag_threshold:.0%} of {n_communities} communities) — "
           "affected communities are named from representative artists instead.")
 
-    # Pass 3: for whatever's left (no usable genre or mood label), try an
-    # LLM name from representative artists before falling back to bare
-    # artist names. Gathered up front and sent as ONE batched call, not
-    # one call per community.
+    # Pass 3: try an LLM name from representative artists for anything
+    # without a usable GENRE label — not just anything without ANY label.
+    # A bare mood ("Aggressive", "Rousing", "Dreamy") describes a vibe but
+    # says almost nothing about what the music actually IS, and several
+    # communities can easily share the same dominant mood without either
+    # crossing the generic-frequency threshold — so leaning on mood alone
+    # produces flat, repetitive, low-information names. Handing the mood
+    # to Gemini as a hint (alongside representative artists) instead lets
+    # it invent something like "Anatolian Vibes" or "Iberian Ska-Punk" —
+    # specific, evocative, and still mood-aware. Gathered up front and
+    # sent as ONE batched call, not one call per community.
     fallback_info = {}
     for community_id, members in community_members.items():
         info = per_community[community_id]
         genre = info["dominant_genre"] if info["dominant_genre"] not in generic_genres else None
         mood = info["dominant_mood"] if info["dominant_mood"] not in generic_moods else None
-        if genre or mood:
+        if genre:
             continue
         names = _representative_names(members, is_track, max_names=5)
         hint_tags = sorted({info["dominant_genre"], info["dominant_mood"]} - {None})
-        fallback_info[community_id] = {"artists": names, "tags": hint_tags}
+        fallback_info[community_id] = {"artists": names, "tags": hint_tags, "mood_only": mood is not None}
 
     llm_names = _llm_name_fallback_communities(fallback_info, api_key, debug=debug) if fallback_info else {}
 
-    # Pass 2 (final assembly): tag label -> LLM name -> bare artist names.
+    # Pass 2 (final assembly): genre label -> LLM name -> mood label -> bare artist names.
+    # Mood drops from a first-choice label to a last-resort one, used only
+    # when Gemini couldn't (or wasn't able to, e.g. dry run/no api key)
+    # turn the mood + representative artists into something more specific.
     result = {}
     for community_id, members in community_members.items():
         info = per_community[community_id]
@@ -1487,10 +1534,10 @@ def _name_communities(community_members, tag_mapping, is_track, generic_tag_thre
             name = genre
             if mood and mood.lower() not in genre.lower():
                 name = f"{genre} — {mood}"
-        elif mood:
-            name = mood
         elif community_id in llm_names:
             name = llm_names[community_id]
+        elif mood:
+            name = mood
         else:
             names = _representative_names(members, is_track)
             if names:
@@ -1500,6 +1547,46 @@ def _name_communities(community_members, tag_mapping, is_track, generic_tag_thre
                 name = max(named_votes, key=named_votes.get) if named_votes else f"Sonic Cluster {community_id}"
 
         result[community_id] = (name, info["vote_counts"])
+
+    # Pass 4: resolve NAME COLLISIONS with real differentiation instead of
+    # leaving it to _finalize_community_name's "(2)", "(3)" numbering. Tag-
+    # based names are especially prone to this: a mood like "Aggressive" or
+    # "Rousing" can be the top mood for several DIFFERENT communities
+    # without any single one crossing the generic_tag_threshold (e.g. 4
+    # communities out of 17 each "own" a different mood, each under 25%
+    # individually) — so the tag itself passes the genericity check, yet
+    # several communities still end up proposing the exact same word. Left
+    # alone, that produces a wall of "Aggressive", "Aggressive (2)",
+    # "Aggressive (3)"... which numbers cosmetically rather than actually
+    # telling clusters apart. Since only genre/mood-named communities can
+    # collide this way (LLM-named and artist-named communities are already
+    # distinct by construction — different membership, different prompt
+    # context), only those are considered for re-naming here.
+    name_to_ids = defaultdict(list)
+    for community_id, (name, _) in result.items():
+        name_to_ids[name].append(community_id)
+    duplicate_ids = {cid for ids in name_to_ids.values() if len(ids) > 1 for cid in ids}
+
+    if duplicate_ids:
+        dup_fallback_info = {}
+        for community_id in duplicate_ids:
+            members = community_members[community_id]
+            names = _representative_names(members, is_track, max_names=5)
+            dup_fallback_info[community_id] = {"artists": names, "tags": [result[community_id][0]]}
+        dup_llm_names = _llm_name_fallback_communities(dup_fallback_info, api_key, debug=debug)
+
+        for community_id in duplicate_ids:
+            base_name, vote_counts = result[community_id]
+            if community_id in dup_llm_names:
+                result[community_id] = (dup_llm_names[community_id], vote_counts)
+                continue
+            # No LLM name available (no api key, or Gemini didn't recognize
+            # this group confidently) — fold in representative artists
+            # rather than a bare number, so the name still says something
+            # real about what's actually in this cluster.
+            names = _representative_names(community_members[community_id], is_track, max_names=2)
+            if names:
+                result[community_id] = (f"{base_name} ({' & '.join(names)})", vote_counts)
 
     return result
 
