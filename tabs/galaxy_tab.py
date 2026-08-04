@@ -2,7 +2,11 @@
 using Plex's "Similar Artist" links, colored by genre cluster when
 available. Inspired by Music-Manager-for-Plex's "Galaxy Explorer" feature."""
 
+import json
+
+import plotly.utils
 import streamlit as st
+import streamlit.components.v1 as components
 
 from galaxy import build_similarity_graph, render_galaxy_figure
 
@@ -16,6 +20,84 @@ def _cluster_signature(tag_mapping, artist_cluster_map):
     mapping_part = tuple(sorted(tag_mapping.items())) if tag_mapping else None
     artist_part = tuple(sorted(artist_cluster_map.items())) if artist_cluster_map else None
     return (mapping_part, artist_part)
+
+
+def _render_galaxy_html(figure, height=650):
+    """Embeds the figure via raw plotly.js instead of st.plotly_chart, and
+    wires zoom/legend buttons to Plotly.relayout() calls that run entirely
+    in the browser. Doing this through Streamlit (session_state + a
+    Python-side re-render + a full rerun) meant every zoom click or legend
+    toggle re-shipped the whole figure JSON over the Streamlit websocket
+    and re-ran the tab's Python — slow, and increasingly so as the graph
+    grows. A relayout of just the camera or showlegend property is a tiny,
+    instant browser-side patch that never leaves the page, so this bypasses
+    Streamlit entirely for anything that doesn't actually change the
+    underlying node data or layout (that part — Build/Re-layout/cluster
+    recoloring — still goes through Python, since it genuinely needs it).
+    """
+    fig_json = json.dumps(figure, cls=plotly.utils.PlotlyJSONEncoder)
+    html = f"""
+    <div id="galaxy-plot" style="width:100%; height:{height}px;"></div>
+    <div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
+        <button onclick="galaxyZoomBy(0.8)"
+            style="width:100%; padding:12px; font-size:15px; border-radius:8px;
+                   border:1px solid rgba(128,128,128,0.4); cursor:pointer;">
+            🔍➕ Zoom in
+        </button>
+        <button onclick="galaxyZoomBy(1.25)"
+            style="width:100%; padding:12px; font-size:15px; border-radius:8px;
+                   border:1px solid rgba(128,128,128,0.4); cursor:pointer;">
+            🔍➖ Zoom out
+        </button>
+        <button onclick="galaxyResetZoom()"
+            style="width:100%; padding:12px; font-size:15px; border-radius:8px;
+                   border:1px solid rgba(128,128,128,0.4); cursor:pointer;">
+            ↺ Reset zoom
+        </button>
+        <button onclick="galaxyToggleLegend()"
+            style="width:100%; padding:12px; font-size:15px; border-radius:8px;
+                   border:1px solid rgba(128,128,128,0.4); cursor:pointer;">
+            🗂️ Toggle legend
+        </button>
+    </div>
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+    <script>
+        var galaxyFig = {fig_json};
+        var galaxyDiv = document.getElementById('galaxy-plot');
+        Plotly.newPlot(galaxyDiv, galaxyFig.data, galaxyFig.layout, {{
+            scrollZoom: true,
+            displaylogo: false,
+            // Same rationale as before: 3D dragmode-switch buttons reset
+            // the camera on click, including on mobile, so they're
+            // stripped from the modebar rather than worked around.
+            modeBarButtonsToRemove: ['pan3d', 'orbitRotation', 'tableRotation', 'zoom3d'],
+            responsive: true
+        }});
+
+        var galaxyZoom = 1.0;
+        function galaxyZoomBy(factor) {{
+            galaxyZoom = Math.max(0.3, Math.min(3.0, galaxyZoom * factor));
+            Plotly.relayout(galaxyDiv, {{
+                'scene.camera.eye.x': 1.25 * galaxyZoom,
+                'scene.camera.eye.y': 1.25 * galaxyZoom,
+                'scene.camera.eye.z': 1.25 * galaxyZoom
+            }});
+        }}
+        function galaxyResetZoom() {{
+            galaxyZoom = 1.0;
+            Plotly.relayout(galaxyDiv, {{
+                'scene.camera.eye.x': 1.25, 'scene.camera.eye.y': 1.25, 'scene.camera.eye.z': 1.25
+            }});
+        }}
+        var galaxyLegendOn = true;
+        function galaxyToggleLegend() {{
+            galaxyLegendOn = !galaxyLegendOn;
+            Plotly.relayout(galaxyDiv, {{showlegend: galaxyLegendOn}});
+        }}
+    </script>
+    """
+    # height padding accounts for the 4 stacked buttons below the plot
+    components.html(html, height=height + 230, scrolling=False)
 
 
 def render(plex, debug_box):
@@ -49,13 +131,6 @@ def render(plex, debug_box):
              "without discarding the real similarity structure. Requires clusters built in "
              "🗂️ Library Clusters first (any clustering mode — Hybrid, Tags, or Sonic).",
     )
-    show_legend = st.checkbox(
-        "Show legend",
-        value=True,
-        help="The cluster legend now floats on top of the chart instead of pushing it "
-             "into a separate column, but on small screens it can still cover part of "
-             "the view — toggle it off to give the whole screen to the galaxy itself.",
-    )
 
     if st.button("🌟 Build Galaxy"):
         with st.spinner("Fetching similarity links and laying out the galaxy..."):
@@ -65,8 +140,7 @@ def render(plex, debug_box):
             artist_cluster_map = st.session_state.get('cluster_artist_map')
             st.session_state['galaxy_figure'] = render_galaxy_figure(
                 graph, tag_mapping=tag_mapping, artist_cluster_map=artist_cluster_map,
-                group_by_cluster=group_by_cluster, show_legend=show_legend,
-                camera_zoom=st.session_state.get('galaxy_camera_zoom', 1.0)
+                group_by_cluster=group_by_cluster
             )
             st.session_state['galaxy_node_count'] = graph.number_of_nodes()
             st.session_state['galaxy_edge_count'] = graph.number_of_edges()
@@ -80,8 +154,7 @@ def render(plex, debug_box):
             artist_cluster_map = st.session_state.get('cluster_artist_map')
             st.session_state['galaxy_figure'] = render_galaxy_figure(
                 st.session_state['galaxy_graph'], tag_mapping=tag_mapping,
-                artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster,
-                show_legend=show_legend, camera_zoom=st.session_state.get('galaxy_camera_zoom', 1.0)
+                artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster
             )
             st.session_state['galaxy_cluster_signature'] = _cluster_signature(tag_mapping, artist_cluster_map)
 
@@ -94,30 +167,19 @@ def render(plex, debug_box):
     # moved on. This is a pure local recoloring — same graph, same layout,
     # no Plex re-fetch — so it's cheap enough to just do automatically
     # rather than asking the user to notice and click Re-layout themselves.
+    # (Zoom and legend-visibility no longer live here at all — see
+    # _render_galaxy_html — since neither changes node data or coloring.)
     if st.session_state.get('galaxy_graph') is not None:
         tag_mapping = st.session_state.get('cluster_tag_mapping')
         artist_cluster_map = st.session_state.get('cluster_artist_map')
         current_signature = _cluster_signature(tag_mapping, artist_cluster_map)
-        cluster_changed = st.session_state.get('galaxy_cluster_signature') != current_signature
-        # The "Show legend" checkbox and the zoom buttons have no dedicated
-        # rebuild step — each should take effect on the very next rerun
-        # (which Streamlit already triggers on checkbox/button interaction),
-        # so both are tracked the same way as the cluster signature rather
-        # than requiring a manual Re-layout click.
-        legend_changed = st.session_state.get('galaxy_show_legend') != show_legend
-        camera_zoom = st.session_state.get('galaxy_camera_zoom', 1.0)
-        zoom_changed = st.session_state.get('galaxy_camera_zoom_rendered') != camera_zoom
-        if cluster_changed or legend_changed or zoom_changed:
+        if st.session_state.get('galaxy_cluster_signature') != current_signature:
             st.session_state['galaxy_figure'] = render_galaxy_figure(
                 st.session_state['galaxy_graph'], tag_mapping=tag_mapping,
-                artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster,
-                show_legend=show_legend, camera_zoom=camera_zoom
+                artist_cluster_map=artist_cluster_map, group_by_cluster=group_by_cluster
             )
             st.session_state['galaxy_cluster_signature'] = current_signature
-            st.session_state['galaxy_show_legend'] = show_legend
-            st.session_state['galaxy_camera_zoom_rendered'] = camera_zoom
-            if cluster_changed:
-                st.caption("🔄 Recolored automatically to match the latest cluster build.")
+            st.caption("🔄 Recolored automatically to match the latest cluster build.")
 
     figure = st.session_state.get('galaxy_figure')
     if figure is not None:
@@ -125,79 +187,7 @@ def render(plex, debug_box):
             f"{st.session_state.get('galaxy_node_count', 0)} artists, "
             f"{st.session_state.get('galaxy_edge_count', 0)} similarity links."
         )
-        # Streamlit's default block width can leave the chart narrower than
-        # the viewport on mobile — this forces the chart's own container to
-        # fill all available width and centers it, on top of
-        # use_container_width doing the same at the Streamlit-widget level.
-        st.markdown(
-            """<style>
-            div[data-testid="stPlotlyChart"] {
-                width: 100% !important;
-                margin-left: auto !important;
-                margin-right: auto !important;
-            }
-            /* On narrow (mobile) viewports, Streamlit's default page
-            padding still eats noticeable width off both sides of the
-            chart on top of anything stPlotlyChart itself does — shrinking
-            that padding is what lets the 3D scene actually reach the
-            edges of the screen instead of sitting in a letterboxed strip. */
-            @media (max-width: 640px) {
-                .block-container {
-                    padding-left: 0.5rem !important;
-                    padding-right: 0.5rem !important;
-                }
-                div[data-testid="stPlotlyChart"] > div {
-                    height: 75vh !important;
-                }
-            }
-            </style>""",
-            unsafe_allow_html=True,
-        )
-        # Plotly's 3D scenes don't support pinch-to-zoom on touch devices
-        # (the scrollZoom config option only wires up desktop mouse-wheel
-        # zoom), so these buttons drive the camera distance directly —
-        # each click nudges galaxy_camera_zoom, which the render calls
-        # above pick up and re-apply to the figure's camera.eye.
-        zoom_in, zoom_out, zoom_reset = st.columns(3)
-        with zoom_in:
-            if st.button("🔍➕ Zoom in", use_container_width=True):
-                st.session_state['galaxy_camera_zoom'] = max(
-                    0.3, st.session_state.get('galaxy_camera_zoom', 1.0) * 0.8
-                )
-                st.rerun()
-        with zoom_out:
-            if st.button("🔍➖ Zoom out", use_container_width=True):
-                st.session_state['galaxy_camera_zoom'] = min(
-                    3.0, st.session_state.get('galaxy_camera_zoom', 1.0) * 1.25
-                )
-                st.rerun()
-        with zoom_reset:
-            if st.button("↺ Reset zoom", use_container_width=True):
-                st.session_state['galaxy_camera_zoom'] = 1.0
-                st.rerun()
-
-        st.plotly_chart(
-            figure,
-            use_container_width=True,
-            config={
-                "scrollZoom": True,  # desktop mouse-wheel zoom; touch pinch-zoom isn't
-                                     # supported by Plotly's gl3d camera, hence the buttons above
-                "displaylogo": False,
-                # Clicking a dragmode button (Pan / Orbit / Turntable) in
-                # Plotly's 3D modebar forces the camera back to its default
-                # position/zoom, even when re-selecting the mode that's
-                # already active — that's what was resetting zoom on mobile
-                # whenever pan or orbit got tapped. The scene's dragmode is
-                # already pinned to 'orbit' in the layout, so these buttons
-                # are pure liability here and are removed rather than
-                # worked around. Desktop wheel-zoom (scrollZoom above) and
-                # the mobile zoom buttons below are independent of this and
-                # unaffected by removing them.
-                "modeBarButtonsToRemove": [
-                    "pan3d", "orbitRotation", "tableRotation", "zoom3d",
-                ],
-            },
-        )
+        _render_galaxy_html(figure)
         if not st.session_state.get('cluster_tag_mapping') and not st.session_state.get('cluster_artist_map'):
             st.info("All nodes are 'Uncategorized' right now — build clusters in 🗂️ Library Clusters to color them.")
     else:

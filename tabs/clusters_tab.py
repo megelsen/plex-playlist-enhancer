@@ -470,7 +470,23 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                     st.session_state['cluster_removed_keys'] = {}
                     st.session_state['cluster_names_used'] = list(results.keys())
                     st.session_state['cluster_artist_map'] = build_artist_cluster_map(results)
-                    st.session_state['cluster_saved_playlists'] = {}  # fresh build invalidates prior "already saved" status too
+                    if remap_clicked:
+                        # Force Re-map throws out the whole genre mapping and
+                        # rebuilds from scratch, so cluster membership can
+                        # shift enough that an old "already saved" badge would
+                        # likely be lying about what's in the cluster now.
+                        st.session_state['cluster_saved_playlists'] = {}
+                    else:
+                        # A plain rebuild (re-scan tracks/play counts, same
+                        # cached genre mapping) usually keeps the same
+                        # cluster identities. Carry saved-playlist status
+                        # over by matching cluster NAME — drop it only for
+                        # clusters that didn't come back under that name.
+                        old_saved = st.session_state.get('cluster_saved_playlists', {})
+                        st.session_state['cluster_saved_playlists'] = {
+                            name: playlist_name for name, playlist_name in old_saved.items()
+                            if name in results
+                        }
                     save_cluster_results_cache(results, tag_mapping, st.session_state['cluster_saved_playlists'])
                 except Exception as e:
                     st.error(f"Failed to build clusters: {e}")

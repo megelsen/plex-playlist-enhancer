@@ -92,7 +92,7 @@ def build_similarity_graph(music_section, max_artists=150, debug=None):
 
 
 def render_galaxy_figure(graph, tag_mapping=None, artist_cluster_map=None, group_by_cluster=True,
-                          show_legend=True):
+                          show_legend=True, camera_zoom=1.0):
     """
     Lays the graph out in 3D using a spring (force-directed) layout and
     renders it as an interactive Plotly figure: drag to rotate (works at
@@ -226,10 +226,25 @@ def render_galaxy_figure(graph, tag_mapping=None, artist_cluster_map=None, group
             yaxis=dict(visible=False),
             zaxis=dict(visible=False),
             dragmode='orbit',
+            # Plotly's gl3d camera has no built-in pinch-to-zoom on touch
+            # devices (scrollZoom in the chart config only covers desktop
+            # mouse-wheel zoom) — so zoom here is driven explicitly by
+            # scaling the camera's eye vector, controlled by dedicated
+            # +/- buttons in the tab rather than a gesture.
+            camera=dict(eye=dict(x=1.25 * camera_zoom, y=1.25 * camera_zoom, z=1.25 * camera_zoom)),
         ),
         autosize=True,
         width=None,   # let the container (see use_container_width in the tab) drive width
         height=650,
-        uirevision='galaxy',  # preserves current rotation/zoom across reruns
+        # uirevision is tied to camera_zoom (rounded to avoid float-noise
+        # churn) rather than a plain constant: a fixed string would make
+        # Plotly ignore the explicit camera eye above on every rerun after
+        # the first (that's the whole point of uirevision — preserve
+        # whatever the user last set), which would silently swallow the
+        # zoom-button clicks. Bumping the revision only when zoom actually
+        # changes still preserves rotation/orbit position across unrelated
+        # reruns (e.g. toggling the legend), since the revision string is
+        # unchanged in that case.
+        uirevision=f'galaxy-{round(camera_zoom, 3)}',
     )
     return fig
