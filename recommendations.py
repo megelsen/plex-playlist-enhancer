@@ -6,12 +6,14 @@ import random
 from plex_helpers import get_sonic_match_percent, get_top_tracks_for_artist
 
 
-def generate_playlist_vibe_recommendations(playlist, plex, debug_box, count=10):
+def generate_playlist_vibe_recommendations(playlist, plex, debug_box, count=10, exclude_keys=None):
     tracks = playlist.items()
     if not tracks:
         return []
 
     existing_keys = {t.ratingKey for t in tracks}
+    if exclude_keys:
+        existing_keys |= set(exclude_keys)
     raw_pool = []
 
     valid_tracks = [t for t in tracks if getattr(t, 'ratingKey', None) is not None]
@@ -19,7 +21,7 @@ def generate_playlist_vibe_recommendations(playlist, plex, debug_box, count=10):
         return []
 
     # Pick seed tracks
-    seeds = random.sample(valid_tracks, min(len(valid_tracks), 6))
+    seeds = random.sample(valid_tracks, min(len(valid_tracks), 10))
     debug_box.write(f"**Selected Seeds:** {len(seeds)} tracks")
 
     for seed in seeds:
@@ -43,6 +45,8 @@ def generate_playlist_vibe_recommendations(playlist, plex, debug_box, count=10):
         # 2. FIXED PLEXAMP CLONE LOGIC (Using .tag instead of .title)
         try:
             artist_key = getattr(seed, 'grandparentRatingKey', None)
+            seed_artist_display = (getattr(seed, 'grandparentTitle', '') or 'Unknown Artist').strip()
+            seed_artist_name = seed_artist_display.lower()
             if artist_key:
                 artist = plex.fetchItem(artist_key)
 
@@ -50,6 +54,16 @@ def generate_playlist_vibe_recommendations(playlist, plex, debug_box, count=10):
                     similar_artists = artist.similar() if callable(artist.similar) else artist.similar
                 else:
                     similar_artists = []
+
+                # Plex's "similar artists" hub sometimes lists the artist
+                # itself alongside genuinely related ones — drop any entry
+                # whose name matches the seed artist before we even sample,
+                # so we never end up suggesting e.g. Korn as a "related
+                # artist" of Korn.
+                similar_artists = [
+                    a for a in similar_artists
+                    if (getattr(a, 'tag', '') or '').strip().lower() != seed_artist_name
+                ]
 
                 if similar_artists:
                     debug_box.write(f"└ ✅ Found {len(similar_artists)} Similar Artists.")
@@ -65,6 +79,19 @@ def generate_playlist_vibe_recommendations(playlist, plex, debug_box, count=10):
 
                                 if full_artist_matches:
                                     real_artist = full_artist_matches[0]
+                                    real_artist_key = getattr(real_artist, 'ratingKey', None)
+                                    real_artist_name = (getattr(real_artist, 'title', '') or '').strip().lower()
+                                    # Compare as strings — grandparentRatingKey and a
+                                    # freshly-resolved artist's ratingKey aren't always
+                                    # parsed to the same type by plexapi, so a raw `==`
+                                    # can silently miss a genuine self-match. The name
+                                    # check is a backstop for when the ID comparison
+                                    # itself is inconclusive (e.g. either key is None).
+                                    is_self_by_key = artist_key is not None and real_artist_key is not None and str(real_artist_key) == str(artist_key)
+                                    is_self_by_name = real_artist_name == seed_artist_name
+                                    if is_self_by_key or is_self_by_name:
+                                        debug_box.write(f"  └ ⏭️ Skipping {real_artist.title} — resolved back to the seed artist itself.")
+                                        continue
                                     top_tracks = get_top_tracks_for_artist(real_artist, limit=4, per_album_sample=2)
                                     if top_tracks:
                                         debug_box.write(f"  └ ✅ Pulled {len(top_tracks)} tracks for {real_artist.title}.")
@@ -72,7 +99,7 @@ def generate_playlist_vibe_recommendations(playlist, plex, debug_box, count=10):
                                         debug_box.write(f"  └ ℹ️ No album tracks found for {real_artist.title}.")
                                     for top_track in top_tracks:
                                         if getattr(top_track, 'ratingKey', None) and top_track.ratingKey not in existing_keys:
-                                            setattr(top_track, 'recommendation_type', f'Related Artist ({real_artist.title})')
+                                            setattr(top_track, 'recommendation_type', f'Related Artist ({seed_artist_display})')
                                             raw_pool.append(top_track)
                         except Exception as e_inner:
                             debug_box.write(f"  └ ❌ Artist Fetch Failed for {getattr(sim_artist, 'tag', 'Unknown')}: `{str(e_inner)}`")

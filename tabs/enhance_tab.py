@@ -46,18 +46,13 @@ def render(plex, plex_url, plex_token, debug_box):
     st.caption(f"Currently enhancing: **{selected_pl_name}**")
     current_playlist = next(pl for pl in all_playlists if pl.title == selected_pl_name)
 
+    SAMPLE_COUNT = 10
+
     if not st.session_state['recommendations']:
         with st.spinner("Analyzing playlist vibe..."):
             st.session_state['recommendations'] = generate_playlist_vibe_recommendations(
-                current_playlist, plex, debug_box, count=10
+                current_playlist, plex, debug_box, count=SAMPLE_COUNT
             )
-
-    if st.button("🔄 Refresh Recommendations"):
-        with st.spinner("Fetching fresh music..."):
-            st.session_state['recommendations'] = generate_playlist_vibe_recommendations(
-                current_playlist, plex, debug_box, count=10
-            )
-        st.rerun()
 
     st.write("---")
 
@@ -68,5 +63,15 @@ def render(plex, plex_url, plex_token, debug_box):
         for idx, track in enumerate(rec_list):
             render_track_row(
                 track, idx, key_prefix="enhance", mode="enhance",
-                plex_url=plex_url, plex_token=plex_token, current_playlist=current_playlist
+                plex_url=plex_url, plex_token=plex_token, current_playlist=current_playlist,
+                plex=plex, debug_box=debug_box
             )
+
+    st.write("---")
+
+    if st.button("🔄 Refresh Recommendations"):
+        with st.spinner("Fetching fresh music..."):
+            st.session_state['recommendations'] = generate_playlist_vibe_recommendations(
+                current_playlist, plex, debug_box, count=SAMPLE_COUNT
+            )
+        st.rerun()

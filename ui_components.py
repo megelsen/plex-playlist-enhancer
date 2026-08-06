@@ -3,9 +3,10 @@
 import streamlit as st
 
 from plex_helpers import get_stream_url
+from recommendations import generate_playlist_vibe_recommendations
 
 
-def render_track_row(track, idx, key_prefix, mode, plex_url, plex_token, current_playlist=None, cluster_name=None):
+def render_track_row(track, idx, key_prefix, mode, plex_url, plex_token, current_playlist=None, cluster_name=None, plex=None, debug_box=None):
     """
     Shared row renderer used by the Playlist Enhancer, Artist Mix, and
     Library Clusters tabs: cover + play/pause + action button on one line,
@@ -74,6 +75,19 @@ def render_track_row(track, idx, key_prefix, mode, plex_url, plex_token, current
                 current_playlist.addItems([track])
                 st.session_state['recommendations'].pop(idx)
                 st.toast(f"Added: {track.title}")
+
+                # Top the slot back up with a fresh recommendation so the
+                # visible list stays at full size instead of shrinking by
+                # one every time a track is added.
+                if plex is not None and debug_box is not None:
+                    seen_keys = {t.ratingKey for t in st.session_state['recommendations']}
+                    seen_keys.add(track.ratingKey)
+                    replacement = generate_playlist_vibe_recommendations(
+                        current_playlist, plex, debug_box, count=1, exclude_keys=seen_keys
+                    )
+                    if replacement:
+                        st.session_state['recommendations'].insert(idx, replacement[0])
+
                 st.rerun()
         elif mode == 'mix':
             if st.button("\u2715\uFE0E", key=f"remove_{key_prefix}_{track.ratingKey}_{idx}"):  # ✕︎

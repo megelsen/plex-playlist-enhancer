@@ -614,7 +614,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                 st.success(f"✅ Already saved as Plex playlist **'{already_saved_name}'** — saving again below will update/re-create it.")
 
             save_name = st.text_input(
-                "Playlist name:", value=already_saved_name or f"{cluster_name} Mix",
+                "Playlist name:", value=already_saved_name or f"[Mix] {cluster_name}",
                 key=f"cluster_playlist_name_{cluster_name}"
             )
             if st.button(f"💾 Save '{cluster_name}' as Plex Playlist", key=f"save_cluster_{cluster_name}"):
