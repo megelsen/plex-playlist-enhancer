@@ -4,7 +4,8 @@ import streamlit as st
 from plexapi.server import PlexServer
 
 from styles import inject_custom_css
-from tabs import enhance_tab, mix_tab, clusters_tab, galaxy_tab
+from tabs import enhance_tab, mix_tab, clusters_tab, galaxy_tab, live_tab
+import live_playlists
 
 st.set_page_config(layout="wide", page_title="Smart Playlist Enhancer")
 inject_custom_css()
@@ -41,6 +42,13 @@ if not plex:
     st.info("👈 Please enter your Plex URL and Token in the left sidebar to connect.")
     st.stop()
 
+# Starts the Live Playlists daily scheduler exactly once per container
+# process (safe to call on every rerun — see live_playlists.py). The
+# scheduled job itself authenticates via PLEX_URL/PLEX_TOKEN environment
+# variables, not the sidebar fields above, since it runs with no browser
+# session attached.
+live_playlists.ensure_scheduler_started()
+
 # Live API Monitor in the Streamlit Sidebar
 st.sidebar.write("---")
 st.sidebar.title("🪲 Live API Debugger")
@@ -53,18 +61,53 @@ if 'last_loaded_playlist' not in st.session_state:
 if 'now_playing_key' not in st.session_state:
     st.session_state['now_playing_key'] = None
 
-tab_enhance, tab_mix, tab_clusters, tab_galaxy = st.tabs(
-    ["🎧 Playlist Enhancer", "🎨 Artist Mix", "🗂️ Library Clusters", "🌌 Library Galaxy"]
+# --- SECTION NAV -----------------------------------------------------------
+#
+# Deliberately NOT st.tabs(): st.tabs() only hides inactive tab content in
+# the browser — every st.tabs() block's Python still executes top-to-bottom
+# on EVERY rerun regardless of which tab is visible. With Library Clusters
+# (a heavy Gemini/Louvain pipeline) and Library Galaxy (an O(n^2)-ish
+# spring layout) as tabs, that meant clicking a play button in Playlist
+# Enhancer was silently re-running the entire clustering pipeline and
+# re-laying out the galaxy in the background on every single interaction —
+# the main cause of the app feeling sluggish everywhere, not just in those
+# two tabs.
+#
+# st.radio (as horizontal pills below) only ever runs the render() call for
+# the section actually selected; every other section's code doesn't execute
+# at all until you switch to it. Each tab's own st.session_state stays
+# intact across switches exactly as before — this only changes how often
+# their code runs, not what it does.
+SECTIONS = {
+    "🎧 Playlist Enhancer": enhance_tab,
+    "🎨 Artist Mix": mix_tab,
+    "🗂️ Library Clusters": clusters_tab,
+    "🌌 Library Galaxy": galaxy_tab,
+    "🔴 Live Playlists": live_tab,
+}
+
+if "active_section" not in st.session_state:
+    st.session_state["active_section"] = list(SECTIONS.keys())[0]
+
+st.session_state["active_section"] = st.radio(
+    "Section",
+    list(SECTIONS.keys()),
+    key="active_section_radio",
+    index=list(SECTIONS.keys()).index(st.session_state["active_section"]),
+    horizontal=True,
+    label_visibility="collapsed",
 )
+st.write("")
 
-with tab_enhance:
+active = st.session_state["active_section"]
+
+if active == "🎧 Playlist Enhancer":
     enhance_tab.render(plex, PLEX_URL, PLEX_TOKEN, debug_box)
-
-with tab_mix:
+elif active == "🎨 Artist Mix":
     mix_tab.render(plex, PLEX_URL, PLEX_TOKEN, debug_box)
-
-with tab_clusters:
+elif active == "🗂️ Library Clusters":
     clusters_tab.render(plex, PLEX_URL, PLEX_TOKEN, debug_box, GEMINI_API_KEY)
-
-with tab_galaxy:
+elif active == "🌌 Library Galaxy":
     galaxy_tab.render(plex, debug_box)
+elif active == "🔴 Live Playlists":
+    live_tab.render(plex, PLEX_URL, PLEX_TOKEN, debug_box)

@@ -13,6 +13,7 @@ from clustering import (
     clear_all_caches,
 )
 from ui_components import render_track_row
+import live_playlists
 
 
 def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
@@ -614,20 +615,62 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
                 st.success(f"✅ Already saved as Plex playlist **'{already_saved_name}'** — saving again below will update/re-create it.")
 
             save_name = st.text_input(
-                "Playlist name:", value=already_saved_name or f"[Mix] {cluster_name}",
+                "Playlist name:", value=already_saved_name or cluster_name,
                 key=f"cluster_playlist_name_{cluster_name}"
             )
-            if st.button(f"💾 Save '{cluster_name}' as Plex Playlist", key=f"save_cluster_{cluster_name}"):
-                try:
-                    plex.createPlaylist(title=save_name, items=tracks)
-                    st.success(f"Created playlist '{save_name}' with {len(tracks)} tracks.")
-                    # Remember this cluster's saved-playlist name and persist it
-                    # to disk (alongside the tracks/mapping) so the "already
-                    # saved" status above survives a reload/restart instead of
-                    # only living in this session's memory.
-                    st.session_state['cluster_saved_playlists'][cluster_name] = save_name
-                    save_cluster_results_cache(
-                        cluster_results, merged_tag_mapping, st.session_state['cluster_saved_playlists']
-                    )
-                except Exception as e:
-                    st.error(f"Failed to create playlist: {e}")
+
+            make_live = st.checkbox(
+                "🎧 Keep this updated automatically (Live Mix)",
+                key=f"cluster_make_live_{cluster_name}",
+                help="Rebuilds daily — part seeded from this cluster's artists, part sonic-similarity "
+                     "expansion — using a '[Mix]' prefix on the name.",
+            )
+
+            if make_live:
+                live_target_size = st.number_input(
+                    "Target size", min_value=5, max_value=200, value=len(tracks) or 30,
+                    key=f"live_target_{cluster_name}"
+                )
+                live_cluster_pct = st.slider(
+                    "Cluster-seeded %", min_value=10, max_value=100, value=67,
+                    key=f"live_pct_{cluster_name}"
+                )
+                live_sonic_seeds = st.number_input(
+                    "Sonic expansion seed songs", min_value=1, max_value=30, value=10,
+                    key=f"live_seeds_{cluster_name}"
+                )
+                live_rotation_pct = st.slider(
+                    "Daily rotation %", min_value=5, max_value=100, value=85, step=5,
+                    key=f"live_rot_{cluster_name}"
+                )
+
+            if st.button("💾 Save", key=f"save_cluster_{cluster_name}", use_container_width=True):
+                if make_live:
+                    live_name = f"[Mix] {cluster_name}"
+                    try:
+                        # Shared with live_tab.py's cluster-save cards — one
+                        # code path for "save a cluster as a Live Mix" no
+                        # matter which tab it's triggered from.
+                        live_playlists.save_cluster_as_live_mix(
+                            plex, plex_url, plex_token, cluster_name, live_name,
+                            target_size=live_target_size, rotation_percent=live_rotation_pct,
+                            cluster_ratio=live_cluster_pct / 100, sonic_seed_count=live_sonic_seeds,
+                            debug=debug_box,
+                        )
+                        st.success(f"'{live_name}' saved and subscribed — it'll refresh automatically every day and now shows up in 🔴 Live Playlists.")
+                    except Exception as e:
+                        st.error(f"Failed to set up live mix: {e}")
+                else:
+                    try:
+                        plex.createPlaylist(title=save_name, items=tracks)
+                        st.success(f"Created playlist '{save_name}' with {len(tracks)} tracks.")
+                        # Remember this cluster's saved-playlist name and persist it
+                        # to disk (alongside the tracks/mapping) so the "already
+                        # saved" status above survives a reload/restart instead of
+                        # only living in this session's memory.
+                        st.session_state['cluster_saved_playlists'][cluster_name] = save_name
+                        save_cluster_results_cache(
+                            cluster_results, merged_tag_mapping, st.session_state['cluster_saved_playlists']
+                        )
+                    except Exception as e:
+                        st.error(f"Failed to create playlist: {e}")

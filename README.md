@@ -22,8 +22,15 @@ organize music across three tools:
   library into one of them, with optional sonic-similarity correction for
   leftover/mistagged tracks afterward. Each cluster shows its most-played
   tracks and can be saved as a playlist.
+- **🔴 Live Playlists** — subscribe an Artist Mix or a Library Cluster to a
+  daily 4am refresh (configurable) so the playlist stays current without
+  manual rebuilding. Artist Mixes simply re-run with the same settings each
+  day. Cluster Mixes rotate a percentage of their least-played tracks for
+  new picks from the same artist set each day, keeping the vibe intact
+  while the specific songs change. Runs in the background regardless of
+  whether the app is open in a browser.
 
-All three tabs share a mobile-friendly UI with in-browser play/pause preview
+All four tabs share a mobile-friendly UI with in-browser play/pause preview
 streamed directly from Plex.
 
 ## Features
@@ -47,6 +54,10 @@ streamed directly from Plex.
   disk, keyed per artist, so re-running "Build Clusters" against an
   unchanged library re-analyzes nothing — only new or changed artists cost
   a fresh Plex sonic-similarity lookup.
+- Live Playlists: subscribe any Artist Mix or saved Cluster to a daily
+  automatic refresh, independent of the browser being open. Enable/disable,
+  remove, or manually trigger any subscription from the Live Playlists tab
+  at any time.
 - In-browser play/pause preview streamed directly from Plex.
 - One-tap "add to playlist" per suggestion; save any mix or cluster as a new
   Plex playlist.
@@ -68,10 +79,12 @@ plex-playlist-enhancer/
 ├── recommendations.py        # Playlist Enhancer's recommendation engine
 ├── artist_mix.py              # Artist Mix builder
 ├── clustering.py              # Library Clusters: tag mapping, sonic profiles, hybrid/Louvain clustering
+├── live_playlists.py          # Live Playlists: subscription storage, rotation logic, daily scheduler
 ├── tabs/
 │   ├── enhance_tab.py         # 🎧 Playlist Enhancer UI
 │   ├── mix_tab.py             # 🎨 Artist Mix UI
-│   └── clusters_tab.py        # 🗂️ Library Clusters UI
+│   ├── clusters_tab.py        # 🗂️ Library Clusters UI
+│   └── live_tab.py            # 🔴 Live Playlists UI
 ├── requirements.txt
 └── Dockerfile
 ```
@@ -88,6 +101,8 @@ plex-playlist-enhancer/
 - `networkx` and `python-louvain` (both in `requirements.txt`) power Library
   Clusters' Hybrid and Sonic clustering modes (Louvain community detection).
   Tags-only clustering doesn't need either.
+- `apscheduler` (in `requirements.txt`) runs Live Playlists' daily refresh
+  job in the background.
 - Python packages listed in `requirements.txt`
 
 ## Setup
@@ -143,10 +158,12 @@ your-repo/
     ├── recommendations.py
     ├── artist_mix.py
     ├── clustering.py
+    ├── live_playlists.py
     ├── tabs/
     │   ├── enhance_tab.py
     │   ├── mix_tab.py
-    │   └── clusters_tab.py
+    │   ├── clusters_tab.py
+    │   └── live_tab.py
     └── requirements.txt
 ```
 
@@ -165,10 +182,18 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - CLUSTER_CACHE_PATH=/app/data/cluster_mapping.json
       - ARTIST_PROFILE_CACHE_PATH=/app/data/artist_sonic_profiles.json
+      - LIVE_PLAYLISTS_PATH=/app/data/live_playlists.json
+      - LIVE_PLAYLISTS_HOUR=4
+      - LIVE_PLAYLISTS_MINUTE=0
     volumes:
       - ./data:/app/data
     restart: unless-stopped
 ```
+
+`PLEX_URL` and `PLEX_TOKEN` must be real values (not blank) for Live
+Playlists to work — its daily job runs with no browser session attached,
+so it authenticates via these environment variables directly rather than
+the sidebar fields.
 
 `PLEX_URL`/`PLEX_TOKEN`/`GEMINI_API_KEY` are left blank in the compose file
 itself and pulled from your environment (or a local `.env` file — see below)
@@ -187,7 +212,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py styles.py plex_helpers.py ui_components.py recommendations.py artist_mix.py clustering.py ./
+COPY app.py styles.py plex_helpers.py ui_components.py recommendations.py artist_mix.py clustering.py live_playlists.py ./
 COPY tabs/ ./tabs/
 
 EXPOSE 8502
@@ -222,12 +247,51 @@ The app will then be available at `http://<host>:8502`.
 | `GEMINI_API_KEY`      | Google Gemini API key, used only by Library Clusters  | *(none — optional)*       |
 | `CLUSTER_CACHE_PATH`  | Disk path for the cached tag → cluster mapping         | `/app/data/cluster_mapping.json` |
 | `ARTIST_PROFILE_CACHE_PATH` | Disk path for cached per-artist sonic profiles (Hybrid/Sonic-artist clustering) | `/app/data/artist_sonic_profiles.json` |
+| `LIVE_PLAYLISTS_PATH` | Disk path for Live Playlists subscriptions               | `/app/data/live_playlists.json` |
+| `LIVE_PLAYLISTS_HOUR` | Hour (0-23, server local time) the daily refresh runs    | `4` |
+| `LIVE_PLAYLISTS_MINUTE` | Minute the daily refresh runs                           | `0` |
 
 These are just defaults for the sidebar fields — you can always override them
-in the running app itself. The two cache paths are the exception: they're
-read once at process start (not sidebar-editable), and only matter if you
-want cluster/sonic-profile caching to survive container restarts — point
-them at a mounted volume in Docker (see below) for that.
+in the running app itself. The cache/subscription paths and the scheduled
+hour/minute are the exception: they're read once at process start (not
+sidebar-editable). The cache paths only matter if you want cluster/sonic-
+profile/live-playlist state to survive container restarts — point them at a
+mounted volume in Docker (see below) for that. `PLEX_URL`/`PLEX_TOKEN` are
+also read directly from the environment for Live Playlists' background job,
+regardless of what's typed into the sidebar in any given session.
+
+## Live Playlists
+
+Turns an Artist Mix or a saved Library Cluster into a playlist that refreshes
+itself automatically once a day, without opening the app.
+
+- **How scheduling works:** a background job (APScheduler) runs inside the
+  same process as the Streamlit app, so it keeps firing on schedule as long
+  as the container is up — a browser tab does not need to be open. It's
+  started once per container process and survives Streamlit's normal
+  page-rerun behavior.
+- **Artist Mixes:** re-run daily with the exact same settings (max total,
+  max from the artist, max related, max sonic) saved when you subscribed.
+  Different songs come out naturally, since the underlying builder already
+  shuffles its candidate pool each run.
+- **Cluster Mixes:** rather than re-running Gemini/Louvain daily (which
+  would let the vibe drift over time), the daily refresh keeps the exact
+  artist set already assigned to that cluster in your last saved build, and
+  pulls each of those artists' full catalogs as a rotation pool. Each run
+  swaps out a configurable percentage (`Daily rotation %`) of the *least-
+  played* tracks currently in the playlist for new picks from that same
+  pool — so the artist lineup and overall feel stay identical while the
+  specific songs cycle. A track that just got rotated out won't immediately
+  come back the next run (one-rotation cooldown).
+- **Managing subscriptions:** the Live Playlists tab lets you add, enable/
+  disable, manually trigger, or remove any subscription — and shows each
+  one's last run time, track count, and any error from the most recent
+  attempt.
+- **Requirements:** a Cluster Mix subscription needs at least one saved
+  build in Library Clusters first (Live Playlists reads from that same
+  disk cache — it doesn't rebuild clusters itself). Both subscription types
+  need real `PLEX_URL`/`PLEX_TOKEN` values set as container environment
+  variables, since the background job has no sidebar to read from.
 
 ## Notes
 

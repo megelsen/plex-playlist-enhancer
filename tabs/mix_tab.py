@@ -5,6 +5,7 @@ import streamlit as st
 
 from artist_mix import build_artist_mix
 from ui_components import render_track_row
+import live_playlists
 
 
 def render(plex, plex_url, plex_token, debug_box):
@@ -110,11 +111,39 @@ def render(plex, plex_url, plex_token, debug_box):
             render_track_row(track, idx, key_prefix="mix", mode="mix", plex_url=plex_url, plex_token=plex_token)
 
         st.write("---")
+        st.subheader("Save this mix")
         default_name = f"{selected_artist.title} Mix" if selected_artist else "Artist Mix"
-        playlist_name = st.text_input("New playlist name:", value=default_name, key="artist_mix_playlist_name")
-        if st.button("💾 Save Mix as New Plex Playlist"):
-            try:
-                plex.createPlaylist(title=playlist_name, items=mix_list)
-                st.success(f"Created playlist '{playlist_name}' with {len(mix_list)} tracks.")
-            except Exception as e:
-                st.error(f"Failed to create playlist: {e}")
+        playlist_name = st.text_input("Playlist name:", value=default_name, key="artist_mix_playlist_name")
+
+        make_live = st.checkbox(
+            "🎧 Keep this updated automatically (Live Mix)",
+            key="artist_mix_make_live",
+            help="Rebuilds every day with the same settings above, using a '[Mix]' prefix on the name.",
+        )
+        if make_live:
+            st.caption("Uses a '[Mix]' prefix and rebuilds daily with the mix settings above.")
+
+        if st.button("💾 Save", use_container_width=True):
+            if make_live:
+                if selected_artist is None:
+                    st.error("Select an artist first.")
+                else:
+                    live_name = playlist_name if playlist_name.startswith("[Mix] ") else f"[Mix] {playlist_name}"
+                    try:
+                        # Shared with clusters_tab.py / live_tab.py — one
+                        # code path for "save as Live Mix" everywhere.
+                        live_playlists.save_artist_mix_as_live(
+                            plex, plex_url, plex_token, selected_artist.title, live_name,
+                            max_total=int(max_total), max_artist=int(max_artist),
+                            max_related=int(max_related), max_sonic=int(max_sonic),
+                            debug=debug_box,
+                        )
+                        st.success(f"'{live_name}' saved and subscribed — it'll refresh automatically every day and now shows up in 🔴 Live Playlists.")
+                    except Exception as e:
+                        st.error(f"Failed to set up live mix: {e}")
+            else:
+                try:
+                    plex.createPlaylist(title=playlist_name, items=mix_list)
+                    st.success(f"Created playlist '{playlist_name}' with {len(mix_list)} tracks.")
+                except Exception as e:
+                    st.error(f"Failed to create playlist: {e}")
