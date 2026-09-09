@@ -124,6 +124,59 @@ def _render_unified_overview(plex_url, plex_token, debug_box):
                     lp.remove_subscription(sub["kind"], sub["id"])
                     st.rerun()
 
+            with st.expander("⚙️ Edit configuration"):
+                st.caption("Changes apply on the next run (scheduled or manual) — they don't rebuild the playlist immediately.")
+                if is_artist:
+                    e_max_total = st.number_input(
+                        "Max songs total", min_value=1, max_value=200,
+                        value=sub.get("max_total", 30), key=f"edit_total_{sub['id']}"
+                    )
+                    e_max_artist = st.number_input(
+                        "Max songs from the artist", min_value=0, max_value=100,
+                        value=sub.get("max_artist", 10), key=f"edit_artist_{sub['id']}"
+                    )
+                    e_max_related = st.number_input(
+                        "Max songs per related artist", min_value=0, max_value=20,
+                        value=sub.get("max_related", 2), key=f"edit_related_{sub['id']}"
+                    )
+                    e_max_sonic = st.number_input(
+                        "Max sonic matches per seed", min_value=0, max_value=20,
+                        value=sub.get("max_sonic", 2), key=f"edit_sonic_{sub['id']}"
+                    )
+                    if st.button("💾 Save changes", key=f"edit_save_{sub['id']}", use_container_width=True):
+                        lp.update_subscription_settings(
+                            sub["kind"], sub["id"],
+                            max_total=int(e_max_total), max_artist=int(e_max_artist),
+                            max_related=int(e_max_related), max_sonic=int(e_max_sonic),
+                        )
+                        st.success("Saved — will apply on the next run.")
+                        st.rerun()
+                else:
+                    e_target_size = st.number_input(
+                        "Target size", min_value=5, max_value=200,
+                        value=sub.get("target_size", 30), key=f"edit_target_{sub['id']}"
+                    )
+                    e_cluster_pct = st.slider(
+                        "Cluster-seeded %", min_value=10, max_value=100,
+                        value=round(sub.get("cluster_ratio", 0.67) * 100), key=f"edit_pct_{sub['id']}"
+                    )
+                    e_sonic_seeds = st.number_input(
+                        "Sonic expansion seed songs", min_value=1, max_value=30,
+                        value=sub.get("sonic_seed_count", 10), key=f"edit_seeds_{sub['id']}"
+                    )
+                    e_rotation_pct = st.slider(
+                        "Daily rotation %", min_value=5, max_value=100, step=5,
+                        value=sub.get("rotation_percent", 30), key=f"edit_rot_{sub['id']}"
+                    )
+                    if st.button("💾 Save changes", key=f"edit_save_{sub['id']}", use_container_width=True):
+                        lp.update_subscription_settings(
+                            sub["kind"], sub["id"],
+                            target_size=int(e_target_size), rotation_percent=int(e_rotation_pct),
+                            cluster_ratio=e_cluster_pct / 100, sonic_seed_count=int(e_sonic_seeds),
+                        )
+                        st.success("Saved — will apply on the next run.")
+                        st.rerun()
+
 
 def _render_cluster_save_section(plex, plex_url, plex_token, debug_box):
     cluster_names, existing_live_names = _get_available_clusters(plex, debug_box)

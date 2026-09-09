@@ -156,6 +156,24 @@ def set_subscription_enabled(kind, sub_id, enabled):
     _save_config(cfg)
 
 
+def update_subscription_settings(kind, sub_id, **fields):
+    """Edits one existing subscription's tunable settings in place (target
+    size, rotation %, cluster/sonic ratio for cluster mixes; max_total etc.
+    for artist mixes) without touching its id, current rotation-tracking
+    keys, or run history. Takes effect on the NEXT run (scheduled or
+    manual) — it doesn't retroactively rebuild the playlist. Only the keys
+    passed in `fields` are changed, so callers can pass just what they
+    edited."""
+    cfg = _load_config()
+    key = "artist_mixes" if kind == "artist_mix" else "cluster_mixes"
+    for s in cfg[key]:
+        if s["id"] == sub_id:
+            s.update(fields)
+            _save_config(cfg)
+            return True
+    return False  # subscription no longer exists
+
+
 # --- Playlist upsert -----------------------------------------------------
 
 def _upsert_playlist(plex, title, tracks):
