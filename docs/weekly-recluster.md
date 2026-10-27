@@ -427,19 +427,31 @@ The pool is every track of every album currently in the cluster.
 
 **DJ order** (`live_playlists.dj_order`):
 1. **Opener:** a random first song.
-2. **Next song:** the remaining song with the best transition score from
-   the current one:
+2. **Never the same artist twice in a row.** This is a hard rule with
+   lookahead: a song is only allowed next if it's by a different artist
+   **and** the songs left after it can still be ordered without doubling.
+   That's possible when no artist holds more than half of them, and the
+   artist just played holds at most half, rounded down.
+3. **Smoothest transition:** among the allowed songs, the next one has the
+   best transition score from the current song:
    - **Direct sonic match:** `1 + Plex match %/100` when one song is in the
      other's `sonicallySimilar` list (50 neighbours each).
    - **Same album:** 0.6.
    - **Otherwise, album-level similarity** from the cached album features:
      the sonic-neighbour weight, else tag overlap × 0.5.
-   - **Same artist as the previous song:** −0.5.
-3. **Ties:** broken at random.
+   - **Recent artist:** −0.4 if the artist played within the last 3 songs,
+     to spread artists further.
+4. **Ties:** broken at random.
 
-This is a greedy path: transitions are smoothest at the start, and the
-last few songs are whatever is left. It costs one `sonicallySimilar` call
-per song.
+- **When doubling is unavoidable:** only if one artist holds more than half
+  of the playlist (the per-artist cap normally prevents this). That artist
+  is then woven in as often as possible (D x D x … D D), which gives the
+  minimum possible number of doubles.
+- **Tested:** 400 random playlists with skewed artist mixes, where
+  same-artist songs are each other's strongest sonic match. Every feasible
+  one came out with 0 doubles, and every infeasible one at the minimum.
+- **Limits:** the smoothest transitions are at the start, and the last few
+  songs are whatever is left. It costs one `sonicallySimilar` call per song.
 
 **Live Mix daily refresh** (`run_cluster_mix_subscription`):
 

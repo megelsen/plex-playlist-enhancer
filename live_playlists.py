@@ -655,21 +655,52 @@ def _album_similarity(fa, fb, album_a, album_b):
     return max(sonic, 0.5 * jaccard)
 
 
+DJ_RECENT_ARTIST_WINDOW = 3     # songs back that count as "just heard this artist"
+DJ_RECENT_ARTIST_PENALTY = 0.4
+
+
+def _artist_of(track):
+    """Artist key used for spacing; a track without one counts as its own artist."""
+    artist = getattr(track, "grandparentRatingKey", None)
+    return artist if artist is not None else ("track", track.ratingKey)
+
+
+def _no_doubling_possible(counts, last_artist, n):
+    """Can n tracks with these per-artist counts be ordered with no artist
+    twice in a row, given the previous track was by last_artist? Yes iff no
+    artist has more than ceil(n/2) of them and last_artist (which can't go
+    first) has at most floor(n/2)."""
+    for artist, c in counts.items():
+        if c > (n + 1) // 2 or (artist == last_artist and c > n // 2):
+            return False
+    return True
+
+
 def dj_order(tracks, start=None, debug=None):
     """DJ-style running order: a random opener (or `start`), then always the
-    remaining track that sounds most like the one before it.
+    remaining track that sounds most like the one before it — never the same
+    artist twice in a row.
 
-    Transition score (higher = smoother), all 0..1-based:
+    Same-artist doubling is a hard rule, with lookahead: a track is only
+    eligible next if it's by a different artist than the previous one AND the
+    tracks left after it can still be ordered without doubling
+    (_no_doubling_possible), so the end of the playlist can't get stuck with
+    one artist. Doubling only happens if it's unavoidable from the start (one
+    artist holds more than half of the playlist — the per-artist cap normally
+    prevents that); then that artist is woven in as often as possible
+    (D x D x … D D), which gives the fewest doubles.
+
+    Among eligible tracks, transition score (higher = smoother):
       1 + Plex sonic match (match % / 100) if one track is in the other's
           sonicallySimilar list (DJ_NEIGHBOR_LIMIT neighbours each),
       else album-level similarity from the cached album features (sonic
           neighbour albums, else tag overlap × 0.5), 0.6 for the same album;
-      − 0.5 if it's the same artist as the previous track (avoids
-          back-to-back artists unless nothing else fits),
+      − DJ_RECENT_ARTIST_PENALTY if that artist played within the last
+          DJ_RECENT_ARTIST_WINDOW tracks (spreads artists out further),
       + a tiny random jitter so ties don't always resolve the same way.
     Costs one sonicallySimilar call per track."""
     tracks = list(tracks)
-    if len(tracks) < 3:
+    if len(tracks) < 2:
         return tracks
     keys = {t.ratingKey for t in tracks}
     direct = defaultdict(dict)
@@ -690,27 +721,64 @@ def dj_order(tracks, start=None, debug=None):
 
     feats = cr.load_album_features()["albums"]
 
-    def _score(a, b):
+    def _similarity(a, b):
         album_a, album_b = getattr(a, "parentRatingKey", None), getattr(b, "parentRatingKey", None)
         if b.ratingKey in direct[a.ratingKey]:
-            score = 1.0 + direct[a.ratingKey][b.ratingKey]
-        elif album_a is not None and album_a == album_b:
-            score = 0.6
-        else:
-            score = _album_similarity(feats.get(str(album_a)), feats.get(str(album_b)), str(album_a), str(album_b))
-        artist_a = getattr(a, "grandparentRatingKey", None)
-        if artist_a is not None and artist_a == getattr(b, "grandparentRatingKey", None):
-            score -= 0.5
-        return score + random.random() * 1e-3
+            return 1.0 + direct[a.ratingKey][b.ratingKey]
+        if album_a is not None and album_a == album_b:
+            return 0.6
+        return _album_similarity(feats.get(str(album_a)), feats.get(str(album_b)), str(album_a), str(album_b))
 
-    current = start if start is not None else random.choice(tracks)
+    counts = defaultdict(int)
+    for t in tracks:
+        counts[_artist_of(t)] += 1
+
+    def _eligible(candidates, last_artist):
+        """Candidates by a different artist that keep a no-doubling order possible."""
+        out = []
+        for t in candidates:
+            artist = _artist_of(t)
+            if artist == last_artist:
+                continue
+            counts[artist] -= 1
+            ok = _no_doubling_possible(counts, artist, len(candidates) - 1)
+            counts[artist] += 1
+            if ok:
+                out.append(t)
+        return out
+
+    def _most_left(candidates):
+        """When doubling can't be avoided: weave in the artist with the most
+        tracks left (D x D x … D D) — that gives the fewest doubles."""
+        top = max(counts[_artist_of(t)] for t in candidates)
+        return [t for t in candidates if counts[_artist_of(t)] == top]
+
+    if start is not None:
+        current = start
+    else:
+        current = random.choice(_eligible(tracks, None) or _most_left(tracks))
     ordered = [current]
     remaining = [t for t in tracks if t.ratingKey != current.ratingKey]
+    counts[_artist_of(current)] -= 1
+    forced = 0
     while remaining:
-        nxt = max(remaining, key=lambda t: _score(current, t))
+        last_artist = _artist_of(current)
+        recent = {_artist_of(t) for t in ordered[-DJ_RECENT_ARTIST_WINDOW:]}
+        other_artists = [t for t in remaining if _artist_of(t) != last_artist]
+        pool = (_eligible(remaining, last_artist)
+                or (_most_left(other_artists) if other_artists else remaining))
+        if _artist_of(pool[0]) == last_artist:
+            forced += 1
+        nxt = max(pool, key=lambda t: _similarity(current, t)
+                  - (DJ_RECENT_ARTIST_PENALTY if _artist_of(t) in recent else 0.0)
+                  + random.random() * 1e-3)
         ordered.append(nxt)
         remaining.remove(nxt)
+        counts[_artist_of(nxt)] -= 1
         current = nxt
+    if forced and debug:
+        debug.write(f"└ DJ order: {forced} same-artist transition(s) were unavoidable "
+                    "(one artist holds more than half of the playlist).")
     return ordered
 
 
