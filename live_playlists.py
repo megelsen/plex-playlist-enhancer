@@ -29,6 +29,17 @@ keeps firing regardless of whether a browser tab is open. It authenticates
 using the PLEX_URL / PLEX_TOKEN environment variables (NOT whatever is
 typed into the sidebar in any given browser session), since a 4am job has
 no session to read from.
+
+Cluster mixes follow the album-level cluster registry (cluster_registry.py)
+by stable `cluster_id` once one exists, so a weekly re-curation that
+renames, merges or splits a cluster doesn't break them. A mix whose
+cluster was dissolved (or merged into a cluster that already has its own
+mix) is marked `stale` — see apply_cluster_events — and its Plex playlist
+is deleted at the next weekly curation (delete_stale_subscriptions), only
+ever by the playlist ratingKey this module created it under.
+
+Both jobs (daily refresh, weekly curation) run on SCHEDULER_TZ
+(default Europe/Paris) wall-clock time.
 """
 
 import json
@@ -42,10 +53,12 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger("live_playlists")
 
+from plexapi.exceptions import NotFound
 from plexapi.server import PlexServer
 
+import cluster_registry as cr
 from artist_mix import build_artist_mix
-from clustering import build_artist_cluster_map, load_cluster_results_cache
+from clustering import CLUSTER_RESULTS_CACHE_PATH, build_artist_cluster_map, load_cluster_results_cache
 
 LIVE_PLAYLISTS_PATH = os.environ.get("LIVE_PLAYLISTS_PATH", "/app/data/live_playlists.json")
 
@@ -53,6 +66,30 @@ LIVE_PLAYLISTS_PATH = os.environ.get("LIVE_PLAYLISTS_PATH", "/app/data/live_play
 # so this doesn't need a code change if you want a different hour later.
 LIVE_PLAYLISTS_HOUR = int(os.environ.get("LIVE_PLAYLISTS_HOUR", 4))
 LIVE_PLAYLISTS_MINUTE = int(os.environ.get("LIVE_PLAYLISTS_MINUTE", 0))
+
+# Weekly cluster curation (curation.py). Same timezone as the daily job, and
+# deliberately an hour earlier so the 4am refresh already uses new clusters.
+SCHEDULER_TZ = os.environ.get("SCHEDULER_TZ", "Europe/Paris")
+CURATION_DAY_OF_WEEK = os.environ.get("CURATION_DAY_OF_WEEK", "mon")
+CURATION_HOUR = int(os.environ.get("CURATION_HOUR", 3))
+CURATION_MINUTE = int(os.environ.get("CURATION_MINUTE", 0))
+CURATION_CATCH_UP_DAYS = 8
+
+# Fields a run_*_subscription call may change on `sub`, persisted by the runners.
+_RUN_STATE_FIELDS = (
+    "cluster_id", "cluster_name", "playlist_name", "playlist_rating_key",
+    "current_cluster_keys", "recent_retired_cluster_keys",
+    "current_sonic_keys", "recent_retired_sonic_keys",
+    "track_view_counts", "fit_stats", "baseline_album_keys", "drift",
+)
+
+
+class PlaylistDeletedError(Exception):
+    """The playlist this subscription created no longer exists in Plex."""
+
+
+class StaleMixError(Exception):
+    """The subscription's cluster no longer exists; it awaits weekly cleanup."""
 
 _scheduler = None
 _scheduler_lock = threading.Lock()
@@ -118,10 +155,11 @@ def add_artist_mix_subscription(artist_name, playlist_name, max_total=30, max_ar
 
 
 def add_cluster_mix_subscription(cluster_name, playlist_name, target_size=30, rotation_percent=85,
-                                  cluster_ratio=0.67, sonic_seed_count=10):
+                                  cluster_ratio=0.67, sonic_seed_count=10, cluster_id=None):
     cfg = _load_config()
     cfg["cluster_mixes"].append({
         "id": _new_id(),
+        "cluster_id": cluster_id,
         "cluster_name": cluster_name,
         "playlist_name": playlist_name,
         "target_size": int(target_size),
@@ -132,6 +170,10 @@ def add_cluster_mix_subscription(cluster_name, playlist_name, target_size=30, ro
         "recent_retired_cluster_keys": [],
         "current_sonic_keys": [],
         "recent_retired_sonic_keys": [],
+        "playlist_rating_key": None,
+        "track_view_counts": {},
+        "fit_stats": {},
+        "stale": None,
         "enabled": True,
         "last_run": None,
         "last_track_count": None,
@@ -153,6 +195,10 @@ def set_subscription_enabled(kind, sub_id, enabled):
     for s in cfg[key]:
         if s["id"] == sub_id:
             s["enabled"] = enabled
+            # Switched back on after its playlist was deleted in Plex:
+            # forget the old ratingKey so the next run creates a fresh one.
+            if enabled and s.pop("playlist_missing", False):
+                s["playlist_rating_key"] = None
     _save_config(cfg)
 
 
@@ -176,15 +222,36 @@ def update_subscription_settings(kind, sub_id, **fields):
 
 # --- Playlist upsert -----------------------------------------------------
 
-def _upsert_playlist(plex, title, tracks):
+def _rename_playlist(playlist, title):
+    try:
+        playlist.editTitle(title)
+    except Exception:
+        logger.exception(f"Couldn't rename playlist '{playlist.title}' to '{title}'")
+
+
+def _upsert_playlist(plex, title, tracks, rating_key=None):
+    """Replaces the playlist's contents (creating it if needed) and returns
+    the playlist. With `rating_key`, the playlist is addressed by the key it
+    was created under (and renamed if `title` changed); raises
+    PlaylistDeletedError if that playlist no longer exists. Without one,
+    falls back to the legacy match by title."""
     if not tracks:
-        return
-    existing = next((p for p in plex.playlists() if p.title == title), None)
+        return None
+    existing = None
+    if rating_key:
+        try:
+            existing = plex.fetchItem(int(rating_key))
+        except NotFound:
+            raise PlaylistDeletedError(title)
+    else:
+        existing = next((p for p in plex.playlists() if p.title == title), None)
     if existing:
+        if existing.title != title:
+            _rename_playlist(existing, title)
         existing.removeItems(existing.items())
         existing.addItems(tracks)
-    else:
-        plex.createPlaylist(title=title, items=tracks)
+        return existing
+    return plex.createPlaylist(title=title, items=tracks)
 
 
 # Public alias — used by mix_tab.py / clusters_tab.py to instantly save a
@@ -223,13 +290,15 @@ def save_artist_mix_as_live(plex, plex_url, plex_token, artist_name, playlist_na
 
 def save_cluster_as_live_mix(plex, plex_url, plex_token, cluster_name, playlist_name,
                               target_size=30, rotation_percent=85, cluster_ratio=0.67,
-                              sonic_seed_count=10, debug=None):
+                              sonic_seed_count=10, cluster_id=None, debug=None):
     """Registers a new cluster-mix subscription and runs it once immediately.
-    Returns (playlist_name, track_count)."""
+    `cluster_id` (a registry cluster) is optional — without it the cluster
+    is resolved by name on each run. Returns (playlist_name, track_count)."""
     add_cluster_mix_subscription(
         cluster_name, playlist_name,
         target_size=target_size, rotation_percent=rotation_percent,
         cluster_ratio=cluster_ratio, sonic_seed_count=sonic_seed_count,
+        cluster_id=cluster_id,
     )
     new_sub = next(
         (s for s in list_cluster_mix_subscriptions()
@@ -281,7 +350,9 @@ def run_artist_mix_subscription(sub, plex, debug=None):
     if not tracks:
         raise ValueError(f"build_artist_mix returned zero tracks for '{sub['artist_name']}'.")
 
-    _upsert_playlist(plex, sub["playlist_name"], tracks)
+    playlist = _upsert_playlist(plex, sub["playlist_name"], tracks, sub.get("playlist_rating_key"))
+    if playlist is not None:
+        sub["playlist_rating_key"] = playlist.ratingKey
     return len(tracks)
 
 
@@ -320,6 +391,76 @@ def _gather_cluster_pool(plex, cluster_name, debug=None):
     return pool
 
 
+def _registry_cluster_pool(plex, registry, cluster_id):
+    """Every track of every album the registry currently assigns to
+    `cluster_id`. Returns ({ratingKey: track}, [album keys])."""
+    album_keys = cr.cluster_album_keys(registry, cluster_id)
+    pool = {}
+    for ak in album_keys:
+        try:
+            for t in plex.fetchItem(int(ak)).tracks():
+                pool[t.ratingKey] = t
+        except Exception:
+            continue
+    if not pool:
+        raise ValueError(f"Resolved zero tracks for cluster '{registry['clusters'][cluster_id]['name']}'.")
+    return pool, album_keys
+
+
+def _resolve_cluster_pool(plex, sub, debug=None):
+    """Registry first (by cluster_id, else by name — persisting the id it
+    found), legacy Library Clusters build cache as a fallback for mixes
+    saved from a build that was never committed to the registry. Also keeps
+    the mix's cluster name / '[Mix] <name>' playlist name in sync with a
+    renamed cluster, and tracks drift vs. the album set at subscription."""
+    if sub.get("stale"):
+        raise StaleMixError(
+            f"Stale: {sub['stale'].get('reason')} — will be deleted at the next weekly curation."
+        )
+    registry = cr.load_registry()
+    if registry:
+        cid = sub.get("cluster_id") or cr.find_cluster_id_by_name(registry, sub["cluster_name"])
+        if cid and cid in registry["clusters"]:
+            sub["cluster_id"] = cid
+            _rename_sub(sub, registry["clusters"][cid]["name"])
+            pool, album_keys = _registry_cluster_pool(plex, registry, cid)
+            current = set(album_keys)
+            if not sub.get("baseline_album_keys"):
+                sub["baseline_album_keys"] = sorted(current)
+            baseline = set(sub["baseline_album_keys"])
+            union = baseline | current
+            sub["drift"] = round(1 - len(baseline & current) / len(union), 3) if union else 0.0
+            return pool
+        if sub.get("cluster_id"):
+            raise ValueError(
+                f"Cluster '{sub['cluster_name']}' no longer exists in the cluster registry — "
+                "it will be cleaned up at the next weekly curation."
+            )
+    return _gather_cluster_pool(plex, sub["cluster_name"], debug=debug)
+
+
+def _update_fit_stats(sub, core_pool):
+    """Per-album "did this mix's picks get played" counters, used by
+    curation as a weak cluster-fit signal. For each cluster-seeded track
+    that was in the playlist since the last run: exposures += 1 for its
+    album, plays += the track's viewCount increase (Plex only counts a play
+    at ~90% completion, so skipped tracks add nothing)."""
+    fit = sub.get("fit_stats") or {}
+    prev_counts = sub.get("track_view_counts") or {}
+    for rk in sub.get("current_cluster_keys") or []:
+        track = core_pool.get(rk)
+        if track is None or str(rk) not in prev_counts:
+            continue
+        album = str(getattr(track, "parentRatingKey", "") or "")
+        if not album:
+            continue
+        delta = (getattr(track, "viewCount", 0) or 0) - prev_counts[str(rk)]
+        entry = fit.setdefault(album, {"exposures": 0, "plays": 0})
+        entry["exposures"] += 1
+        entry["plays"] += max(0, delta)
+    sub["fit_stats"] = fit
+
+
 def run_cluster_mix_subscription(sub, plex, debug=None):
     """
     Builds the cluster mix from two rotating parts and upserts the target
@@ -332,7 +473,8 @@ def run_cluster_mix_subscription(sub, plex, debug=None):
     Each part rotates independently via _rotate_pool. Mutates sub in place
     with the new state — caller is responsible for persisting cfg.
     """
-    core_pool = _gather_cluster_pool(plex, sub["cluster_name"], debug=debug)
+    core_pool = _resolve_cluster_pool(plex, sub, debug=debug)
+    _update_fit_stats(sub, core_pool)
 
     target_size = sub.get("target_size", 30)
     rotation_percent = sub.get("rotation_percent", 30)
@@ -385,7 +527,10 @@ def run_cluster_mix_subscription(sub, plex, debug=None):
             seen.add(t.ratingKey)
 
     random.shuffle(final_tracks)
-    _upsert_playlist(plex, sub["playlist_name"], final_tracks)
+    playlist = _upsert_playlist(plex, sub["playlist_name"], final_tracks, sub.get("playlist_rating_key"))
+    if playlist is not None:
+        sub["playlist_rating_key"] = playlist.ratingKey
+    sub["track_view_counts"] = {str(t.ratingKey): getattr(t, "viewCount", 0) or 0 for t in cluster_tracks}
 
     sub["current_cluster_keys"] = [t.ratingKey for t in cluster_tracks]
     sub["recent_retired_cluster_keys"] = [t.ratingKey for t in cluster_removed]
@@ -488,7 +633,6 @@ def run_all_subscriptions(plex_url=None, plex_token=None, debug=None, only=None)
 
     plex = PlexServer(plex_url, plex_token)
     cfg = _load_config()
-    now_snapshot = datetime.now().isoformat(timespec="seconds")
     summary = {"artist_mixes": [], "cluster_mixes": []}
 
     run_artist = only is None or only == "artist_mixes"
@@ -498,39 +642,47 @@ def run_all_subscriptions(plex_url=None, plex_token=None, debug=None, only=None)
         for sub in list(cfg["artist_mixes"]):
             if not sub.get("enabled", True):
                 continue
-            now = datetime.now().isoformat(timespec="seconds")
-            try:
-                count = run_artist_mix_subscription(sub, plex, debug=debug)
-                _update_sub_fields("artist_mix", sub["id"], {
-                    "last_run": now, "last_track_count": count, "last_error": None,
-                })
-                summary["artist_mixes"].append((sub["artist_name"], count, None))
-            except Exception as e:
-                logger.exception(f"Artist mix subscription failed: {sub['artist_name']}")
-                _update_sub_fields("artist_mix", sub["id"], {"last_run": now, "last_error": str(e)})
-                summary["artist_mixes"].append((sub["artist_name"], None, str(e)))
+            count, err = _run_and_record("artist_mix", sub, plex, debug=debug)
+            summary["artist_mixes"].append((sub["artist_name"], count, err))
 
     if run_cluster:
         for sub in list(cfg["cluster_mixes"]):
-            if not sub.get("enabled", True):
+            if not sub.get("enabled", True) or sub.get("stale"):
                 continue
-            now = datetime.now().isoformat(timespec="seconds")
-            try:
-                count = run_cluster_mix_subscription(sub, plex, debug=debug)
-                _update_sub_fields("cluster_mix", sub["id"], {
-                    "last_run": now, "last_track_count": count, "last_error": None,
-                    "current_cluster_keys": sub.get("current_cluster_keys", []),
-                    "recent_retired_cluster_keys": sub.get("recent_retired_cluster_keys", []),
-                    "current_sonic_keys": sub.get("current_sonic_keys", []),
-                    "recent_retired_sonic_keys": sub.get("recent_retired_sonic_keys", []),
-                })
-                summary["cluster_mixes"].append((sub["cluster_name"], count, None))
-            except Exception as e:
-                logger.exception(f"Cluster mix subscription failed: {sub['cluster_name']}")
-                _update_sub_fields("cluster_mix", sub["id"], {"last_run": now, "last_error": str(e)})
-                summary["cluster_mixes"].append((sub["cluster_name"], None, str(e)))
+            count, err = _run_and_record("cluster_mix", sub, plex, debug=debug)
+            summary["cluster_mixes"].append((sub["cluster_name"], count, err))
 
     return summary
+
+
+def _run_and_record(kind, sub, plex, debug=None):
+    """Runs one subscription and persists its outcome (via
+    _update_sub_fields, so concurrent UI edits aren't clobbered). Returns
+    (track_count, error_message)."""
+    now = datetime.now().isoformat(timespec="seconds")
+    label = sub["artist_name"] if kind == "artist_mix" else sub["cluster_name"]
+    try:
+        if kind == "artist_mix":
+            count = run_artist_mix_subscription(sub, plex, debug=debug)
+        else:
+            count = run_cluster_mix_subscription(sub, plex, debug=debug)
+    except PlaylistDeletedError:
+        # Deleting the playlist in Plex is taken as the user's intent: stop
+        # instead of silently recreating it.
+        msg = ("Playlist was deleted in Plex — subscription switched off. Switch it back on to "
+               "recreate the playlist, or remove the subscription.")
+        _update_sub_fields(kind, sub["id"], {"last_run": now, "last_error": msg,
+                                             "enabled": False, "playlist_missing": True})
+        return None, msg
+    except Exception as e:
+        logger.exception(f"Live playlist subscription failed: {label}")
+        _update_sub_fields(kind, sub["id"], {"last_run": now, "last_error": str(e)})
+        return None, str(e)
+
+    updates = {"last_run": now, "last_track_count": count, "last_error": None}
+    updates.update({k: sub[k] for k in _RUN_STATE_FIELDS if k in sub})
+    _update_sub_fields(kind, sub["id"], updates)
+    return count, None
 
 
 def run_single_subscription(kind, sub_id, plex_url=None, plex_token=None, debug=None):
@@ -545,25 +697,167 @@ def run_single_subscription(kind, sub_id, plex_url=None, plex_token=None, debug=
     if sub is None:
         raise ValueError("Subscription not found (may have been removed).")
 
-    now = datetime.now().isoformat(timespec="seconds")
-    try:
-        if kind == "artist_mix":
-            count = run_artist_mix_subscription(sub, plex, debug=debug)
-            _update_sub_fields(kind, sub_id, {"last_run": now, "last_track_count": count, "last_error": None})
-        else:
-            count = run_cluster_mix_subscription(sub, plex, debug=debug)
-            _update_sub_fields(kind, sub_id, {
-                "last_run": now, "last_track_count": count, "last_error": None,
-                "current_cluster_keys": sub.get("current_cluster_keys", []),
-                "recent_retired_cluster_keys": sub.get("recent_retired_cluster_keys", []),
-                "current_sonic_keys": sub.get("current_sonic_keys", []),
-                "recent_retired_sonic_keys": sub.get("recent_retired_sonic_keys", []),
-            })
-    except Exception as e:
-        _update_sub_fields(kind, sub_id, {"last_run": now, "last_error": str(e)})
-        raise
-
+    count, err = _run_and_record(kind, sub, plex, debug=debug)
+    if err:
+        raise RuntimeError(err)
     return count
+
+
+# --- Cluster registry reconciliation ---------------------------------------
+
+def _rename_sub(sub, new_cluster_name):
+    """Follows a cluster rename. The playlist is renamed too, but only if it
+    still uses the default '[Mix] <cluster>' name (custom names are kept);
+    the Plex rename itself happens on the next run via its ratingKey."""
+    old = sub.get("cluster_name")
+    if not new_cluster_name or old == new_cluster_name:
+        return
+    sub["cluster_name"] = new_cluster_name
+    if sub.get("playlist_name") == f"[Mix] {old}":
+        sub["playlist_name"] = f"[Mix] {new_cluster_name}"
+
+
+def _mark_stale(sub, reason, generation):
+    if not sub.get("stale"):
+        sub["stale"] = {"reason": reason, "generation": generation,
+                        "marked_at": datetime.now().isoformat(timespec="seconds")}
+
+
+def apply_cluster_events(events, registry):
+    """Brings cluster-mix subscriptions in line with a newly committed
+    registry generation. Per subscription:
+      - continued / renamed / split (kept its id) -> keeps running, renamed if needed
+      - merged into a cluster with no mix yet     -> re-pointed to the survivor
+      - merged into a cluster that has a mix      -> stale (duplicate)
+      - retired (dissolved)                       -> stale
+      - id no longer in the registry              -> stale (orphaned)
+    Legacy subscriptions without a cluster_id are matched by name first.
+    Stale playlists are NOT deleted here — that happens at the weekly
+    curation (delete_stale_subscriptions). Returns the number of subs marked stale."""
+    cfg = _load_config()
+    clusters = registry["clusters"]
+    gen = registry.get("generation")
+    subs = cfg["cluster_mixes"]
+    newly_stale = 0
+
+    for s in subs:
+        if not s.get("cluster_id"):
+            cid = cr.find_cluster_id_by_name(registry, s.get("cluster_name"))
+            if cid:
+                s["cluster_id"] = cid
+
+    def _active_on(cid):
+        return [s for s in subs if s.get("cluster_id") == cid and not s.get("stale")]
+
+    for ev in events:
+        affected = _active_on(ev["cluster_id"])
+        if ev["type"] == "retired":
+            for s in affected:
+                _mark_stale(s, f"cluster '{ev.get('name')}' was dissolved ({ev.get('albums', 0)} albums left)", gen)
+                newly_stale += 1
+        elif ev["type"] == "merged":
+            for s in affected:
+                if _active_on(ev["into"]):
+                    _mark_stale(s, f"cluster '{ev.get('name')}' was merged into '{ev.get('into_name')}', "
+                                   "which already has its own Live Mix", gen)
+                    newly_stale += 1
+                else:
+                    s["cluster_id"] = ev["into"]
+                    s["baseline_album_keys"] = []
+                    _rename_sub(s, clusters[ev["into"]]["name"])
+
+    for s in subs:
+        cid = s.get("cluster_id")
+        if not cid or s.get("stale"):
+            continue
+        if cid in clusters:
+            _rename_sub(s, clusters[cid]["name"])
+        else:
+            _mark_stale(s, f"cluster '{s.get('cluster_name')}' no longer exists", gen)
+            newly_stale += 1
+
+    _save_config(cfg)
+    return newly_stale
+
+
+def delete_stale_subscriptions(plex):
+    """Weekly cleanup: deletes each stale mix's Plex playlist — only by the
+    ratingKey this module created it under, and only if that item really is
+    a playlist — then removes the subscription. A sub with no stored
+    ratingKey (created before ratingKeys were tracked and never run since)
+    is removed without touching Plex. On a transient Plex error the sub is
+    kept so the next run retries. Returns one record per removed sub
+    (including the playlist's track keys, so a rollback can recreate it)."""
+    cfg = _load_config()
+    removed = []
+    keep = []
+    for s in cfg["cluster_mixes"]:
+        if not s.get("stale"):
+            keep.append(s)
+            continue
+        record = {"sub": dict(s), "track_keys": [], "playlist_deleted": False, "note": None}
+        rk = s.get("playlist_rating_key")
+        if rk:
+            try:
+                playlist = plex.fetchItem(int(rk))
+                if getattr(playlist, "TYPE", None) != "playlist":
+                    record["note"] = f"ratingKey {rk} is not a playlist — left untouched"
+                else:
+                    record["track_keys"] = [t.ratingKey for t in playlist.items()]
+                    playlist.delete()
+                    record["playlist_deleted"] = True
+            except NotFound:
+                record["note"] = "playlist was already gone from Plex"
+            except Exception as e:
+                logger.exception(f"Couldn't delete stale playlist '{s.get('playlist_name')}'")
+                record["note"] = f"delete failed ({e}) — will retry next week"
+                keep.append(s)
+                continue
+        else:
+            record["note"] = "no stored playlist ratingKey — Plex playlist left untouched"
+        removed.append(record)
+    cfg["cluster_mixes"] = keep
+    _save_config(cfg)
+    return removed
+
+
+def restore_deleted_subscription(plex, record):
+    """Undo for delete_stale_subscriptions (used by curation rollback):
+    recreates the playlist from its saved track keys and re-adds the sub."""
+    sub = dict(record["sub"])
+    sub["stale"] = None
+    sub["baseline_album_keys"] = []
+    tracks = []
+    for key in record.get("track_keys") or []:
+        try:
+            tracks.append(plex.fetchItem(int(key)))
+        except Exception:
+            continue
+    sub["playlist_rating_key"] = None
+    if tracks:
+        playlist = plex.createPlaylist(title=sub["playlist_name"], items=tracks)
+        sub["playlist_rating_key"] = playlist.ratingKey
+    cfg = _load_config()
+    if not any(s["id"] == sub["id"] for s in cfg["cluster_mixes"]):
+        cfg["cluster_mixes"].append(sub)
+        _save_config(cfg)
+
+
+def collect_mix_fit_penalties(min_exposures, penalty):
+    """{(album_key, cluster_id): penalty} for albums whose tracks sat in a
+    cluster's Live Mix for >= min_exposures rotations without a single play
+    — but only for mixes you did play from (otherwise "unplayed" says
+    nothing about fit)."""
+    out = {}
+    for s in _load_config()["cluster_mixes"]:
+        cid = s.get("cluster_id")
+        fit = s.get("fit_stats") or {}
+        if not cid or s.get("stale") or not any(v.get("plays") for v in fit.values()):
+            continue
+        for album, v in fit.items():
+            if v.get("exposures", 0) >= min_exposures and not v.get("plays"):
+                out[(album, cid)] = penalty
+    return out
 
 
 # --- Scheduler singleton ---------------------------------------------
@@ -576,13 +870,50 @@ def _job_wrapper():
     identical to "the job just didn't fire"). Also stamps a last-attempt
     timestamp file independent of individual subscription state, so
     get_last_scheduled_attempt() can tell "the job fired but everything
-    failed" apart from "the job never fired at all"."""
+    failed" apart from "the job never fired at all".
+
+    Holds cluster_registry.JOB_LOCK so it never overlaps the weekly
+    curation (or a UI-triggered registry job); first assigns any albums
+    added since yesterday so they're in today's mixes."""
     try:
-        run_all_subscriptions()
+        with cr.JOB_LOCK:
+            try:
+                if cr.load_registry():
+                    plex = PlexServer(os.environ.get("PLEX_URL"), os.environ.get("PLEX_TOKEN"))
+                    logger.info(f"New-album sync: {cr.sync_new_albums(plex)}")
+            except Exception:
+                logger.exception("New-album sync failed (live playlists still refresh)")
+            run_all_subscriptions()
     except Exception:
         logger.exception("Scheduled live-playlist run failed")
     finally:
         _record_scheduler_heartbeat()
+
+
+def _curation_job_wrapper():
+    import curation  # lazy: curation imports this module
+    try:
+        with cr.JOB_LOCK:
+            curation.run_weekly_curation(trigger="schedule")
+    except Exception:
+        logger.exception("Scheduled weekly cluster curation failed")
+    finally:
+        curation.record_heartbeat()
+
+
+def _curation_due():
+    import curation
+    last = curation.get_last_heartbeat()
+    if last is not None and (datetime.now() - last) <= timedelta(days=CURATION_CATCH_UP_DAYS):
+        return False
+    return cr.load_registry() is not None or os.path.exists(CLUSTER_RESULTS_CACHE_PATH)
+
+
+def _startup_catch_up(run_curation, run_daily):
+    if run_curation:
+        _curation_job_wrapper()
+    if run_daily:
+        _job_wrapper()
 
 
 def _record_scheduler_heartbeat():
@@ -628,7 +959,7 @@ def ensure_scheduler_started():
 
         from apscheduler.schedulers.background import BackgroundScheduler
 
-        scheduler = BackgroundScheduler()
+        scheduler = BackgroundScheduler(timezone=SCHEDULER_TZ)
         scheduler.add_job(
             _job_wrapper,
             trigger="cron",
@@ -641,21 +972,39 @@ def ensure_scheduler_started():
             # up to a 1 hour grace window.
             misfire_grace_time=3600,
         )
+        scheduler.add_job(
+            _curation_job_wrapper,
+            trigger="cron",
+            day_of_week=CURATION_DAY_OF_WEEK,
+            hour=CURATION_HOUR,
+            minute=CURATION_MINUTE,
+            id="cluster_curation_weekly",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
         scheduler.start()
         _scheduler = scheduler
 
         last_heartbeat = get_last_scheduler_heartbeat()
-        gap_too_large = (
+        daily_gap = (
             last_heartbeat is None
             or (datetime.now() - last_heartbeat) > timedelta(hours=25)
         )
-        if gap_too_large:
-            logger.info("Live playlists: no scheduled run in >25h, catching up now.")
-            threading.Thread(target=_job_wrapper, daemon=True).start()
+        curation_gap = _curation_due()
+        if daily_gap or curation_gap:
+            logger.info(f"Catch-up on startup: curation={curation_gap}, daily refresh={daily_gap}.")
+            threading.Thread(target=_startup_catch_up, args=(curation_gap, daily_gap), daemon=True).start()
 
 
 def get_next_run_time():
     if _scheduler is None:
         return None
     job = _scheduler.get_job("live_playlists_daily")
+    return job.next_run_time if job else None
+
+
+def get_next_curation_time():
+    if _scheduler is None:
+        return None
+    job = _scheduler.get_job("cluster_curation_weekly")
     return job.next_run_time if job else None

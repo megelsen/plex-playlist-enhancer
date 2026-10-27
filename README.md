@@ -21,14 +21,20 @@ organize music across three tools:
   default) invents cluster names and sorts every genre/mood tag in your
   library into one of them, with optional sonic-similarity correction for
   leftover/mistagged tracks afterward. Each cluster shows its most-played
-  tracks and can be saved as a playlist.
+  tracks and can be saved as a playlist. Commit a build as **🧬 album
+  clusters** and every album in the library gets a cluster (or
+  `Unclustered`); new albums are assigned daily, and the clusters are
+  re-curated automatically every Monday at 03:00 (Paris time) — see
+  [docs/weekly-recluster.md](./docs/weekly-recluster.md).
 - **🔴 Live Playlists** — subscribe an Artist Mix or a Library Cluster to a
   daily 4am refresh (configurable) so the playlist stays current without
   manual rebuilding. Artist Mixes simply re-run with the same settings each
   day. Cluster Mixes rotate a percentage of their least-played tracks for
   new picks from the same artist set each day, keeping the vibe intact
   while the specific songs change. Runs in the background regardless of
-  whether the app is open in a browser.
+  whether the app is open in a browser. Cluster Mixes follow their album
+  cluster through renames/merges/splits; a mix whose cluster disappears is
+  marked stale and its playlist is deleted at the next weekly curation.
 
 All four tabs share a mobile-friendly UI with in-browser play/pause preview
 streamed directly from Plex.
@@ -79,11 +85,18 @@ plex-playlist-enhancer/
 ├── recommendations.py        # Playlist Enhancer's recommendation engine
 ├── artist_mix.py              # Artist Mix builder
 ├── clustering.py              # Library Clusters: tag mapping, sonic profiles, hybrid/Louvain clustering
-├── live_playlists.py          # Live Playlists: subscription storage, rotation logic, daily scheduler
+├── live_playlists.py          # Live Playlists: subscription storage, rotation logic, scheduler (daily + weekly)
+├── cluster_registry.py        # album-level cluster registry: features, affinity scoring, assignment, curation pass
+├── curation.py                # weekly curation job, guardrails, reports, commit-from-build, rollback
+├── galaxy.py                  # Library Galaxy similarity graph + figure
+├── docs/
+│   └── weekly-recluster.md    # reference: album clusters, weekly curation, stale Live Mixes
 ├── tabs/
 │   ├── enhance_tab.py         # 🎧 Playlist Enhancer UI
 │   ├── mix_tab.py             # 🎨 Artist Mix UI
 │   ├── clusters_tab.py        # 🗂️ Library Clusters UI
+│   ├── registry_panel.py      # 🧬 album clusters panel (inside Library Clusters)
+│   ├── galaxy_tab.py          # 🌌 Library Galaxy UI
 │   └── live_tab.py            # 🔴 Live Playlists UI
 ├── requirements.txt
 └── Dockerfile
@@ -158,7 +171,10 @@ your-repo/
     ├── recommendations.py
     ├── artist_mix.py
     ├── clustering.py
+    ├── galaxy.py
     ├── live_playlists.py
+    ├── cluster_registry.py
+    ├── curation.py
     ├── tabs/
     │   ├── enhance_tab.py
     │   ├── mix_tab.py
@@ -185,6 +201,12 @@ services:
       - LIVE_PLAYLISTS_PATH=/app/data/live_playlists.json
       - LIVE_PLAYLISTS_HOUR=4
       - LIVE_PLAYLISTS_MINUTE=0
+      - CLUSTER_REGISTRY_PATH=/app/data/cluster_registry.json
+      - ALBUM_FEATURES_PATH=/app/data/album_features.json
+      - CURATION_REPORTS_PATH=/app/data/curation_reports.json
+      - SCHEDULER_TZ=Europe/Paris
+      - CURATION_DAY_OF_WEEK=mon
+      - CURATION_HOUR=3
     volumes:
       - ./data:/app/data
     restart: unless-stopped
@@ -212,7 +234,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py styles.py plex_helpers.py ui_components.py recommendations.py artist_mix.py clustering.py live_playlists.py ./
+COPY app.py styles.py plex_helpers.py ui_components.py recommendations.py artist_mix.py clustering.py galaxy.py live_playlists.py cluster_registry.py curation.py ./
 COPY tabs/ ./tabs/
 
 EXPOSE 8502
@@ -248,8 +270,13 @@ The app will then be available at `http://<host>:8502`.
 | `CLUSTER_CACHE_PATH`  | Disk path for the cached tag → cluster mapping         | `/app/data/cluster_mapping.json` |
 | `ARTIST_PROFILE_CACHE_PATH` | Disk path for cached per-artist sonic profiles (Hybrid/Sonic-artist clustering) | `/app/data/artist_sonic_profiles.json` |
 | `LIVE_PLAYLISTS_PATH` | Disk path for Live Playlists subscriptions               | `/app/data/live_playlists.json` |
-| `LIVE_PLAYLISTS_HOUR` | Hour (0-23, server local time) the daily refresh runs    | `4` |
+| `LIVE_PLAYLISTS_HOUR` | Hour (0-23, in `SCHEDULER_TZ`) the daily refresh runs    | `4` |
 | `LIVE_PLAYLISTS_MINUTE` | Minute the daily refresh runs                           | `0` |
+| `SCHEDULER_TZ`        | Timezone for the daily refresh and the weekly curation   | `Europe/Paris` |
+| `CURATION_DAY_OF_WEEK` / `CURATION_HOUR` / `CURATION_MINUTE` | When the weekly cluster curation runs | `mon` / `3` / `0` |
+| `CLUSTER_REGISTRY_PATH` | Album cluster registry (+ `.snapshots/` for rollback)  | `/app/data/cluster_registry.json` |
+| `ALBUM_FEATURES_PATH` | Cached per-album tags + sonic neighbours                 | `/app/data/album_features.json` |
+| `CURATION_REPORTS_PATH` | Last 12 curation reports                               | `/app/data/curation_reports.json` |
 
 These are just defaults for the sidebar fields — you can always override them
 in the running app itself. The cache/subscription paths and the scheduled
@@ -292,6 +319,32 @@ itself automatically once a day, without opening the app.
   disk cache — it doesn't rebuild clusters itself). Both subscription types
   need real `PLEX_URL`/`PLEX_TOKEN` values set as container environment
   variables, since the background job has no sidebar to read from.
+
+## Album clusters & weekly curation
+
+Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
+
+- **Commit a build:** in Library Clusters, press **📌 Commit build as album
+  clusters**. Every album is scored against every cluster (sonic neighbours,
+  tags, artist). It joins a cluster only above a threshold. Albums that fit
+  nowhere try to form new clusters among themselves; the rest go to
+  `Unclustered`.
+- **Daily (04:00):** albums added since the last scan are assigned to a
+  fitting cluster before the Live Mixes refresh.
+- **Weekly (Monday 03:00, Paris):** the clusters are re-curated
+  automatically:
+  - albums move only when another cluster fits clearly better two weeks in
+    a row
+  - thin clusters retire, near-duplicates merge, mixed clusters split, and
+    new clusters form from `Unclustered`
+  - listening history weights clusters toward what you play, but never
+    decides what belongs together
+- **Guardrails:** a run is aborted if it would change too much at once.
+- **Stale Live Mixes** are deleted at the weekly run: mixes whose cluster
+  was dissolved, or merged into one that already has a mix. Deletion only
+  ever uses the playlist ratingKey the app created.
+- **Rollback:** every run is snapshotted and can be rolled back from the 🧬
+  panel, which also recreates deleted playlists.
 
 ## Notes
 

@@ -13,7 +13,10 @@ from clustering import (
     clear_all_caches,
 )
 from ui_components import render_track_row
+import cluster_registry
+import curation
 import live_playlists
+from tabs import registry_panel
 
 
 def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
@@ -68,13 +71,16 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
         st.error("No music library section found on this Plex server.")
         st.stop()
 
+    registry_panel.render(plex, plex_url, plex_token, gemini_api_key)
+
     with st.expander("🧹 Clean slate", expanded=False):
         st.caption(
             "Clears every cache this app keeps for Library Clusters \u2014 the tag\u2192cluster "
             "mapping, per-artist sonic profiles, the saved cluster build, and the in-process "
             "artist scan \u2014 so the next build starts completely from scratch with zero "
             "assumptions carried over from before. Doesn't touch anything already saved as a "
-            "Plex playlist."
+            "Plex playlist, and keeps the album cluster registry (🧬 above) — committing a new "
+            "build replaces that."
         )
         if st.button("🧹 Clear all caches and start fresh"):
             summary = clear_all_caches(debug=debug_box)
@@ -593,6 +599,25 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
     if st.session_state.get('cluster_results_cache_signature') != results_signature:
         save_cluster_results_cache(cluster_results, merged_tag_mapping, st.session_state['cluster_saved_playlists'])
         st.session_state['cluster_results_cache_signature'] = results_signature
+
+    # --- Commit to the album cluster registry. The build above is a
+    # one-off grouping + display sample; committing turns it into album-level
+    # clusters with stable IDs (every album scored, unfitting ones form new
+    # clusters or go to Unclustered) that Live Mixes and the weekly
+    # curation work from. Runs in the background — first commit analyses
+    # every album once.
+    registry_busy = cluster_registry.get_job_status()["running"]
+    if st.button("📌 Commit build as album clusters", use_container_width=True, disabled=registry_busy,
+                 help="Replaces the 🧬 album clusters with this build (merges included). Existing Live "
+                      "Mixes follow their cluster by album overlap; mixes whose cluster disappears are "
+                      "marked stale and deleted at the next weekly curation."):
+        started = cluster_registry.run_background_job(
+            "Commit build", curation.commit_build, plex, cluster_results,
+            locked_names=locked_clusters, api_key=gemini_api_key,
+        )
+        if not started:
+            st.warning("Another cluster job is already running.")
+        st.rerun()
 
     st.write("---")
 

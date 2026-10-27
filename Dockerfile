@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the full app package (entrypoint, modules, and tabs/ subfolder)
-COPY app.py styles.py plex_helpers.py ui_components.py recommendations.py artist_mix.py clustering.py galaxy.py live_playlists.py ./
+COPY app.py styles.py plex_helpers.py ui_components.py recommendations.py artist_mix.py clustering.py galaxy.py live_playlists.py cluster_registry.py curation.py ./
 COPY tabs/ ./tabs/
 
 # /app/data holds the disk-cached genre/mood -> cluster mapping (see

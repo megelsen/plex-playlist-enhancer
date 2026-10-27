@@ -15,6 +15,7 @@ same as a cluster mix does.
 
 import streamlit as st
 
+import cluster_registry as cr
 import live_playlists as lp
 from clustering import load_cluster_results_cache
 
@@ -26,10 +27,14 @@ def render(plex, plex_url, plex_token, debug_box):
     next_run_str = next_run.strftime("%Y-%m-%d %H:%M %Z") if next_run else "not started yet"
     last_heartbeat = lp.get_last_scheduler_heartbeat()
     heartbeat_str = last_heartbeat.strftime("%Y-%m-%d %H:%M") if last_heartbeat else "never"
+    next_cur = lp.get_next_curation_time()
+    next_cur_str = next_cur.strftime("%a %Y-%m-%d %H:%M %Z") if next_cur else "not started yet"
     st.caption(
         f"Live Mixes refresh automatically once a day (scheduled for "
-        f"{lp.LIVE_PLAYLISTS_HOUR:02d}:{lp.LIVE_PLAYLISTS_MINUTE:02d} server time — "
-        f"next run: {next_run_str}, last scheduled run: {heartbeat_str}). To create a new "
+        f"{lp.LIVE_PLAYLISTS_HOUR:02d}:{lp.LIVE_PLAYLISTS_MINUTE:02d} {lp.SCHEDULER_TZ} — "
+        f"next run: {next_run_str}, last scheduled run: {heartbeat_str}). Clusters are re-curated "
+        f"weekly (next: {next_cur_str}); Cluster Mixes follow their cluster, and mixes whose "
+        f"cluster disappeared are deleted at that run. To create a new "
         f"Live Artist Mix, build one in 🎨 Artist Mix and check 'Keep this updated "
         f"automatically'. To create a new Live Cluster Mix, use the section below."
     )
@@ -88,6 +93,11 @@ def _render_unified_overview(plex_url, plex_token, debug_box):
 
         with st.container(border=True):
             st.write(f"{source_icon} **{source_label}** → *{sub['playlist_name']}*")
+            if sub.get("stale"):
+                st.warning(
+                    f"🕸️ Stale — {sub['stale'].get('reason')}. No longer refreshed; its playlist is "
+                    f"deleted at the next weekly curation."
+                )
             status_bits = []
             if not is_artist:
                 status_bits.append(
@@ -96,6 +106,8 @@ def _render_unified_overview(plex_url, plex_token, debug_box):
                 )
                 status_bits.append(f"rotation {sub.get('rotation_percent', 30)}%")
                 status_bits.append(f"target {sub.get('target_size', 30)} tracks")
+                if sub.get("drift") is not None:
+                    status_bits.append(f"cluster changed {round(sub['drift'] * 100)}% since subscribed")
             if sub.get("last_run"):
                 status_bits.append(f"last run {sub['last_run']}")
             if sub.get("last_track_count") is not None:
@@ -179,16 +191,16 @@ def _render_unified_overview(plex_url, plex_token, debug_box):
 
 
 def _render_cluster_save_section(plex, plex_url, plex_token, debug_box):
-    cluster_names, existing_live_names = _get_available_clusters(plex, debug_box)
-    if not cluster_names:
+    clusters, existing_live = _get_available_clusters(plex, debug_box)
+    if not clusters:
         st.warning(
             "No saved cluster build found — open 🗂️ Library Clusters, build clusters, "
             "and save at least one first."
         )
         return
 
-    for cluster_name in cluster_names:
-        already_live = cluster_name in existing_live_names
+    for cluster_id, cluster_name in clusters:
+        already_live = (cluster_id or cluster_name) in existing_live
         with st.expander(f"{'🎧 ' if already_live else ''}{cluster_name}", expanded=False):
             if already_live:
                 st.success("✅ Already a Live Mix — saving again below updates its settings and re-runs it now.")
@@ -219,7 +231,7 @@ def _render_cluster_save_section(plex, plex_url, plex_token, debug_box):
                             plex, plex_url, plex_token, cluster_name, live_name,
                             target_size=live_target_size, rotation_percent=live_rotation_pct,
                             cluster_ratio=live_cluster_pct / 100, sonic_seed_count=live_sonic_seeds,
-                            debug=debug_box,
+                            cluster_id=cluster_id, debug=debug_box,
                         )
                         st.success(f"'{live_name}' saved and subscribed — it'll refresh automatically every day.")
                     except Exception as e:
@@ -228,17 +240,26 @@ def _render_cluster_save_section(plex, plex_url, plex_token, debug_box):
 
 
 def _get_available_clusters(plex, debug_box):
-    """Prefer the current session's cluster_results (freshest, includes
-    unsaved merges), falling back to whatever's saved on disk so this tab
-    works even if Library Clusters hasn't been visited this session.
-    Also returns the set of cluster names that already have a live mix, so
-    the expander above can flag them."""
-    session_results = st.session_state.get("cluster_results")
-    if session_results:
-        names = sorted(session_results.keys())
+    """[(cluster_id, name)] to offer as Live Mixes. The album cluster
+    registry wins when it exists (stable IDs that survive re-curation);
+    otherwise the current session's build, falling back to the build saved
+    on disk, with cluster_id None (resolved by name at run time). Also
+    returns the set of ids/names that already have a non-stale live mix."""
+    registry = cr.load_registry()
+    if registry:
+        clusters = [(cid, c["name"]) for cid, c, n in cr.list_clusters(registry) if n]
     else:
-        results, _tag_mapping, _saved = load_cluster_results_cache(plex, debug=debug_box)
-        names = sorted(results.keys()) if results else []
+        session_results = st.session_state.get("cluster_results")
+        if session_results:
+            names = sorted(session_results.keys())
+        else:
+            results, _tag_mapping, _saved = load_cluster_results_cache(plex, debug=debug_box)
+            names = sorted(results.keys()) if results else []
+        clusters = [(None, n) for n in names]
 
-    existing_live_names = {s["cluster_name"] for s in lp.list_cluster_mix_subscriptions()}
-    return names, existing_live_names
+    existing_live = set()
+    for s in lp.list_cluster_mix_subscriptions():
+        if not s.get("stale"):
+            existing_live.add(s.get("cluster_id") or s["cluster_name"])
+            existing_live.add(s["cluster_name"])
+    return clusters, existing_live
