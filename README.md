@@ -345,8 +345,9 @@ Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
   the cluster, with length, max share per artist and popular/discovery mix
   adjustable and a preview before saving. Tick "Keep it updated daily" for
   a Live Mix instead.
-- **A Live Mix for every cluster:** 🧬 → 🎧 Live Mixes for all clusters
-  creates the missing ones in one go. With **🔁 Keep it that way** on, new
+- **A Live Mix for every cluster:** 🧬 → 🎧 Live Mixes for all clusters →
+  **🔄 Create & update all** creates the missing mixes and applies the same
+  settings to the existing ones, in one go. With **🔁 Keep it that way** on, new
   clusters from weekly curation (or a new commit) get a mix automatically.
 - **Daily (04:00):** albums added since the last scan are assigned to a
   fitting cluster before the Live Mixes refresh.

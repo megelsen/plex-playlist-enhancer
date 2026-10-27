@@ -402,12 +402,21 @@ The pool is every track of every album currently in the cluster.
   follows the cluster through curation (§9).
 
 **Live Mixes for all clusters** (🧬 → 🎧 Live Mixes for all clusters):
-- **Create:** creates a `[Mix] <cluster>` Live Mix for every non-empty
-  cluster that doesn't have one, all with one set of settings (songs, max
-  per artist, popular %, daily rotation, cluster/sonic ratio, sonic seeds,
-  DJ order, optionally including `Unclustered`).
-- **First build:** each mix is built once right away, in a background job.
-  The number of mixes follows the cluster cap.
+- **🔄 Create & update all:** one set of settings (songs, max per artist,
+  popular %, daily rotation, cluster/sonic ratio, sonic seeds, DJ order,
+  optionally including `Unclustered`) for every non-empty cluster:
+  - **Missing mixes are created** as `[Mix] <cluster>`.
+  - **Existing cluster mixes get the settings,** and their playlist names
+    are kept.
+  - **"Rebuild existing mixes from scratch"** (on by default) gives them a
+    fresh selection under the new settings. Off, they keep their songs and
+    only today's rotation follows the new settings; lowering "Songs" still
+    trims each mix right away, oldest songs first.
+  - **A mix whose playlist was deleted in Plex** is recreated.
+  - **A mix you switched off** gets the settings but stays off.
+- **First build:** everything is built right away, in a background job.
+  The settings become the defaults for automatic mixes. The number of
+  mixes follows the cluster cap.
 - **🔁 Keep it that way** (`auto_cluster_mixes` in `live_playlists.json`):
   after every weekly curation and every commit, clusters without a mix
   (newly formed or split off) get one with the saved settings. Created

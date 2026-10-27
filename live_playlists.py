@@ -408,6 +408,83 @@ def ensure_cluster_live_mixes(plex, settings=None, debug=None):
     return results
 
 
+_ROTATION_STATE_RESET = {
+    "current_cluster_keys": [], "recent_retired_cluster_keys": [],
+    "current_sonic_keys": [], "recent_retired_sonic_keys": [], "track_ages": {},
+}
+
+
+def sync_all_cluster_mixes(plex, settings, rebuild=True, debug=None):
+    """One-button 'create & update': every non-empty album cluster (plus
+    Unclustered if settings['include_unclustered']) ends up with a Live Mix
+    using `settings`:
+      - clusters without a mix get a new '[Mix] <cluster>' one,
+      - existing (non-stale) mixes of those clusters get the new settings —
+        their playlist names are kept; a mix whose playlist was deleted in
+        Plex is recreated; a mix you switched off stays off (settings only) —
+    and every one of them is built right away. With `rebuild`, existing mixes
+    start over (fresh picks under the new settings); without it, today's
+    normal rotation applies (only new picks follow the new settings).
+    The settings are also saved as the defaults for automatic mixes.
+    Returns [(playlist name, "created"|"updated", track count, error)]."""
+    d = debug.write if debug else (lambda *a, **k: None)
+    registry = cr.load_registry()
+    if not registry:
+        return []
+    s = set_auto_mix_settings(**settings)
+    mix_settings = {k: s[k] for k in _MIX_SETTING_KEYS}
+    include_unclustered = s.get("include_unclustered", False)
+
+    targets = [(cid, c.get("name")) for cid, c, n in cr.list_clusters(registry)
+               if n and (cid != cr.UNCLUSTERED_ID or include_unclustered)]
+    target_ids = {cid for cid, _ in targets}
+    names_to_id = {name: cid for cid, name in targets}
+
+    updated_ids = set()
+    results = []
+    for sub in list_cluster_mix_subscriptions():
+        if sub.get("stale"):
+            continue
+        cid = sub.get("cluster_id") or names_to_id.get(sub.get("cluster_name"))
+        if cid not in target_ids:
+            continue
+        updates = dict(mix_settings)
+        if rebuild:
+            updates.update(_ROTATION_STATE_RESET)
+        if sub.get("playlist_missing"):
+            # Its playlist was deleted in Plex earlier; this button asks for every
+            # cluster to have a mix, so recreate it.
+            updates.update(enabled=True, playlist_missing=False, playlist_rating_key=None)
+        update_subscription_settings("cluster_mix", sub["id"], **updates)
+        updated_ids.add(cid)
+        fresh = next(x for x in list_cluster_mix_subscriptions() if x["id"] == sub["id"])
+        if not fresh.get("enabled", True):
+            d(f"└ ⏸️ {fresh['playlist_name']}: settings updated; switched off, so not rebuilt")
+            results.append((fresh["playlist_name"], "updated (off)", None, None))
+            continue
+        count, err = _run_and_record("cluster_mix", fresh, plex, debug=debug)
+        fresh = next(x for x in list_cluster_mix_subscriptions() if x["id"] == sub["id"])
+        if err and fresh.get("playlist_missing"):  # deleted in Plex just now — recreate as above
+            update_subscription_settings("cluster_mix", sub["id"], enabled=True, playlist_missing=False,
+                                         playlist_rating_key=None, **_ROTATION_STATE_RESET)
+            fresh = next(x for x in list_cluster_mix_subscriptions() if x["id"] == sub["id"])
+            count, err = _run_and_record("cluster_mix", fresh, plex, debug=debug)
+        d(f"└ {'❌' if err else '🔄'} {fresh['playlist_name']}: {err or f'{count} songs (updated)'}")
+        results.append((fresh["playlist_name"], "updated", count, err))
+
+    for cid, name in targets:
+        if cid in updated_ids:
+            continue
+        sub = add_cluster_mix_subscription(name, f"[Mix] {name}", cluster_id=cid, **mix_settings)
+        count, err = _run_and_record("cluster_mix", sub, plex, debug=debug)
+        d(f"└ {'❌' if err else '✅'} [Mix] {name}: {err or f'{count} songs (new)'}")
+        results.append((f"[Mix] {name}", "created", count, err))
+
+    d(f"**Done:** {sum(1 for r in results if r[1] == 'created')} created, "
+      f"{sum(1 for r in results if r[1] == 'updated')} updated, {sum(1 for r in results if r[3])} failed.")
+    return results
+
+
 def list_all_subscriptions():
     """Combined view for the Live Playlists overview: every subscription,
     tagged with its kind, so the tab can render one unified list instead of
@@ -839,6 +916,8 @@ def _rotate_pool(pool, current_keys, recent_retired, target_size, rotation_perce
         current_tracks,
         key=lambda t: (-ages.get(str(t.ratingKey), 0), getattr(t, "viewCount", 0) or 0, random.random()),
     )
+    # If target_size was lowered, also drop the oldest extras.
+    rotation_count = max(rotation_count, len(current_tracks) - target_size)
     removed = by_age[:rotation_count]
     kept = []
     for t in by_age[rotation_count:]:
