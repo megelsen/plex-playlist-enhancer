@@ -72,6 +72,11 @@ def _render_report(report):
         sub = rec["sub"]
         what = "playlist deleted" if rec.get("playlist_deleted") else (rec.get("note") or "removed")
         st.write(f"- 🧹 Stale mix **{sub.get('playlist_name')}** — {(sub.get('stale') or {}).get('reason')} ({what})")
+    for rec in report.get("created_mixes") or []:
+        if rec.get("error"):
+            st.write(f"- ⚠️ Live Mix for **{rec.get('name')}** failed: {rec['error']}")
+        else:
+            st.write(f"- 🎧 New Live Mix **[Mix] {rec.get('name')}** ({rec.get('songs')} songs)")
 
 
 def render(plex, plex_url, plex_token, gemini_api_key):
@@ -118,6 +123,8 @@ def render(plex, plex_url, plex_token, gemini_api_key):
                 st.warning("Another cluster job is already running.")
             st.rerun()
 
+    _render_all_mixes(plex, reg, busy)
+
     reports = curation.load_reports()
     if reports:
         with st.expander(f"📋 Last run: {reports[-1].get('trigger')} {reports[-1].get('started_at')} — "
@@ -160,6 +167,59 @@ def render(plex, plex_url, plex_token, gemini_api_key):
                 if not cr.run_background_job("Rollback", curation.rollback_to_generation, int(gen), plex):
                     st.warning("Another cluster job is already running.")
                 st.rerun()
+
+
+def _render_all_mixes(plex, reg, busy):
+    """One place to give every cluster a Live Mix, and optionally keep it
+    that way after each weekly curation / commit."""
+    auto = lp.get_auto_mix_settings()
+    n_clusters = sum(1 for cid, _c, n in cr.list_clusters(reg) if n and cid != cr.UNCLUSTERED_ID)
+    missing = lp.clusters_without_mix(reg, include_unclustered=auto["include_unclustered"])
+    title = (f"🎧 Live Mixes for all clusters — {n_clusters - len([m for m in missing if m[0] != cr.UNCLUSTERED_ID])}"
+             f" of {n_clusters} have one{' · 🔁 auto' if auto['enabled'] else ''}")
+    with st.expander(title):
+        st.caption("Creates a **[Mix] <cluster>** Live Mix for every cluster that doesn't have one, all with the "
+                   "settings below. Each is built once right away (in the background), then refreshes daily. "
+                   "Mixes whose cluster disappears are removed at the weekly curation.")
+        c1, c2, c3 = st.columns(3)
+        size = c1.number_input("Songs", 5, 500, int(auto["target_size"]), step=5, key="all_mix_size")
+        artist_pct = c2.slider("Max per artist (%)", 0, 100, round(auto["max_artist_share"] * 100), key="all_mix_artist")
+        popular_pct = c3.slider("Popular (%)", 0, 100, round(auto["popular_share"] * 100), step=5, key="all_mix_pop")
+        c4, c5, c6 = st.columns(3)
+        rotation = c4.slider("Daily rotation (%)", 5, 100, int(auto["rotation_percent"]), step=5, key="all_mix_rot")
+        cluster_pct = c5.slider("From the cluster (%)", 10, 100, round(auto["cluster_ratio"] * 100), key="all_mix_ratio")
+        seeds = c6.number_input("Sonic seed songs", 1, 30, int(auto["sonic_seed_count"]), key="all_mix_seeds")
+        dj = st.checkbox("🎚️ DJ order", value=bool(auto["dj_order"]), key="all_mix_dj")
+        include_unclustered = st.checkbox("Include the Unclustered cluster", value=bool(auto["include_unclustered"]),
+                                          key="all_mix_uncl")
+        settings = {
+            "target_size": int(size), "max_artist_share": artist_pct / 100, "popular_share": popular_pct / 100,
+            "rotation_percent": int(rotation), "cluster_ratio": cluster_pct / 100, "sonic_seed_count": int(seeds),
+            "dj_order": bool(dj), "include_unclustered": bool(include_unclustered),
+        }
+        missing = lp.clusters_without_mix(reg, include_unclustered=include_unclustered)
+        if missing:
+            st.caption("Without a mix: " + ", ".join(f"{name} ({n} albums)" for _cid, name, n in missing))
+        if st.button(f"➕ Create {len(missing)} Live Mix(es)", disabled=busy or not missing,
+                     use_container_width=True, key="all_mix_create"):
+            lp.set_auto_mix_settings(**settings)
+            if not cr.run_background_job("Create Live Mixes", lp.ensure_cluster_live_mixes, plex, settings=settings):
+                st.warning("Another cluster job is already running.")
+            st.rerun()
+
+        keep = st.toggle(
+            "🔁 Keep it that way — also create mixes for new clusters automatically", value=bool(auto["enabled"]),
+            key="all_mix_auto",
+            help="After each weekly curation and each commit, clusters without a mix (new or split off) get one "
+                 "with the settings above.",
+        )
+        if keep != bool(auto["enabled"]):
+            lp.set_auto_mix_settings(enabled=keep, **settings)
+            st.rerun()
+        if auto["enabled"] and settings != {k: auto[k] for k in settings} and st.button(
+                "💾 Use these settings for automatic mixes", key="all_mix_save"):
+            lp.set_auto_mix_settings(**settings)
+            st.rerun()
 
 
 def _render_playlist_tab(plex, plex_url, plex_token, reg, cid, cluster, count):

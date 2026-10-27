@@ -199,6 +199,7 @@ def add_cluster_mix_subscription(cluster_name, playlist_name, target_size=30,
         "last_error": None,
     })
     _save_config(cfg)
+    return cfg["cluster_mixes"][-1]
 
 
 def remove_subscription(kind, sub_id):
@@ -331,6 +332,80 @@ def save_cluster_as_live_mix(plex, plex_url, plex_token, cluster_name, playlist_
     if new_sub:
         count = run_single_subscription("cluster_mix", new_sub["id"], plex_url, plex_token, debug=debug)
     return playlist_name, count
+
+
+# --- Live Mixes for every cluster ------------------------------------------
+
+AUTO_MIX_DEFAULTS = {
+    "enabled": False,               # create mixes for new clusters after each curation / commit
+    "include_unclustered": False,
+    "target_size": 30,
+    "rotation_percent": DEFAULT_ROTATION_PERCENT,
+    "cluster_ratio": 0.67,
+    "sonic_seed_count": 10,
+    "max_artist_share": DEFAULT_MAX_ARTIST_SHARE,
+    "popular_share": DEFAULT_POPULAR_SHARE,
+    "dj_order": True,
+}
+_MIX_SETTING_KEYS = ("target_size", "rotation_percent", "cluster_ratio", "sonic_seed_count",
+                     "max_artist_share", "popular_share", "dj_order")
+
+
+def get_auto_mix_settings():
+    return {**AUTO_MIX_DEFAULTS, **(_load_config().get("auto_cluster_mixes") or {})}
+
+
+def set_auto_mix_settings(**fields):
+    cfg = _load_config()
+    current = {**AUTO_MIX_DEFAULTS, **(cfg.get("auto_cluster_mixes") or {})}
+    current.update({k: v for k, v in fields.items() if k in AUTO_MIX_DEFAULTS})
+    cfg["auto_cluster_mixes"] = current
+    _save_config(cfg)
+    return current
+
+
+def clusters_without_mix(registry, include_unclustered=False):
+    """[(cluster_id, name, album_count)] of non-empty album clusters that
+    have no active (non-stale) Live Mix. A legacy mix without cluster_id
+    counts for the cluster of the same name."""
+    active_ids, active_names = set(), set()
+    for s in list_cluster_mix_subscriptions():
+        if s.get("stale"):
+            continue
+        if s.get("cluster_id"):
+            active_ids.add(s["cluster_id"])
+        else:
+            active_names.add(s.get("cluster_name"))
+    out = []
+    for cid, c, n in cr.list_clusters(registry):
+        if not n or cid in active_ids or c.get("name") in active_names:
+            continue
+        if cid == cr.UNCLUSTERED_ID and not include_unclustered:
+            continue
+        out.append((cid, c.get("name"), n))
+    return out
+
+
+def ensure_cluster_live_mixes(plex, settings=None, debug=None):
+    """Creates a '[Mix] <cluster>' Live Mix for every album cluster that
+    doesn't have one yet (with `settings`, default: the saved auto-mix
+    settings) and builds each once right away. Returns [(cluster name,
+    track count, error)]."""
+    d = debug.write if debug else (lambda *a, **k: None)
+    registry = cr.load_registry()
+    if not registry:
+        return []
+    s = {**get_auto_mix_settings(), **(settings or {})}
+    missing = clusters_without_mix(registry, include_unclustered=s.get("include_unclustered", False))
+    d(f"**Live Mixes for all clusters:** {len(missing)} cluster(s) without one.")
+    results = []
+    for cid, name, n_albums in missing:
+        sub = add_cluster_mix_subscription(name, f"[Mix] {name}", cluster_id=cid,
+                                           **{k: s[k] for k in _MIX_SETTING_KEYS})
+        count, err = _run_and_record("cluster_mix", sub, plex, debug=debug)
+        d(f"└ {'❌' if err else '✅'} [Mix] {name} ({n_albums} albums): {err or f'{count} songs'}")
+        results.append((name, count, err))
+    return results
 
 
 def list_all_subscriptions():

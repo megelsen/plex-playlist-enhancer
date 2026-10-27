@@ -401,6 +401,21 @@ The pool is every track of every album currently in the cluster.
   Live Mix (`[Mix] <cluster>`) instead, with the same three settings. It
   follows the cluster through curation (§9).
 
+**Live Mixes for all clusters** (🧬 → 🎧 Live Mixes for all clusters):
+- **Create:** creates a `[Mix] <cluster>` Live Mix for every non-empty
+  cluster that doesn't have one, all with one set of settings (songs, max
+  per artist, popular %, daily rotation, cluster/sonic ratio, sonic seeds,
+  DJ order, optionally including `Unclustered`).
+- **First build:** each mix is built once right away, in a background job.
+  The number of mixes follows the cluster cap.
+- **🔁 Keep it that way** (`auto_cluster_mixes` in `live_playlists.json`):
+  after every weekly curation and every commit, clusters without a mix
+  (newly formed or split off) get one with the saved settings. Created
+  mixes are listed in the run report.
+- **Removals:** mixes whose cluster disappears are still marked stale and
+  removed at the weekly curation (§9), so with auto on, the set of mixes
+  tracks the set of clusters.
+
 **DJ order** (`live_playlists.dj_order`):
 1. **Opener:** a random first song.
 2. **Next song:** the remaining song with the best transition score from

@@ -229,6 +229,7 @@ def run_weekly_curation(plex_url=None, plex_token=None, api_key=None, debug=None
         report["deleted_subscriptions"] = deleted
         d(f"**Committed gen {work['generation']}.** {len(deleted)} stale Live Mix(es) removed.")
         report["status"] = "committed"
+        report["created_mixes"] = _auto_create_mixes(plex, debug)
         return report
     except Exception as e:
         logger.exception("Weekly curation failed")
@@ -237,6 +238,18 @@ def run_weekly_curation(plex_url=None, plex_token=None, api_key=None, debug=None
     finally:
         report["finished_at"] = _now_iso()
         _save_report(report)
+
+
+def _auto_create_mixes(plex, debug=None):
+    """When 'keep every cluster as a Live Mix' is on, give each cluster that
+    has no mix (new, split-off) one. Never fails the run that called it."""
+    if not lp.get_auto_mix_settings().get("enabled"):
+        return []
+    try:
+        return [{"name": n, "songs": c, "error": e} for n, c, e in lp.ensure_cluster_live_mixes(plex, debug=debug)]
+    except Exception as e:
+        logger.exception("Automatic Live Mix creation failed")
+        return [{"name": None, "songs": None, "error": str(e)}]
 
 
 def commit_build(plex, build, api_key=None, debug=None):
@@ -251,11 +264,13 @@ def commit_build(plex, build, api_key=None, debug=None):
                                    api_key=api_key, max_clusters=build.get("total_clusters"), debug=debug)
     reg = cr.load_registry()
     marked = lp.apply_cluster_events(boot["events"], reg)
+    created = _auto_create_mixes(plex, debug)
     _save_report({
         "id": f"build_{datetime.now().strftime('%Y%m%d%H%M%S')}", "trigger": "build", "status": "committed",
         "started_at": _now_iso(), "finished_at": _now_iso(),
         "from_generation": old["generation"] if old else None, "to_generation": boot["generation"],
         "events": boot["events"], "marked_stale": marked, "deleted_subscriptions": [],
+        "created_mixes": created,
         **{k: boot["stats"].get(k) for k in ("moved", "assigned", "ejected", "clusters", "unclustered")},
     })
     return boot

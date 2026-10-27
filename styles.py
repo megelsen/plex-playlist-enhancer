@@ -77,14 +77,20 @@ def inject_custom_css():
            their responsive JS/CSS to override. render_track_row always
            calls st.columns([8, 1, 1]) (content, play, add) — three tracks,
            fixed here to match: a flexible content column plus two fixed
-           40px icon columns that never move regardless of screen width. */
-        div[data-testid="stHorizontalBlock"] {
+           40px icon columns that never move regardless of screen width.
+           Scoped with :has(.track-row-text) to track rows ONLY — applied to
+           every st.columns row, it squeezed any other 2nd/3rd column (slider
+           labels, artist lists, buttons) into 40px, breaking text after
+           every couple of letters on mobile. Other rows keep Streamlit's own
+           layout, which stacks columns on narrow screens. */
+        div[data-testid="stHorizontalBlock"]:has(.track-row-text) {
             display: grid !important;
             grid-template-columns: 1fr 40px 40px !important;
             align-items: center !important;
             gap: 0.4rem !important;
         }
-        div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+        div[data-testid="stHorizontalBlock"]:has(.track-row-text) > div[data-testid="column"],
+        div[data-testid="stHorizontalBlock"]:has(.track-row-text) > div[data-testid="stColumn"] {
             width: auto !important;
             min-width: 0 !important;
             max-width: none !important;
@@ -108,6 +114,13 @@ def inject_custom_css():
             overflow: hidden !important;
             white-space: nowrap !important;
             text-overflow: ellipsis !important;
+        }
+        /* The recommendation-type tag is inline <code>, which Streamlit lets
+           break anywhere — on a phone it split mid-word ("A" / "mbient").
+           Keep it on the row's single line; the span's ellipsis truncates. */
+        .track-row-text code {
+            white-space: nowrap !important;
+            word-break: normal !important;
         }
 
         /* --- PLOTLY CHART FULL WIDTH (Library Galaxy) ---
