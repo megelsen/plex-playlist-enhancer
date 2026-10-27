@@ -16,11 +16,13 @@ survive container restarts:
       - the remainder expanded via Plex's sonic-similarity hub, seeded
         from `sonic_seed_count` (default 10) tracks drawn from the
         cluster-seeded part just picked that run.
-    Each part rotates independently: `rotation_percent` of its least-
-    played current tracks get swapped for new picks from its own pool
-    each day, with a one-rotation cooldown per part. Because the artist
-    set (and therefore the sonic seeds it can produce) never fundamentally
-    changes, the vibe stays intact while specific songs cycle.
+    Each part rotates independently: `rotation_percent` (default 20%) of
+    its tracks — the ones that have been in the mix longest first — get
+    swapped each day for new picks from its own pool, with a one-rotation
+    cooldown per part. New picks use the same picker as static cluster
+    playlists (_pick_tracks: popular/random split, per-artist cap across
+    the whole mix). The day's tracks are then put in DJ order (dj_order):
+    a random opener, then always the most similar-sounding next track.
 
 The daily job itself runs via APScheduler's BackgroundScheduler, started
 once per container process (guarded by a module-level singleton) so it
@@ -58,6 +60,7 @@ from plexapi.server import PlexServer
 
 import cluster_registry as cr
 from artist_mix import build_artist_mix
+from plex_helpers import get_sonic_match_percent
 from clustering import (
     CLUSTER_RESULTS_CACHE_PATH, apply_merge_plan, build_artist_cluster_map, load_build_cache,
     load_cluster_results_cache,
@@ -78,12 +81,18 @@ CURATION_HOUR = int(os.environ.get("CURATION_HOUR", 3))
 CURATION_MINUTE = int(os.environ.get("CURATION_MINUTE", 0))
 CURATION_CATCH_UP_DAYS = 8
 
+# Cluster Mix / cluster playlist defaults (percent = share of the playlist).
+DEFAULT_ROTATION_PERCENT = 20
+DEFAULT_MAX_ARTIST_SHARE = 0.10
+DEFAULT_POPULAR_SHARE = 0.5
+DJ_NEIGHBOR_LIMIT = 50
+
 # Fields a run_*_subscription call may change on `sub`, persisted by the runners.
 _RUN_STATE_FIELDS = (
     "cluster_id", "cluster_name", "playlist_name", "playlist_rating_key",
     "current_cluster_keys", "recent_retired_cluster_keys",
     "current_sonic_keys", "recent_retired_sonic_keys",
-    "track_view_counts", "fit_stats", "baseline_album_keys", "drift",
+    "track_view_counts", "fit_stats", "baseline_album_keys", "drift", "track_ages",
 )
 
 
@@ -157,8 +166,11 @@ def add_artist_mix_subscription(artist_name, playlist_name, max_total=30, max_ar
     _save_config(cfg)
 
 
-def add_cluster_mix_subscription(cluster_name, playlist_name, target_size=30, rotation_percent=85,
-                                  cluster_ratio=0.67, sonic_seed_count=10, cluster_id=None):
+def add_cluster_mix_subscription(cluster_name, playlist_name, target_size=30,
+                                  rotation_percent=DEFAULT_ROTATION_PERCENT, cluster_ratio=0.67,
+                                  sonic_seed_count=10, cluster_id=None,
+                                  max_artist_share=DEFAULT_MAX_ARTIST_SHARE,
+                                  popular_share=DEFAULT_POPULAR_SHARE, dj_order=True):
     cfg = _load_config()
     cfg["cluster_mixes"].append({
         "id": _new_id(),
@@ -169,12 +181,16 @@ def add_cluster_mix_subscription(cluster_name, playlist_name, target_size=30, ro
         "rotation_percent": int(rotation_percent),
         "cluster_ratio": float(cluster_ratio),
         "sonic_seed_count": int(sonic_seed_count),
+        "max_artist_share": float(max_artist_share),
+        "popular_share": float(popular_share),
+        "dj_order": bool(dj_order),
         "current_cluster_keys": [],
         "recent_retired_cluster_keys": [],
         "current_sonic_keys": [],
         "recent_retired_sonic_keys": [],
         "playlist_rating_key": None,
         "track_view_counts": {},
+        "track_ages": {},
         "fit_stats": {},
         "stale": None,
         "enabled": True,
@@ -292,8 +308,10 @@ def save_artist_mix_as_live(plex, plex_url, plex_token, artist_name, playlist_na
 
 
 def save_cluster_as_live_mix(plex, plex_url, plex_token, cluster_name, playlist_name,
-                              target_size=30, rotation_percent=85, cluster_ratio=0.67,
-                              sonic_seed_count=10, cluster_id=None, debug=None):
+                              target_size=30, rotation_percent=DEFAULT_ROTATION_PERCENT, cluster_ratio=0.67,
+                              sonic_seed_count=10, cluster_id=None,
+                              max_artist_share=DEFAULT_MAX_ARTIST_SHARE, popular_share=DEFAULT_POPULAR_SHARE,
+                              dj_order=True, debug=None):
     """Registers a new cluster-mix subscription and runs it once immediately.
     `cluster_id` (a registry cluster) is optional — without it the cluster
     is resolved by name on each run. Returns (playlist_name, track_count)."""
@@ -301,7 +319,8 @@ def save_cluster_as_live_mix(plex, plex_url, plex_token, cluster_name, playlist_
         cluster_name, playlist_name,
         target_size=target_size, rotation_percent=rotation_percent,
         cluster_ratio=cluster_ratio, sonic_seed_count=sonic_seed_count,
-        cluster_id=cluster_id,
+        cluster_id=cluster_id, max_artist_share=max_artist_share,
+        popular_share=popular_share, dj_order=dj_order,
     )
     new_sub = next(
         (s for s in list_cluster_mix_subscriptions()
@@ -429,48 +448,135 @@ def _registry_cluster_pool(plex, registry, cluster_id):
     return pool, album_keys
 
 
-def build_cluster_playlist(plex, cluster_id, size=50, max_artist_share=0.10, popular_share=0.5, registry=None):
-    """A playlist drawn from EVERY track of every album in the cluster:
-      - popular_share of `size` picked by weighted random sampling, weight =
-        plays + 1 (viewCount; the +1 gives unplayed tracks a chance),
-      - the rest picked uniformly from the remaining tracks (discovery),
-      - at most max(1, ceil(size * max_artist_share)) tracks per artist
-        (0 = no cap).
-    Returns a shuffled track list; shorter than `size` only if the cluster
-    can't fill it under the artist cap. Tracks get a recommendation_type of
-    "<cluster> (Popular)" / "(Discovery)" for display."""
+def _artist_cap(size, max_artist_share):
+    """Max tracks per artist for a playlist of `size` (None = no cap)."""
+    return max(1, math.ceil(size * max_artist_share)) if max_artist_share else None
+
+
+def _pick_tracks(candidates, n, popular_share, cap=None, artist_counts=None, label=None):
+    """Picks up to n tracks from `candidates`, the same way for static
+    cluster playlists and Live Mixes:
+      - round(n * popular_share) by weighted random sampling without
+        replacement, weight = plays + 1 (viewCount; +1 so unplayed tracks
+        keep a chance) — Efraimidis–Spirakis: order by u ** (1 / weight);
+      - the rest uniformly at random from what's left;
+      - never more than `cap` tracks per artist, counted in `artist_counts`
+        (shared by the caller across parts, updated in place); tracks with
+        no artist key aren't capped.
+    Returns the picks (fewer than n only if the cap or pool runs out)."""
+    artist_counts = artist_counts if artist_counts is not None else defaultdict(int)
+    candidates = list(candidates)
+    picked, picked_keys = [], set()
+
+    def _take(ordered, target, kind):
+        for t in ordered:
+            if len(picked) >= target:
+                return
+            artist = getattr(t, "grandparentRatingKey", None)
+            if t.ratingKey in picked_keys or (cap and artist is not None and artist_counts[artist] >= cap):
+                continue
+            if label:
+                setattr(t, "recommendation_type", f"{label} ({kind})")
+            picked.append(t)
+            picked_keys.add(t.ratingKey)
+            artist_counts[artist] += 1
+
+    weighted = sorted(candidates, key=lambda t: random.random() ** (1.0 / ((getattr(t, "viewCount", 0) or 0) + 1)),
+                      reverse=True)
+    _take(weighted, round(n * popular_share), "Popular")
+    rest = [t for t in candidates if t.ratingKey not in picked_keys]
+    random.shuffle(rest)
+    _take(rest, n, "Discovery")
+    return picked
+
+
+def _album_similarity(fa, fb, album_a, album_b):
+    """0..1 similarity of two albums from the cached album features: their
+    sonic-neighbour weight (Plex match % / 100), else tag overlap (Jaccard)
+    scaled by 0.5 so a tag match never beats a real sonic match."""
+    if not fa or not fb:
+        return 0.0
+    sonic = max((fa.get("sonic") or {}).get(album_b, 0.0), (fb.get("sonic") or {}).get(album_a, 0.0))
+    ta = set(fa.get("genres", [])) | set(fa.get("moods", []))
+    tb = set(fb.get("genres", [])) | set(fb.get("moods", []))
+    jaccard = len(ta & tb) / len(ta | tb) if ta | tb else 0.0
+    return max(sonic, 0.5 * jaccard)
+
+
+def dj_order(tracks, start=None, debug=None):
+    """DJ-style running order: a random opener (or `start`), then always the
+    remaining track that sounds most like the one before it.
+
+    Transition score (higher = smoother), all 0..1-based:
+      1 + Plex sonic match (match % / 100) if one track is in the other's
+          sonicallySimilar list (DJ_NEIGHBOR_LIMIT neighbours each),
+      else album-level similarity from the cached album features (sonic
+          neighbour albums, else tag overlap × 0.5), 0.6 for the same album;
+      − 0.5 if it's the same artist as the previous track (avoids
+          back-to-back artists unless nothing else fits),
+      + a tiny random jitter so ties don't always resolve the same way.
+    Costs one sonicallySimilar call per track."""
+    tracks = list(tracks)
+    if len(tracks) < 3:
+        return tracks
+    keys = {t.ratingKey for t in tracks}
+    direct = defaultdict(dict)
+    for t in tracks:
+        try:
+            matches = t.sonicallySimilar(limit=DJ_NEIGHBOR_LIMIT)
+        except Exception as e:
+            if debug:
+                debug.write(f"└ ⚠️ Sonic lookup failed while ordering: `{e}`")
+            continue
+        for m in matches:
+            mk = getattr(m, "ratingKey", None)
+            if mk in keys and mk != t.ratingKey:
+                pct = get_sonic_match_percent(m)
+                w = (pct / 100.0) if pct is not None else 0.5
+                direct[t.ratingKey][mk] = max(direct[t.ratingKey].get(mk, 0.0), w)
+                direct[mk][t.ratingKey] = max(direct[mk].get(t.ratingKey, 0.0), w)
+
+    feats = cr.load_album_features()["albums"]
+
+    def _score(a, b):
+        album_a, album_b = getattr(a, "parentRatingKey", None), getattr(b, "parentRatingKey", None)
+        if b.ratingKey in direct[a.ratingKey]:
+            score = 1.0 + direct[a.ratingKey][b.ratingKey]
+        elif album_a is not None and album_a == album_b:
+            score = 0.6
+        else:
+            score = _album_similarity(feats.get(str(album_a)), feats.get(str(album_b)), str(album_a), str(album_b))
+        artist_a = getattr(a, "grandparentRatingKey", None)
+        if artist_a is not None and artist_a == getattr(b, "grandparentRatingKey", None):
+            score -= 0.5
+        return score + random.random() * 1e-3
+
+    current = start if start is not None else random.choice(tracks)
+    ordered = [current]
+    remaining = [t for t in tracks if t.ratingKey != current.ratingKey]
+    while remaining:
+        nxt = max(remaining, key=lambda t: _score(current, t))
+        ordered.append(nxt)
+        remaining.remove(nxt)
+        current = nxt
+    return ordered
+
+
+def build_cluster_playlist(plex, cluster_id, size=50, max_artist_share=DEFAULT_MAX_ARTIST_SHARE,
+                           popular_share=DEFAULT_POPULAR_SHARE, dj=True, registry=None, debug=None):
+    """A playlist drawn from EVERY track of every album in the cluster,
+    picked by _pick_tracks (popular/random split, per-artist cap of
+    max(1, ceil(size * max_artist_share)); 0 = no cap). Returned in DJ order
+    (dj_order) when `dj`, else shuffled. Shorter than `size` only if the
+    cluster can't fill it under the artist cap."""
     registry = registry or cr.load_registry()
     if not registry or cluster_id not in registry["clusters"]:
         raise ValueError("Cluster not found in the album cluster registry.")
     name = registry["clusters"][cluster_id]["name"]
     pool, _album_keys = _registry_cluster_pool(plex, registry, cluster_id)
-    tracks = list(pool.values())
-
-    cap = max(1, math.ceil(size * max_artist_share)) if max_artist_share else None
-    per_artist = defaultdict(int)
-    picked, picked_keys = [], set()
-
-    def _take(candidates, target, label):
-        for t in candidates:
-            if len(picked) >= target:
-                return
-            artist = getattr(t, "grandparentRatingKey", None)
-            if t.ratingKey in picked_keys or (cap and per_artist[artist] >= cap):
-                continue
-            setattr(t, "recommendation_type", f"{name} ({label})")
-            picked.append(t)
-            picked_keys.add(t.ratingKey)
-            per_artist[artist] += 1
-
-    # Weighted sampling without replacement (Efraimidis–Spirakis): order by
-    # u ** (1 / weight), u ~ U(0, 1) — O(n log n) on large clusters.
-    weighted = sorted(tracks, key=lambda t: random.random() ** (1.0 / ((getattr(t, "viewCount", 0) or 0) + 1)),
-                      reverse=True)
-    _take(weighted, round(size * popular_share), "Popular")
-    rest = [t for t in tracks if t.ratingKey not in picked_keys]
-    random.shuffle(rest)
-    _take(rest, size, "Discovery")
-
+    picked = _pick_tracks(pool.values(), size, popular_share, cap=_artist_cap(size, max_artist_share), label=name)
+    if dj:
+        return dj_order(picked, debug=debug)
     random.shuffle(picked)
     return picked
 
@@ -533,31 +639,38 @@ def run_cluster_mix_subscription(sub, plex, debug=None):
     """
     Builds the cluster mix from two rotating parts and upserts the target
     playlist:
-      - a cluster-seeded part (~cluster_ratio of target_size), pulled from
-        the cluster's assigned artists' full catalogs.
-      - a sonic-expansion part (the remainder), pulled from Plex's
-        sonic-similarity hub, seeded from sonic_seed_count tracks drawn
-        from the cluster-seeded part just picked this run.
-    Each part rotates independently via _rotate_pool. Mutates sub in place
-    with the new state — caller is responsible for persisting cfg.
+      - a cluster part (~cluster_ratio of target_size) from every track of
+        the cluster's albums,
+      - a sonic-expansion part (the remainder): Plex sonicallySimilar
+        matches from OUTSIDE the cluster, seeded from sonic_seed_count
+        tracks of today's cluster part (yesterday's sonic tracks stay
+        available, so rotation applies to this part too).
+    Both parts rotate via _rotate_pool and share one per-artist cap
+    (max_artist_share of target_size) and the popular_share split. The
+    result is put in DJ order unless dj_order is off. Mutates sub in place —
+    the caller persists it.
     """
     core_pool = _resolve_cluster_pool(plex, sub, debug=debug)
     _update_fit_stats(sub, core_pool)
 
     target_size = sub.get("target_size", 30)
-    rotation_percent = sub.get("rotation_percent", 30)
+    rotation_percent = sub.get("rotation_percent", DEFAULT_ROTATION_PERCENT)
     cluster_ratio = sub.get("cluster_ratio", 0.67)
     sonic_seed_count = sub.get("sonic_seed_count", 10)
+    popular_share = sub.get("popular_share", DEFAULT_POPULAR_SHARE)
+    cap = _artist_cap(target_size, sub.get("max_artist_share", DEFAULT_MAX_ARTIST_SHARE))
+    ages = sub.get("track_ages") or {}
+    artist_counts = defaultdict(int)
 
     cluster_target = max(1, round(target_size * cluster_ratio))
     sonic_target = max(0, target_size - cluster_target)
 
-    # --- Cluster-seeded part ---
+    # --- Cluster part ---
     cluster_tracks, cluster_removed = _rotate_pool(
         core_pool,
         sub.get("current_cluster_keys") or [],
         set(sub.get("recent_retired_cluster_keys") or []),
-        cluster_target, rotation_percent,
+        cluster_target, rotation_percent, popular_share, cap, artist_counts, ages,
     )
 
     # --- Sonic-expansion part, seeded from what the cluster part just picked ---
@@ -576,17 +689,23 @@ def run_cluster_mix_subscription(sub, plex, debug=None):
             rk = getattr(m, "ratingKey", None)
             if rk and rk not in core_pool and rk not in sonic_pool:
                 sonic_pool[rk] = m
+    # Today's seeds rarely re-surface yesterday's matches; keep those tracks
+    # available so they rotate out gradually instead of all at once.
+    for rk in sub.get("current_sonic_keys") or []:
+        if rk not in sonic_pool and rk not in core_pool:
+            try:
+                sonic_pool[rk] = plex.fetchItem(int(rk))
+            except Exception:
+                continue
 
     sonic_tracks, sonic_removed = _rotate_pool(
         sonic_pool,
         sub.get("current_sonic_keys") or [],
         set(sub.get("recent_retired_sonic_keys") or []),
-        sonic_target, rotation_percent,
+        sonic_target, rotation_percent, popular_share, cap, artist_counts, ages,
     )
 
-    # Combine and dedup (a sonic match could in rare cases coincide with a
-    # cluster pick if Plex's hub surfaces a same-cluster-artist track that
-    # somehow wasn't in core_pool — keep the cluster copy, drop the dupe).
+    # Combine and dedup (keep the cluster copy if both parts hold a track).
     final_tracks = []
     seen = set()
     for t in cluster_tracks + sonic_tracks:
@@ -594,11 +713,15 @@ def run_cluster_mix_subscription(sub, plex, debug=None):
             final_tracks.append(t)
             seen.add(t.ratingKey)
 
-    random.shuffle(final_tracks)
+    if sub.get("dj_order", True):
+        final_tracks = dj_order(final_tracks, debug=debug)
+    else:
+        random.shuffle(final_tracks)
     playlist = _upsert_playlist(plex, sub["playlist_name"], final_tracks, sub.get("playlist_rating_key"))
     if playlist is not None:
         sub["playlist_rating_key"] = playlist.ratingKey
     sub["track_view_counts"] = {str(t.ratingKey): getattr(t, "viewCount", 0) or 0 for t in cluster_tracks}
+    sub["track_ages"] = {str(t.ratingKey): ages.get(str(t.ratingKey), 0) + 1 for t in final_tracks}
 
     sub["current_cluster_keys"] = [t.ratingKey for t in cluster_tracks]
     sub["recent_retired_cluster_keys"] = [t.ratingKey for t in cluster_removed]
@@ -608,52 +731,61 @@ def run_cluster_mix_subscription(sub, plex, debug=None):
     return len(final_tracks)
 
 
-def _rotate_pool(pool, current_keys, recent_retired, target_size, rotation_percent):
+def _rotate_pool(pool, current_keys, recent_retired, target_size, rotation_percent,
+                 popular_share=DEFAULT_POPULAR_SHARE, cap=None, artist_counts=None, ages=None):
     """
-    Shared rotation logic for one sub-pool: on first run (or once nothing
-    carries over), picks target_size tracks leaning toward popular but
-    shuffled from a wider shortlist. On subsequent runs, swaps out
-    rotation_percent of the current tracks (least-played first) for fresh
-    picks from the pool, respecting a one-rotation cooldown on what was
-    just removed. Returns (final_tracks, removed_tracks).
+    Rotation for one part of a Live Mix. First run (or nothing carries
+    over): picks target_size tracks with _pick_tracks. Later runs:
+      - removes rotation_percent of the current tracks (of what's actually
+        in the mix, not of target_size), the ones that have
+        been in the mix the longest first (`ages` = runs in the mix), then
+        the least played — so every track stays roughly 100/rotation_percent
+        days and the popular/random balance holds over time;
+      - drops kept tracks that break the artist cap (e.g. after the cap was
+        tightened);
+      - refills with _pick_tracks from the pool, skipping what was just
+        removed (one-rotation cooldown) unless the pool is too small.
+    `artist_counts` is shared across parts and updated in place.
+    Returns (final_tracks, removed_tracks).
     """
+    artist_counts = artist_counts if artist_counts is not None else defaultdict(int)
+    ages = ages or {}
     if target_size <= 0 or not pool:
         return [], []
 
     current_tracks = [pool[k] for k in current_keys if k in pool]
-
     if not current_tracks:
-        ranked = sorted(pool.values(), key=lambda t: getattr(t, "viewCount", 0) or 0, reverse=True)
-        shortlist = ranked[: max(target_size * 3, target_size)]
-        random.shuffle(shortlist)
-        return shortlist[:target_size], []
+        return _pick_tracks(pool.values(), target_size, popular_share, cap, artist_counts), []
 
-    rotation_count = max(1, round(target_size * rotation_percent / 100))
-    rotation_count = min(rotation_count, len(current_tracks))
-
-    sorted_current = sorted(
-        current_tracks, key=lambda t: (getattr(t, "viewCount", 0) or 0, random.random())
+    # Share of what's actually in the mix (it can be shorter than target_size
+    # when the artist cap or a small pool limits it).
+    rotation_count = max(1, round(len(current_tracks) * rotation_percent / 100))
+    by_age = sorted(
+        current_tracks,
+        key=lambda t: (-ages.get(str(t.ratingKey), 0), getattr(t, "viewCount", 0) or 0, random.random()),
     )
-    removed = sorted_current[:rotation_count]
-    kept = sorted_current[rotation_count:]
+    removed = by_age[:rotation_count]
+    kept = []
+    for t in by_age[rotation_count:]:
+        artist = getattr(t, "grandparentRatingKey", None)
+        if cap and artist is not None and artist_counts[artist] >= cap:
+            removed.append(t)
+            continue
+        artist_counts[artist] += 1
+        kept.append(t)
+
+    need = target_size - len(kept)
     kept_keys = {t.ratingKey for t in kept}
-
-    candidates = [t for t in pool.values() if t.ratingKey not in kept_keys and t.ratingKey not in recent_retired]
-    if len(candidates) < rotation_count:
-        candidates = [t for t in pool.values() if t.ratingKey not in kept_keys]
-    random.shuffle(candidates)
-    added = candidates[:rotation_count]
-
-    final = kept + added
-
-    # If the pool is smaller than target_size, pad out from whatever's left.
-    if len(final) < target_size:
-        final_keys = {t.ratingKey for t in final}
-        extra = [t for t in pool.values() if t.ratingKey not in final_keys]
-        random.shuffle(extra)
-        final += extra[: target_size - len(final)]
-
-    return final, removed
+    removed_keys = {t.ratingKey for t in removed}
+    candidates = [t for t in pool.values()
+                  if t.ratingKey not in kept_keys and t.ratingKey not in removed_keys
+                  and t.ratingKey not in recent_retired]
+    added = _pick_tracks(candidates, need, popular_share, cap, artist_counts)
+    if len(added) < need:  # pool too small for the cooldown — allow just-removed tracks back
+        added_keys = {t.ratingKey for t in added}
+        backup = [t for t in pool.values() if t.ratingKey not in kept_keys and t.ratingKey not in added_keys]
+        added += _pick_tracks(backup, need - len(added), popular_share, cap, artist_counts)
+    return kept + added, removed
 
 
 # --- Batch runner --------------------------------------------------------

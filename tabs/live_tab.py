@@ -104,8 +104,13 @@ def _render_unified_overview(plex_url, plex_token, debug_box):
                     f"{round(sub.get('cluster_ratio', 0.67) * 100)}% cluster / "
                     f"{round((1 - sub.get('cluster_ratio', 0.67)) * 100)}% sonic"
                 )
-                status_bits.append(f"rotation {sub.get('rotation_percent', 30)}%")
+                status_bits.append(f"rotation {sub.get('rotation_percent', lp.DEFAULT_ROTATION_PERCENT)}%")
                 status_bits.append(f"target {sub.get('target_size', 30)} tracks")
+                status_bits.append(f"≤{round(sub.get('max_artist_share', lp.DEFAULT_MAX_ARTIST_SHARE) * 100)}% "
+                                   f"per artist")
+                status_bits.append(f"{round(sub.get('popular_share', lp.DEFAULT_POPULAR_SHARE) * 100)}% popular")
+                if sub.get("dj_order", True):
+                    status_bits.append("DJ order")
                 if sub.get("drift") is not None:
                     status_bits.append(f"cluster changed {round(sub['drift'] * 100)}% since subscribed")
             if sub.get("last_run"):
@@ -178,13 +183,26 @@ def _render_unified_overview(plex_url, plex_token, debug_box):
                     )
                     e_rotation_pct = st.slider(
                         "Daily rotation %", min_value=5, max_value=100, step=5,
-                        value=sub.get("rotation_percent", 30), key=f"edit_rot_{sub['id']}"
+                        value=sub.get("rotation_percent", lp.DEFAULT_ROTATION_PERCENT), key=f"edit_rot_{sub['id']}"
                     )
+                    e_artist_pct = st.slider(
+                        "Max per artist %", min_value=0, max_value=100,
+                        value=round(sub.get("max_artist_share", lp.DEFAULT_MAX_ARTIST_SHARE) * 100),
+                        key=f"edit_artist_pct_{sub['id']}", help="0 = no limit.",
+                    )
+                    e_popular_pct = st.slider(
+                        "Popular %", min_value=0, max_value=100, step=5,
+                        value=round(sub.get("popular_share", lp.DEFAULT_POPULAR_SHARE) * 100),
+                        key=f"edit_pop_{sub['id']}",
+                    )
+                    e_dj = st.checkbox("🎚️ DJ order", value=sub.get("dj_order", True), key=f"edit_dj_{sub['id']}")
                     if st.button("💾 Save changes", key=f"edit_save_{sub['id']}", use_container_width=True):
                         lp.update_subscription_settings(
                             sub["kind"], sub["id"],
                             target_size=int(e_target_size), rotation_percent=int(e_rotation_pct),
                             cluster_ratio=e_cluster_pct / 100, sonic_seed_count=int(e_sonic_seeds),
+                            max_artist_share=e_artist_pct / 100, popular_share=e_popular_pct / 100,
+                            dj_order=bool(e_dj),
                         )
                         st.success("Saved — will apply on the next run.")
                         st.rerun()
@@ -217,9 +235,19 @@ def _render_cluster_save_section(plex, plex_url, plex_token, debug_box):
                 key=f"live_overview_seeds_{cluster_name}"
             )
             live_rotation_pct = st.slider(
-                "Daily rotation %", min_value=5, max_value=100, value=85, step=5,
+                "Daily rotation %", min_value=5, max_value=100, value=lp.DEFAULT_ROTATION_PERCENT, step=5,
                 key=f"live_overview_rot_{cluster_name}"
             )
+            live_artist_pct = st.slider(
+                "Max per artist %", min_value=0, max_value=100,
+                value=round(lp.DEFAULT_MAX_ARTIST_SHARE * 100), key=f"live_overview_artist_{cluster_name}",
+                help="0 = no limit.",
+            )
+            live_popular_pct = st.slider(
+                "Popular %", min_value=0, max_value=100, value=round(lp.DEFAULT_POPULAR_SHARE * 100), step=5,
+                key=f"live_overview_pop_{cluster_name}",
+            )
+            live_dj = st.checkbox("🎚️ DJ order", value=True, key=f"live_overview_dj_{cluster_name}")
 
             if st.button("🎧 Save as Live Mix", key=f"live_overview_save_{cluster_name}", use_container_width=True):
                 live_name = f"[Mix] {cluster_name}"
@@ -230,7 +258,8 @@ def _render_cluster_save_section(plex, plex_url, plex_token, debug_box):
                             plex, plex_url, plex_token, cluster_name, live_name,
                             target_size=live_target_size, rotation_percent=live_rotation_pct,
                             cluster_ratio=live_cluster_pct / 100, sonic_seed_count=live_sonic_seeds,
-                            cluster_id=cluster_id, debug=debug_box,
+                            cluster_id=cluster_id, max_artist_share=live_artist_pct / 100,
+                            popular_share=live_popular_pct / 100, dj_order=live_dj, debug=debug_box,
                         )
                         st.success(f"'{live_name}' saved and subscribed — it'll refresh automatically every day.")
                     except Exception as e:

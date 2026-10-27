@@ -32,9 +32,10 @@ organize music across three tools:
 - **🔴 Live Playlists** — subscribe an Artist Mix or a Library Cluster to a
   daily 4am refresh (configurable) so the playlist stays current without
   manual rebuilding. Artist Mixes simply re-run with the same settings each
-  day. Cluster Mixes rotate a percentage of their least-played tracks for
-  new picks from the same artist set each day, keeping the vibe intact
-  while the specific songs change. Runs in the background regardless of
+  day. Cluster Mixes replace 20% of their songs per day (configurable;
+  longest-in-the-mix first) with new picks from the same cluster, keeping
+  the vibe intact while the specific songs change, and play in DJ order:
+  a random first song, then always the most similar-sounding next one. Runs in the background regardless of
   whether the app is open in a browser. Cluster Mixes follow their album
   cluster through renames/merges/splits; a mix whose cluster disappears is
   marked stale and its playlist is deleted at the next weekly curation.
@@ -305,14 +306,20 @@ itself automatically once a day, without opening the app.
   Different songs come out naturally, since the underlying builder already
   shuffles its candidate pool each run.
 - **Cluster Mixes:** rather than re-running Gemini/Louvain daily (which
-  would let the vibe drift over time), the daily refresh keeps the exact
-  artist set already assigned to that cluster in your last saved build, and
-  pulls each of those artists' full catalogs as a rotation pool. Each run
-  swaps out a configurable percentage (`Daily rotation %`) of the *least-
-  played* tracks currently in the playlist for new picks from that same
-  pool — so the artist lineup and overall feel stay identical while the
-  specific songs cycle. A track that just got rotated out won't immediately
-  come back the next run (one-rotation cooldown).
+  would let the vibe drift over time), the daily refresh draws from every
+  track of the cluster's current 🧬 albums, plus a sonic-similarity
+  expansion from outside the cluster.
+  - **Rotation:** each run replaces `Daily rotation %` (default **20%**, so
+    each song stays about 5 days) of the songs that have been in the mix
+    longest. A song that was just rotated out won't come straight back
+    (one-rotation cooldown).
+  - **New picks:** chosen like static cluster playlists — a popular share
+    weighted by play count, the rest at random, and at most `Max per
+    artist %` from one artist across the whole mix.
+  - **DJ order** (on by default): a random first song, then always the
+    remaining song that sounds most like the previous one (Plex sonic
+    analysis, falling back to album-level similarity), avoiding the same
+    artist twice in a row.
 - **Managing subscriptions:** the Live Playlists tab lets you add, enable/
   disable, manually trigger, or remove any subscription — and shows each
   one's last run time, track count, and any error from the most recent

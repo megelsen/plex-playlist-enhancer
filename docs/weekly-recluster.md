@@ -389,6 +389,7 @@ The pool is every track of every album currently in the cluster.
 | Songs | 50 | playlist length |
 | Max per artist (%) | 10 | at most `max(1, ceil(songs × %))` tracks per artist (10% of 50 = 5); 0 = no cap |
 | Popular (%) | 50 | this share is picked by weighted random sampling with weight = plays + 1, so played tracks are likelier but unplayed ones still have a chance; the rest is picked uniformly from the remaining tracks (discovery) |
+| DJ order | on | running order, see below; off = shuffled |
 
 - **Different every time.** The selection is random, so **🎲 Generate
   preview** gives a new set each time. You can play the preview before
@@ -397,9 +398,45 @@ The pool is every track of every album currently in the cluster.
   length (a cluster with few artists), the playlist comes out shorter and
   the preview says why.
 - **Live Mix.** Ticking **Keep it updated daily** saves the playlist as a
-  Live Mix (`[Mix] <cluster>`) instead. Every day it draws the cluster part
-  from the same whole-cluster pool, plus sonic-similarity expansion, and it
+  Live Mix (`[Mix] <cluster>`) instead, with the same three settings. It
   follows the cluster through curation (§9).
+
+**DJ order** (`live_playlists.dj_order`):
+1. **Opener:** a random first song.
+2. **Next song:** the remaining song with the best transition score from
+   the current one:
+   - **Direct sonic match:** `1 + Plex match %/100` when one song is in the
+     other's `sonicallySimilar` list (50 neighbours each).
+   - **Same album:** 0.6.
+   - **Otherwise, album-level similarity** from the cached album features:
+     the sonic-neighbour weight, else tag overlap × 0.5.
+   - **Same artist as the previous song:** −0.5.
+3. **Ties:** broken at random.
+
+This is a greedy path: transitions are smoothest at the start, and the
+last few songs are whatever is left. It costs one `sonicallySimilar` call
+per song.
+
+**Live Mix daily refresh** (`run_cluster_mix_subscription`):
+
+| Part | Share | Pool |
+|---|---|---|
+| Cluster | `cluster_ratio` (67%) of `target_size` | every track of the cluster's albums |
+| Sonic expansion | the rest | `sonicallySimilar` matches from **outside** the cluster, seeded from 10 random songs of today's cluster part, plus yesterday's sonic songs |
+
+- **What gets replaced:** each part replaces `rotation_percent` (default
+  **20%**) of the songs it currently holds. The songs that have been in the
+  mix longest go first (`track_ages`), then the least played.
+- **Artist cap:** kept songs that break the cap are dropped too, for
+  example after you tighten it.
+- **Refill:** `_pick_tracks` refills each part with the same popular/random
+  split and one artist cap across the whole mix. The songs just removed
+  are skipped for one run, unless the pool is too small.
+- **Order:** the result is put in DJ order (or shuffled).
+- **Existing mixes** keep the rotation % they were created with (older
+  mixes used 85%). Change it in 🔴 Live Playlists → ⚙️ Edit configuration.
+  The artist cap and popular split now apply to them with the defaults
+  (10%, 50%).
 
 There are no "tracks per cluster" or "songs per artist per cluster" build
 settings any more: cluster membership and playlist length are independent.

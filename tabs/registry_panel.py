@@ -180,18 +180,25 @@ def _render_playlist_tab(plex, plex_url, plex_token, reg, cid, cluster, count):
     popular_pct = c3.slider("Popular (%)", min_value=0, max_value=100, value=50, step=5, key=f"pl_pop_{cid}",
                             help="This share is picked weighted by your play counts; the rest is picked "
                                  "at random from the whole cluster (discovery).")
+    dj = st.checkbox("🎚️ DJ order", value=True, key=f"pl_dj_{cid}",
+                     help="Random first song, then always the most similar-sounding next song (Plex sonic "
+                          "analysis), avoiding the same artist twice in a row. Off = shuffled.")
 
     make_live = st.checkbox(
         "🎧 Keep it updated daily (Live Mix)", key=f"pl_live_{cid}",
-        help="Rebuilds every day from this cluster's current albums — part whole-cluster, part "
-             "sonic-similarity expansion — and follows the cluster through weekly curation.",
+        help="Every day swaps a share of the songs (oldest first) for new picks made with the settings "
+             "above, part whole-cluster, part sonic-similarity expansion, and follows the cluster through "
+             "weekly curation.",
     )
     if make_live:
         l1, l2, l3 = st.columns(3)
         live_cluster_pct = l1.slider("From the cluster (%)", 10, 100, 67, key=f"pl_live_pct_{cid}",
                                      help="The rest is sonic-similarity expansion from outside the cluster.")
         live_seeds = l2.number_input("Sonic seed songs", 1, 30, 10, key=f"pl_live_seeds_{cid}")
-        live_rotation = l3.slider("Daily rotation (%)", 5, 100, 85, step=5, key=f"pl_live_rot_{cid}")
+        live_rotation = l3.slider("Daily rotation (%)", 5, 100, lp.DEFAULT_ROTATION_PERCENT, step=5,
+                                  key=f"pl_live_rot_{cid}",
+                                  help="Share of the songs replaced each day, longest-in-the-mix first. "
+                                       "20% = each song stays about 5 days.")
         playlist_name = f"[Mix] {name}"
         st.caption(f"Saved as **{playlist_name}**; renamed automatically if the cluster is renamed.")
     else:
@@ -205,7 +212,7 @@ def _render_playlist_tab(plex, plex_url, plex_token, reg, cid, cluster, count):
                 try:
                     previews[cid] = lp.build_cluster_playlist(
                         plex, cid, size=int(size), max_artist_share=artist_pct / 100,
-                        popular_share=popular_pct / 100, registry=reg,
+                        popular_share=popular_pct / 100, dj=dj, registry=reg,
                     )
                 except Exception as e:
                     st.error(f"Couldn't build the playlist: {e}")
@@ -218,13 +225,14 @@ def _render_playlist_tab(plex, plex_url, plex_token, reg, cid, cluster, count):
                             plex, plex_url, plex_token, name, playlist_name, target_size=int(size),
                             rotation_percent=int(live_rotation), cluster_ratio=live_cluster_pct / 100,
                             sonic_seed_count=int(live_seeds), cluster_id=cid,
+                            max_artist_share=artist_pct / 100, popular_share=popular_pct / 100, dj_order=dj,
                         )
                         st.success(f"'{playlist_name}' saved as a Live Mix ({n} songs) — it refreshes daily "
                                    "and shows up in 🔴 Live Playlists.")
                     else:
                         tracks = previews.get(cid) or lp.build_cluster_playlist(
                             plex, cid, size=int(size), max_artist_share=artist_pct / 100,
-                            popular_share=popular_pct / 100, registry=reg,
+                            popular_share=popular_pct / 100, dj=dj, registry=reg,
                         )
                         lp.upsert_playlist(plex, playlist_name, tracks)
                         st.success(f"Saved '{playlist_name}' with {len(tracks)} songs "
