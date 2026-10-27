@@ -88,6 +88,9 @@ DEFAULT_PARAMS = {
     "w_tag": 0.3,
     "w_artist": 0.2,
     # Structure
+    "max_clusters": 0,             # hard cap on clusters (Unclustered not counted); 0 = no cap.
+                                   # Set from the build's "Maximum number of clusters" on commit.
+    "max_splits_per_run": 2,
     "min_cluster_albums": 6,
     "max_cluster_albums": 150,
     "split_min_modularity": 0.30,
@@ -764,6 +767,33 @@ def _name_clusters(reg, feats, cids, labels, plays, api_key=None, debug=None):
 
 # --- Core curation pass -----------------------------------------------
 
+def _merge_pair_ratios(scorer, table, cluster_ids, eligible):
+    """[(cross-affinity / mean cohesion, x, y)] for every pair of eligible
+    clusters, highest first. cross-affinity = mean affinity of each
+    cluster's albums to the other cluster; cohesion = mean affinity of a
+    cluster's albums to itself (all 0..1)."""
+    ids = sorted(c for c in cluster_ids if c != UNCLUSTERED_ID and eligible(c) and scorer.members.get(c))
+    cohesion = {cid: _cohesion(scorer, table, cid) for cid in ids}
+    cross = defaultdict(lambda: defaultdict(float))
+    for cid in ids:
+        for a in scorer.members[cid]:
+            for other, s in table[a].items():
+                if other != cid:
+                    cross[cid][other] += s
+    pairs = []
+    for i, x in enumerate(ids):
+        for y in ids[i + 1:]:
+            nx_, ny_ = len(scorer.members[x]), len(scorer.members[y])
+            inter = (cross[x][y] + cross[y][x]) / (nx_ + ny_)
+            base = (cohesion[x] + cohesion[y]) / 2
+            pairs.append((inter / base if base > 0 else 0.0, x, y))
+    return sorted(pairs, reverse=True)
+
+
+def _non_system_count(clusters):
+    return sum(1 for cid, c in clusters.items() if cid != UNCLUSTERED_ID and not c.get("system"))
+
+
 def curate(reg, store, mode, plays=None, recent_plays=None, penalties=None, only_albums=None,
            api_key=None, debug=None):
     """Runs one curation pass over `reg` IN PLACE.
@@ -844,53 +874,70 @@ def curate(reg, store, mode, plays=None, recent_plays=None, penalties=None, only
 
         graph = _album_graph(feats, set(feats))
 
+        def _merge(survivor, absorbed, reason=None):
+            for a in scorer.members[absorbed]:
+                labels[a] = survivor
+            ev = {"type": "merged", "cluster_id": absorbed, "name": clusters[absorbed].get("name"),
+                  "into": survivor, "into_name": clusters[survivor].get("name")}
+            if reason:
+                ev["reason"] = reason
+            events.append(ev)
+            d(f"└ Merged `{clusters[absorbed].get('name')}` into `{clusters[survivor].get('name')}`"
+              f"{' (cluster cap)' if reason == 'cap' else ''}.")
+            clusters[survivor]["updated_gen"] = gen
+            del clusters[absorbed]
+            scorer.members[survivor] |= scorer.members.pop(absorbed, set())
+
+        def _bigger_first(x, y):
+            return (x, y) if len(scorer.members[x]) >= len(scorer.members[y]) else (y, x)
+
         # 3. Merge near-duplicates: similar by affinity AND not separable in
         # the album graph (otherwise next week's split would undo it).
-        cohesion = {cid: _cohesion(scorer, table, cid) for cid in clusters if cid != UNCLUSTERED_ID}
-        cross = defaultdict(lambda: defaultdict(float))
-        for cid in cohesion:
-            for a in scorer.members.get(cid, ()):
-                for other, s in table[a].items():
-                    if other != cid:
-                        cross[cid][other] += s
-        pairs = []
-        ids = sorted(cohesion)
-        for i, x in enumerate(ids):
-            for y in ids[i + 1:]:
-                if _system_or_locked(x) or _system_or_locked(y):
-                    continue
-                nx_, ny_ = len(scorer.members.get(x, ())), len(scorer.members.get(y, ()))
-                if not nx_ or not ny_ or nx_ + ny_ > p["max_cluster_albums"]:
-                    continue
-                inter = (cross[x][y] + cross[y][x]) / (nx_ + ny_)
-                base = (cohesion[x] + cohesion[y]) / 2
-                if base > 0 and inter >= p["merge_ratio"] * base:
-                    pairs.append((inter / base, x, y))
         touched = set()
-        for _ratio, x, y in sorted(pairs, reverse=True):
+        for ratio, x, y in _merge_pair_ratios(scorer, table, list(clusters), lambda c: not _system_or_locked(c)):
+            if ratio < p["merge_ratio"]:
+                break
             if x in touched or y in touched:
+                continue
+            if len(scorer.members[x]) + len(scorer.members[y]) > p["max_cluster_albums"]:
                 continue
             if not _groups_glue(graph, scorer.members[x], scorer.members[y]):
                 continue
-            survivor, absorbed = (x, y) if len(scorer.members[x]) >= len(scorer.members[y]) else (y, x)
-            for a in scorer.members[absorbed]:
-                labels[a] = survivor
-            events.append({"type": "merged", "cluster_id": absorbed, "name": clusters[absorbed].get("name"),
-                           "into": survivor, "into_name": clusters[survivor].get("name")})
-            d(f"└ Merged `{clusters[absorbed].get('name')}` into `{clusters[survivor].get('name')}`.")
-            clusters[survivor]["updated_gen"] = gen
-            del clusters[absorbed]
+            _merge(*_bigger_first(x, y))
             touched |= {x, y}
         scorer.rebuild(list(clusters))
         table = scorer.score_all()
+
+        # 3b. Enforce the cluster cap: merge the most similar pair (thresholds
+        # ignored) until the count fits. Locked clusters are never merged, so
+        # they can keep the count above the cap.
+        cap = int(p.get("max_clusters") or 0)
+        while cap and _non_system_count(clusters) > cap:
+            pairs = _merge_pair_ratios(scorer, table, list(clusters), lambda c: not _system_or_locked(c))
+            if not pairs:
+                break
+            _ratio, x, y = pairs[0]
+            _merge(*_bigger_first(x, y), reason="cap")
+            touched |= {x, y}
+            scorer.rebuild(list(clusters))
+            table = scorer.score_all()
+
+        def _room():
+            return (cap - _non_system_count(clusters)) if cap else float("inf")
 
         # 4. Split clusters that contain clearly separate groups of albums
         # (Louvain + coalescing, gated by modularity and how much edge
         # weight stays inside the parts). Uniformly connected clusters
         # coalesce back into one group and are left alone — unless they're
         # over max_cluster_albums, which skips coalescing.
+        # Skipped on bootstrap (a commit keeps exactly the clusters you built),
+        # capped per run, and only while there's room under max_clusters.
         created = []
-        for cid in list(clusters):
+        splits_done = 0
+        split_order = sorted(clusters, key=lambda c: len(scorer.members.get(c, ())), reverse=True)
+        for cid in (split_order if mode == "weekly" else []):
+            if splits_done >= p["max_splits_per_run"] or _room() < 1:
+                break
             if _system_or_locked(cid) or cid in touched:
                 continue
             members = scorer.members.get(cid, set())
@@ -915,6 +962,9 @@ def curate(reg, store, mode, plays=None, recent_plays=None, penalties=None, only
                     internal_w += w if part_of[x] == part_of[y] else 0.0
             if not total_w or internal_w / total_w < p["split_min_internal"]:
                 continue
+            room = _room()
+            if room < len(big) - 1:  # keep the largest parts that fit; the rest stay with the original
+                big = big[: 1 + int(room)]
             new_ids = []
             for part in big[1:]:
                 nid = _new_cluster_id()
@@ -924,6 +974,7 @@ def curate(reg, store, mode, plays=None, recent_plays=None, penalties=None, only
                     labels[a] = nid
                 new_ids.append(nid)
             created += new_ids
+            splits_done += 1
             clusters[cid]["updated_gen"] = gen
             events.append({"type": "split", "cluster_id": cid, "name": clusters[cid].get("name"),
                            "new": new_ids, "modularity": round(modularity, 3)})
@@ -939,7 +990,8 @@ def curate(reg, store, mode, plays=None, recent_plays=None, penalties=None, only
         candidates = [g for g in groups if len(g) >= p["min_cluster_albums"]]
         candidates.sort(key=lambda g: sum(plays.get(a, 0) for a in g), reverse=True)
         provisional = []
-        for group in candidates[: p["max_new_clusters"]]:
+        spawn_slots = min(p["max_new_clusters"], _room())
+        for group in candidates[: int(spawn_slots)]:
             nid = _new_cluster_id()
             clusters[nid] = {"name": None, "locked": False, "system": False, "created_gen": gen,
                              "updated_gen": gen, "origin": "spawned", "stats": {}}
@@ -1060,7 +1112,7 @@ def match_lineage(old_members, new_members, min_jaccard=0.5, min_containment=0.5
     return id_map, merged, retired
 
 
-def bootstrap_from_results(plex, results, locked_names=(), api_key=None, debug=None):
+def bootstrap_from_results(plex, results, locked_names=(), api_key=None, max_clusters=None, debug=None):
     """Builds a new registry generation from a Library Clusters build
     (`results` = {cluster_name: [tracks]}) and saves it. Each built
     cluster's artists seed it with ALL their albums; then a full bootstrap
@@ -1078,6 +1130,10 @@ def bootstrap_from_results(plex, results, locked_names=(), api_key=None, debug=N
     gen = (old["generation"] if old else 0) + 1
     reg = empty_registry(old["params"] if old else None)
     reg["generation"] = gen
+    if max_clusters is not None:
+        reg["params"]["max_clusters"] = int(max_clusters)
+    elif not reg["params"].get("max_clusters"):
+        reg["params"]["max_clusters"] = len([n for n in results if n != "Unsorted"])
     _ensure_unclustered(reg)
 
     artist_map = {str(k): v for k, v in build_artist_cluster_map(results).items()}

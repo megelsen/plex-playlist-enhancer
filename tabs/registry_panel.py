@@ -84,7 +84,9 @@ def render(plex, plex_url, plex_token, gemini_api_key):
         n_albums = len(reg["albums"])
         n_unclustered = next((n for cid, _c, n in rows if cid == cr.UNCLUSTERED_ID), 0)
         st.caption(
-            f"Generation **{reg['generation']}** · {len(rows) - 1} clusters · {n_albums} albums "
+            f"Generation **{reg['generation']}** · {len(rows) - 1} clusters"
+            f"{' (cap ' + str(reg['params']['max_clusters']) + ')' if reg['params'].get('max_clusters') else ''}"
+            f" · {n_albums} albums "
             f"({n_unclustered} unclustered) · last updated {reg.get('updated_at')} · "
             f"next weekly curation: {_fmt_time(next_cur)}. New albums are assigned every day "
             f"before the Live Mix refresh."
@@ -198,6 +200,10 @@ def _render_params(reg, busy):
         "min_cluster_albums": st.number_input("Min albums per cluster", 2, 100, int(p["min_cluster_albums"])),
         "max_cluster_albums": st.number_input("Max albums per cluster (bigger ones get split)", 10, 2000,
                                               int(p["max_cluster_albums"])),
+        "max_clusters": st.number_input(
+            "Max clusters (0 = no limit)", 0, 200, int(p.get("max_clusters") or 0),
+            help="Hard cap, Unclustered not counted. Splits and new clusters only happen while there's "
+                 "room; if there are more, the most similar ones are merged at the next curation."),
         "max_new_clusters": st.number_input("Max new clusters per week", 0, 20, int(p["max_new_clusters"])),
         "w_sonic": st.slider("Weight: sonic", 0.0, 1.0, float(p["w_sonic"]), 0.05),
         "w_tag": st.slider("Weight: tags", 0.0, 1.0, float(p["w_tag"]), 0.05),

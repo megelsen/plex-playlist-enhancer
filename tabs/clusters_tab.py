@@ -608,12 +608,13 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
     # every album once.
     registry_busy = cluster_registry.get_job_status()["running"]
     if st.button("📌 Commit build as album clusters", use_container_width=True, disabled=registry_busy,
-                 help="Replaces the 🧬 album clusters with this build (merges included). Existing Live "
+                 help="Replaces the 🧬 album clusters with this build (merges included), and sets their "
+                      "cluster cap to 'Maximum number of clusters' above. Existing Live "
                       "Mixes follow their cluster by album overlap; mixes whose cluster disappears are "
                       "marked stale and deleted at the next weekly curation."):
         started = cluster_registry.run_background_job(
             "Commit build", curation.commit_build, plex, cluster_results,
-            locked_names=locked_clusters, api_key=gemini_api_key,
+            locked_names=locked_clusters, api_key=gemini_api_key, max_clusters=total_clusters,
         )
         if not started:
             st.warning("Another cluster job is already running.")

@@ -142,7 +142,9 @@ def _check_guardrails(before, after, stats):
     prior_assigned = sum(1 for e in before["albums"].values() if cr._assigned(e.get("cluster")))
     moved_share = stats["moved"] / prior_assigned if prior_assigned else 0.0
     prior_clusters = [c for c in before["clusters"] if c != cr.UNCLUSTERED_ID]
-    structural = sum(1 for e in stats["events"] if e["type"] in ("retired", "merged"))
+    # Merges forced by the cluster cap are what you asked for, so they don't count.
+    structural = sum(1 for e in stats["events"]
+                     if e["type"] in ("retired", "merged") and e.get("reason") != "cap")
     allowed = max(1, int(len(prior_clusters) * p["guard_max_structural_share"]))
     problems = []
     if moved_share > p["guard_max_moved_share"]:
@@ -229,14 +231,15 @@ def run_weekly_curation(plex_url=None, plex_token=None, api_key=None, debug=None
         _save_report(report)
 
 
-def commit_build(plex, results, locked_names=(), api_key=None, debug=None):
+def commit_build(plex, results, locked_names=(), api_key=None, max_clusters=None, debug=None):
     """UI: turns the current Library Clusters build into a new registry
     generation. Stale mixes are only marked; the weekly curation deletes them.
     Callers hold cluster_registry.JOB_LOCK."""
     old = cr.load_registry()
     if old:
         cr.snapshot_registry(old)
-    boot = cr.bootstrap_from_results(plex, results, locked_names=locked_names, api_key=api_key, debug=debug)
+    boot = cr.bootstrap_from_results(plex, results, locked_names=locked_names, api_key=api_key,
+                                     max_clusters=max_clusters, debug=debug)
     reg = cr.load_registry()
     marked = lp.apply_cluster_events(boot["events"], reg)
     _save_report({

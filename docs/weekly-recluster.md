@@ -114,8 +114,17 @@ Run order inside `cluster_registry.curate()`:
 
    The bigger cluster survives and keeps its ID and name. A cluster is
    merged at most once per run.
-4. **Split.** Applies to any cluster with at least 2 × `min_cluster_albums`
-   albums that wasn't just merged:
+3b. **Cluster cap.** While there are more than `max_clusters` clusters
+   (`Unclustered` not counted), the most similar pair is merged. The
+   `merge_ratio` and graph tests are ignored here. Locked clusters are never
+   merged, so they can keep the count above the cap. These merges are marked
+   `reason: "cap"` and don't count toward the weekly guardrail.
+4. **Split.** Weekly runs only: a commit keeps exactly the clusters you
+   built. At most `max_splits_per_run` splits per run, largest clusters
+   first, and only while there is room under `max_clusters`. If there is
+   room for only some of the parts, the largest ones are split off and the
+   rest stay in the original cluster. Applies to any cluster with at least
+   2 × `min_cluster_albums` albums that wasn't just merged:
    - Louvain runs on its album graph, and the communities are then
      **coalesced**.
    - It splits only if:
@@ -128,7 +137,9 @@ Run order inside `cluster_registry.curate()`:
 5. **Spawn.** Louvain runs over **Unclustered** albums (at resolution 0.5),
    and the communities are coalesced.
    - Communities of at least `min_cluster_albums` become candidates, most
-     played first, up to `max_new_clusters`.
+     played first, up to `max_new_clusters` **and** the room left under
+     `max_clusters`. When the build already filled the cap, leftovers stay
+     in `Unclustered` until you raise the cap.
    - A candidate is kept only if its albums' mean affinity to it reaches
      `spawn_cohesion`.
 6. **Final pass.** Remaining Unclustered albums try again against all
@@ -314,6 +325,8 @@ ones are editable in 🧬 → ⚙️ Curation settings.
 | `eject_threshold` | 0.15 | below this (and nothing ≥ threshold) → Unclustered |
 | `max_move_share` | 0.10 | max share of a cluster's albums leaving per week |
 | `w_sonic` / `w_tag` / `w_artist` | 0.5 / 0.3 / 0.2 | affinity weights |
+| `max_clusters` | from the build | hard cap on clusters, set to the build's "Maximum number of clusters" when you commit; 0 = no cap |
+| `max_splits_per_run` | 2 | splits per weekly run |
 | `min_cluster_albums` | 6 | smaller clusters retire; min size of a split part or new cluster |
 | `max_cluster_albums` | 150 | merges never exceed it; bigger clusters get split |
 | `split_min_modularity` | 0.30 | min modularity for a split |
@@ -335,6 +348,9 @@ different hash seeds, all passing):
 - Thin clusters retire.
 - Two halves of one genre merge.
 - Two genres combined in one cluster split back apart.
+- A cap of 15 holds through a commit and repeated weekly runs. A registry
+  that had grown to 36 merges back to 15, with every genre whole again and
+  no guardrail abort.
 - Three weekly runs on a stable library change nothing.
 - Stale mixes are re-pointed, marked, and deleted by ratingKey.
 
