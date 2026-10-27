@@ -33,7 +33,7 @@ from plexapi.server import PlexServer
 
 import cluster_registry as cr
 import live_playlists as lp
-from clustering import load_cluster_results_cache
+from clustering import apply_merge_plan, load_build_cache, load_cluster_results_cache
 
 logger = logging.getLogger("curation")
 
@@ -170,12 +170,20 @@ def run_weekly_curation(plex_url=None, plex_token=None, api_key=None, debug=None
 
         reg = cr.load_registry()
         if reg is None:
-            results, _mapping, _saved = load_cluster_results_cache(plex, debug=debug)
-            if not results:
-                report.update(status="skipped", reason="No cluster registry and no saved Library Clusters build yet.")
-                return report
-            d("**No registry yet — bootstrapping from the last saved Library Clusters build.**")
-            boot = cr.bootstrap_from_results(plex, results, api_key=api_key, debug=debug)
+            build, merge_plan = load_build_cache()
+            if build:
+                build = apply_merge_plan(build, merge_plan)
+                d("**No registry yet — bootstrapping from the last saved Library Clusters build.**")
+                boot = cr.bootstrap_from_seeds(plex, build["clusters"], locked_names=build.get("locked", ()),
+                                               api_key=api_key, max_clusters=build.get("total_clusters"),
+                                               debug=debug)
+            else:
+                results, _mapping, _saved = load_cluster_results_cache(plex, debug=debug)
+                if not results:
+                    report.update(status="skipped", reason="No cluster registry and no saved Library Clusters build yet.")
+                    return report
+                d("**No registry yet — bootstrapping from the last saved (legacy) Library Clusters build.**")
+                boot = cr.bootstrap_from_results(plex, results, api_key=api_key, debug=debug)
             reg = cr.load_registry()
             lp.apply_cluster_events(boot["events"], reg)
             report["bootstrapped_generation"] = boot["generation"]
@@ -231,15 +239,16 @@ def run_weekly_curation(plex_url=None, plex_token=None, api_key=None, debug=None
         _save_report(report)
 
 
-def commit_build(plex, results, locked_names=(), api_key=None, max_clusters=None, debug=None):
-    """UI: turns the current Library Clusters build into a new registry
-    generation. Stale mixes are only marked; the weekly curation deletes them.
-    Callers hold cluster_registry.JOB_LOCK."""
+def commit_build(plex, build, api_key=None, debug=None):
+    """UI: turns a Library Clusters build (merge plan already applied) into a
+    new registry generation, seeded from the build's FULL album membership
+    and capped at the build's cluster count. Stale mixes are only marked;
+    the weekly curation deletes them. Callers hold cluster_registry.JOB_LOCK."""
     old = cr.load_registry()
     if old:
         cr.snapshot_registry(old)
-    boot = cr.bootstrap_from_results(plex, results, locked_names=locked_names, api_key=api_key,
-                                     max_clusters=max_clusters, debug=debug)
+    boot = cr.bootstrap_from_seeds(plex, build["clusters"], locked_names=build.get("locked", ()),
+                                   api_key=api_key, max_clusters=build.get("total_clusters"), debug=debug)
     reg = cr.load_registry()
     marked = lp.apply_cluster_events(boot["events"], reg)
     _save_report({

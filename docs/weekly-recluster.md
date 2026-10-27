@@ -9,9 +9,9 @@ Album clusters** and **🔴 Live Playlists**.
 
 ## 1. Why a registry
 
-A Library Clusters build (`clustering.build_genre_clusters`) is a one-off
-grouping. It stores only a ~30-track display sample per cluster and identifies
-clusters by **name**. That caused three problems:
+A Library Clusters build used to be a one-off grouping. It stored only a
+~30-track display sample per cluster and identified clusters by **name**. That
+caused three problems:
 
 - Most albums were not in any stored cluster.
 - Rebuilding or renaming a cluster broke its Live Mix ("Cluster not found"
@@ -23,14 +23,35 @@ The registry fixes all three:
 | | Build (clustering.py) | Registry (cluster_registry.py) |
 |---|---|---|
 | Unit | tracks (tags mode) / artists (relational mode) | **albums** |
-| Coverage | ~30 sample tracks per cluster | **every album** in the library |
+| Coverage | full album membership of the build's clusters (unsorted albums left out) | **every album** in the library |
 | Identity | cluster name | **stable `cluster_id`** (`c_xxxxxxxxxx`) |
 | Updated | manually | **daily** (new albums) + **weekly** (curation) |
 | Leftovers | `Unsorted` / dropped communities | new clusters, else the `Unclustered` system cluster |
 
-The build is still how you *seed* clusters. Click **📌 Commit build as album
-clusters** under Results to turn the current build (merges included) into a
-registry generation.
+The build (`clustering.build_clusters`) is how you *seed* clusters. It returns
+each cluster's **full album membership** over the whole library:
+
+- **Tags mode:** every track is sorted by its tags, and each album goes to
+  the cluster that holds most of its tracks. An artist whose albums span
+  genres is split per album.
+- **Relational mode:** each Louvain community brings **all** albums of all
+  its artists.
+
+Review the build in **🛠️ Build clusters → 4. Review & commit**: albums,
+artists, plays and top artists per cluster, and optionally combine
+clusters. Then click **📌 Commit as album clusters**.
+
+**What the commit does:**
+- It seeds a new registry generation with exactly that membership, merges
+  included.
+- It sets the cluster cap to the build's "Maximum number of clusters".
+- It then scores every album. A seeded album only moves if another cluster
+  clearly fits better; unseeded albums join by threshold or go to
+  `Unclustered`.
+
+**Playlists:** they are made from the committed clusters (🧬 → a cluster →
+🎧 Playlist) and draw on **every track of every album** in the cluster.
+See §12.
 
 ---
 
@@ -355,3 +376,31 @@ different hash seeds, all passing):
 - Stale mixes are re-pointed, marked, and deleted by ratingKey.
 
 None of this has been run against a real Plex server yet.
+
+---
+
+## 12. Playlists from a cluster
+
+🧬 → open a cluster → **🎧 Playlist** (`live_playlists.build_cluster_playlist`).
+The pool is every track of every album currently in the cluster.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Songs | 50 | playlist length |
+| Max per artist (%) | 10 | at most `max(1, ceil(songs × %))` tracks per artist (10% of 50 = 5); 0 = no cap |
+| Popular (%) | 50 | this share is picked by weighted random sampling with weight = plays + 1, so played tracks are likelier but unplayed ones still have a chance; the rest is picked uniformly from the remaining tracks (discovery) |
+
+- **Different every time.** The selection is random, so **🎲 Generate
+  preview** gives a new set each time. You can play the preview before
+  **💾 Save to Plex**, which replaces an existing playlist with the same name.
+- **Shorter playlists.** If the per-artist cap can't fill the requested
+  length (a cluster with few artists), the playlist comes out shorter and
+  the preview says why.
+- **Live Mix.** Ticking **Keep it updated daily** saves the playlist as a
+  Live Mix (`[Mix] <cluster>`) instead. Every day it draws the cluster part
+  from the same whole-cluster pool, plus sonic-similarity expansion, and it
+  follows the cluster through curation (§9).
+
+There are no "tracks per cluster" or "songs per artist per cluster" build
+settings any more: cluster membership and playlist length are independent.
+

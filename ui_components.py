@@ -6,7 +6,7 @@ from plex_helpers import get_stream_url
 from recommendations import generate_playlist_vibe_recommendations
 
 
-def render_track_row(track, idx, key_prefix, mode, plex_url, plex_token, current_playlist=None, cluster_name=None, plex=None, debug_box=None):
+def render_track_row(track, idx, key_prefix, mode, plex_url, plex_token, current_playlist=None, plex=None, debug_box=None):
     """
     Shared row renderer used by the Playlist Enhancer, Artist Mix, and
     Library Clusters tabs: cover + play/pause + action button on one line,
@@ -18,13 +18,6 @@ def render_track_row(track, idx, key_prefix, mode, plex_url, plex_token, current
     mode='mix': action button removes the track from
         st.session_state['artist_mix_result'] (no Plex write — just curating
         the in-progress mix before saving it).
-    mode='cluster': action button records the track's ratingKey in
-        st.session_state['cluster_removed_keys'][cluster_name] (requires
-        cluster_name) instead of popping it from a results list directly —
-        the Library Clusters tab recomputes its merged view fresh from the
-        raw fine-grained build plus the current merge plan on every run, so
-        a direct pop would get silently undone; tracking removed keys
-        separately lets them persist across merge-plan changes too.
     mode='view': read-only row — no destructive action, action_col stays
         empty so layout still lines up with play_col.
     """
@@ -92,11 +85,6 @@ def render_track_row(track, idx, key_prefix, mode, plex_url, plex_token, current
         elif mode == 'mix':
             if st.button("\u2715\uFE0E", key=f"remove_{key_prefix}_{track.ratingKey}_{idx}"):  # ✕︎
                 st.session_state['artist_mix_result'].pop(idx)
-                st.toast(f"Removed: {track.title}")
-                st.rerun()
-        elif mode == 'cluster':
-            if st.button("\u2715\uFE0E", key=f"remove_{key_prefix}_{track.ratingKey}_{idx}"):  # ✕︎
-                st.session_state.setdefault('cluster_removed_keys', {}).setdefault(cluster_name, set()).add(track.ratingKey)
                 st.toast(f"Removed: {track.title}")
                 st.rerun()
         elif mode == 'view':

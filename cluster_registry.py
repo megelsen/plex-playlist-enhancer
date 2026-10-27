@@ -257,6 +257,19 @@ def list_clusters(reg):
     return rows
 
 
+def artist_cluster_map(reg):
+    """{artist ratingKey (str): cluster name} by majority of the artist's
+    albums (Unclustered ignored) — what Library Galaxy colours nodes by."""
+    feats = load_album_features()["albums"]
+    votes = defaultdict(lambda: defaultdict(int))
+    for a, e in reg["albums"].items():
+        artist_key = (feats.get(a) or {}).get("artist_key")
+        if artist_key and _assigned(e.get("cluster")):
+            votes[artist_key][e["cluster"]] += 1
+    names = {cid: c.get("name") for cid, c in reg["clusters"].items()}
+    return {a: names.get(max(c, key=c.get)) for a, c in votes.items()}
+
+
 def set_cluster_locked(cid, locked):
     reg = load_registry()
     if reg and cid in reg["clusters"] and cid != UNCLUSTERED_ID:
@@ -1112,12 +1125,33 @@ def match_lineage(old_members, new_members, min_jaccard=0.5, min_containment=0.5
     return id_map, merged, retired
 
 
+def seeds_from_track_results(results, feats):
+    """LEGACY (v1 build cache = ~30-track display sample per cluster): each
+    sampled artist seeds its cluster with all its albums."""
+    artist_map = {str(k): v for k, v in build_artist_cluster_map(results).items()}
+    seeds = defaultdict(list)
+    for a, f in feats.items():
+        name = artist_map.get(f["artist_key"])
+        if name and name != "Unsorted":
+            seeds[name].append(a)
+    return dict(seeds)
+
+
 def bootstrap_from_results(plex, results, locked_names=(), api_key=None, max_clusters=None, debug=None):
-    """Builds a new registry generation from a Library Clusters build
-    (`results` = {cluster_name: [tracks]}) and saves it. Each built
-    cluster's artists seed it with ALL their albums; then a full bootstrap
-    curation pass scores every album. If a registry already exists, new
-    clusters inherit old IDs by album overlap so Live Mixes follow them.
+    """LEGACY wrapper for v1 track-sample builds — see bootstrap_from_seeds."""
+    return bootstrap_from_seeds(plex, lambda feats: seeds_from_track_results(results, feats),
+                                locked_names=locked_names, api_key=api_key,
+                                max_clusters=max_clusters, debug=debug)
+
+
+def bootstrap_from_seeds(plex, seeds, locked_names=(), api_key=None, max_clusters=None, debug=None):
+    """Builds a new registry generation from a Library Clusters build and
+    saves it. `seeds` = {cluster_name: [album keys]} — the build's FULL
+    membership (or a callable feats -> seeds). Seeded albums start in their
+    cluster; then a full bootstrap curation pass scores every album (seeds
+    that clearly fit elsewhere move, unseeded albums join by threshold).
+    If a registry already exists, new clusters inherit old IDs by album
+    overlap so Live Mixes follow them.
     Returns {"events": [...], "stats": {...}, "generation": n}."""
     d = _writer(debug)
     section = get_music_section(plex)
@@ -1128,29 +1162,33 @@ def bootstrap_from_results(plex, results, locked_names=(), api_key=None, max_clu
 
     old = load_registry()
     gen = (old["generation"] if old else 0) + 1
+    if callable(seeds):
+        seeds = seeds(feats)
+    seeds = {name: keys for name, keys in seeds.items() if name != "Unsorted" and keys}
+
     reg = empty_registry(old["params"] if old else None)
     reg["generation"] = gen
     if max_clusters is not None:
         reg["params"]["max_clusters"] = int(max_clusters)
     elif not reg["params"].get("max_clusters"):
-        reg["params"]["max_clusters"] = len([n for n in results if n != "Unsorted"])
+        reg["params"]["max_clusters"] = len(seeds)
     _ensure_unclustered(reg)
 
-    artist_map = {str(k): v for k, v in build_artist_cluster_map(results).items()}
     locked_set = {n.lower() for n in locked_names}
+    seed_of = {}
     temp_ids = {}
-    for name in results:
-        if name == "Unsorted":
-            continue
+    for name, keys in seeds.items():
         tid = _new_cluster_id()
         temp_ids[name] = tid
         reg["clusters"][tid] = {"name": name, "locked": name.lower() in locked_set, "system": False,
                                 "created_gen": gen, "updated_gen": gen, "origin": "bootstrap", "stats": {}}
-    for a, f in feats.items():
-        name = artist_map.get(f["artist_key"])
-        reg["albums"][a] = {"cluster": temp_ids.get(name, UNCLUSTERED_ID) if name else UNCLUSTERED_ID}
-    d(f"**Bootstrap gen {gen}:** {len(temp_ids)} seeded clusters from the build, "
-      f"{sum(1 for e in reg['albums'].values() if _assigned(e['cluster']))} of {len(feats)} albums seeded.")
+        for a in keys:
+            seed_of[str(a)] = tid
+    for a in feats:
+        reg["albums"][a] = {"cluster": seed_of.get(a, UNCLUSTERED_ID)}
+    seeded = sum(1 for e in reg["albums"].values() if _assigned(e["cluster"]))
+    d(f"**Bootstrap gen {gen}:** {len(temp_ids)} clusters from the build, "
+      f"{seeded} of {len(feats)} albums seeded.")
 
     stats = curate(reg, store, mode="bootstrap", api_key=api_key, debug=debug)
 

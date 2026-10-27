@@ -8,12 +8,11 @@ survive container restarts:
     shuffles internally — no special rotation logic needed here.
 
   - "cluster_mix": re-generating from scratch (re-running Gemini/Louvain)
-    would let the vibe drift day to day, so instead this keeps the SAME
-    artist set that's already assigned to the cluster (read from the
-    existing Library Clusters disk cache via build_artist_cluster_map).
+    would let the vibe drift day to day, so instead this draws from the
+    cluster's CURRENT album membership in the album cluster registry
+    (cluster_registry.py) — every track of every album in the cluster.
     The playlist is composed of two rotating parts:
-      - ~cluster_ratio (default 67%) seeded directly from those artists'
-        full catalogs.
+      - ~cluster_ratio (default 67%) drawn from that whole-cluster pool.
       - the remainder expanded via Plex's sonic-similarity hub, seeded
         from `sonic_seed_count` (default 10) tracks drawn from the
         cluster-seeded part just picked that run.
@@ -44,6 +43,7 @@ Both jobs (daily refresh, weekly curation) run on SCHEDULER_TZ
 
 import json
 import logging
+import math
 import os
 import random
 import threading
@@ -58,7 +58,10 @@ from plexapi.server import PlexServer
 
 import cluster_registry as cr
 from artist_mix import build_artist_mix
-from clustering import CLUSTER_RESULTS_CACHE_PATH, build_artist_cluster_map, load_cluster_results_cache
+from clustering import (
+    CLUSTER_RESULTS_CACHE_PATH, apply_merge_plan, build_artist_cluster_map, load_build_cache,
+    load_cluster_results_cache,
+)
 
 LIVE_PLAYLISTS_PATH = os.environ.get("LIVE_PLAYLISTS_PATH", "/app/data/live_playlists.json")
 
@@ -358,13 +361,38 @@ def run_artist_mix_subscription(sub, plex, debug=None):
 
 # --- Cluster Mix rotation ----------------------------------------------
 
+def _album_tracks_pool(plex, album_keys):
+    pool = {}
+    for ak in album_keys:
+        try:
+            for t in plex.fetchItem(int(ak)).tracks():
+                pool[t.ratingKey] = t
+        except Exception:
+            continue
+    return pool
+
+
 def _gather_cluster_pool(plex, cluster_name, debug=None):
     """
-    Artists already assigned to `cluster_name` (per the last saved cluster
-    build), expanded to their full track catalogs. Returns {ratingKey: track}.
-    Raises ValueError if the cluster can't be found — most commonly because
-    Library Clusters hasn't been built/saved yet.
+    Fallback for mixes on a build that was never committed to the album
+    cluster registry: every track of the cluster's albums in the last saved
+    build (v2), or — for a legacy v1 cache — the full catalogs of the
+    artists in the old track sample. Returns {ratingKey: track}. Raises
+    ValueError if the cluster can't be found.
     """
+    build, merge_plan = load_build_cache()
+    if build:
+        build = apply_merge_plan(build, merge_plan)
+        if cluster_name not in build["clusters"]:
+            raise ValueError(
+                f"Cluster '{cluster_name}' not found in the last saved cluster build — "
+                "open Library Clusters, build and commit clusters first."
+            )
+        pool = _album_tracks_pool(plex, build["clusters"][cluster_name])
+        if not pool:
+            raise ValueError(f"Resolved zero tracks for cluster '{cluster_name}'.")
+        return pool
+
     results, _tag_mapping, _saved = load_cluster_results_cache(plex, debug=debug)
     if not results or cluster_name not in results:
         raise ValueError(
@@ -395,16 +423,56 @@ def _registry_cluster_pool(plex, registry, cluster_id):
     """Every track of every album the registry currently assigns to
     `cluster_id`. Returns ({ratingKey: track}, [album keys])."""
     album_keys = cr.cluster_album_keys(registry, cluster_id)
-    pool = {}
-    for ak in album_keys:
-        try:
-            for t in plex.fetchItem(int(ak)).tracks():
-                pool[t.ratingKey] = t
-        except Exception:
-            continue
+    pool = _album_tracks_pool(plex, album_keys)
     if not pool:
         raise ValueError(f"Resolved zero tracks for cluster '{registry['clusters'][cluster_id]['name']}'.")
     return pool, album_keys
+
+
+def build_cluster_playlist(plex, cluster_id, size=50, max_artist_share=0.10, popular_share=0.5, registry=None):
+    """A playlist drawn from EVERY track of every album in the cluster:
+      - popular_share of `size` picked by weighted random sampling, weight =
+        plays + 1 (viewCount; the +1 gives unplayed tracks a chance),
+      - the rest picked uniformly from the remaining tracks (discovery),
+      - at most max(1, ceil(size * max_artist_share)) tracks per artist
+        (0 = no cap).
+    Returns a shuffled track list; shorter than `size` only if the cluster
+    can't fill it under the artist cap. Tracks get a recommendation_type of
+    "<cluster> (Popular)" / "(Discovery)" for display."""
+    registry = registry or cr.load_registry()
+    if not registry or cluster_id not in registry["clusters"]:
+        raise ValueError("Cluster not found in the album cluster registry.")
+    name = registry["clusters"][cluster_id]["name"]
+    pool, _album_keys = _registry_cluster_pool(plex, registry, cluster_id)
+    tracks = list(pool.values())
+
+    cap = max(1, math.ceil(size * max_artist_share)) if max_artist_share else None
+    per_artist = defaultdict(int)
+    picked, picked_keys = [], set()
+
+    def _take(candidates, target, label):
+        for t in candidates:
+            if len(picked) >= target:
+                return
+            artist = getattr(t, "grandparentRatingKey", None)
+            if t.ratingKey in picked_keys or (cap and per_artist[artist] >= cap):
+                continue
+            setattr(t, "recommendation_type", f"{name} ({label})")
+            picked.append(t)
+            picked_keys.add(t.ratingKey)
+            per_artist[artist] += 1
+
+    # Weighted sampling without replacement (Efraimidis–Spirakis): order by
+    # u ** (1 / weight), u ~ U(0, 1) — O(n log n) on large clusters.
+    weighted = sorted(tracks, key=lambda t: random.random() ** (1.0 / ((getattr(t, "viewCount", 0) or 0) + 1)),
+                      reverse=True)
+    _take(weighted, round(size * popular_share), "Popular")
+    rest = [t for t in tracks if t.ratingKey not in picked_keys]
+    random.shuffle(rest)
+    _take(rest, size, "Discovery")
+
+    random.shuffle(picked)
+    return picked
 
 
 def _resolve_cluster_pool(plex, sub, debug=None):

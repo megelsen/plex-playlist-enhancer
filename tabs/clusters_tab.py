@@ -1,150 +1,143 @@
-"""Library Clusters tab: groups the whole library into N genre/mood
-clusters (some locked by name, the rest invented by Gemini — or all
-suggested via the Suggest Clusters step), ranks each cluster's top tracks
-as a blend of popular/sonic/related picks, and lets the user save any
-cluster as a playlist."""
+"""Library Clusters tab, two layers:
+
+  1. 🧬 Album clusters (tabs/registry_panel.py) — the committed, album-level
+     clusters that cover the whole library and are re-curated every week.
+     Playlists and Live Mixes are made here, from every track in a cluster.
+  2. 🛠️ Build clusters — generate a fresh set from scratch (Gemini tag
+     mapping or Relational/Louvain), review the FULL membership (albums,
+     artists, top artists per cluster), optionally combine clusters, then
+     commit. Committing seeds the album clusters with the build's full album
+     membership and caps them at the build's cluster count.
+"""
 
 import streamlit as st
-from math import ceil
 
-from clustering import (
-    build_genre_clusters, get_all_genre_and_mood_tags, suggest_cluster_names, apply_cluster_merge_plan,
-    build_artist_cluster_map, save_cluster_results_cache, load_cluster_results_cache, clear_artist_scan_cache,
-    clear_all_caches,
-)
-from ui_components import render_track_row
 import cluster_registry
 import curation
-import live_playlists
+from clustering import (
+    apply_merge_plan, artist_cluster_map_from_albums, build_clusters, clear_all_caches,
+    clear_artist_scan_cache, get_all_genre_and_mood_tags, load_build_cache, save_build_cache,
+    suggest_cluster_names,
+)
 from tabs import registry_panel
+
+_SESSION_DEFAULTS = {
+    'cluster_build': None,          # raw build dict from clustering.build_clusters
+    'cluster_merge_plan': [],       # [{"members": [...], "new_name": str}, ...]
+    'cluster_locked': "",
+    'suggested_snapshot': None,     # {genre_tags, mood_tags, total_clusters, clusters, mapping}
+    'cluster_tag_counts': None,     # {"genre": n, "mood": n} from the tag scan
+    'cluster_tag_preview': None,
+    'cluster_tag_mapping': None,    # for Library Galaxy
+    'cluster_artist_map': None,     # {artist ratingKey: cluster name}, for Library Galaxy
+}
+
+
+def _init_state():
+    for key, value in _SESSION_DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = value if not isinstance(value, list) else list(value)
+    if 'cluster_cache_checked' not in st.session_state:
+        # Once per session: restore the last build (and its pending merges)
+        # from disk so a restart doesn't lose an uncommitted review.
+        st.session_state['cluster_cache_checked'] = True
+        build, merge_plan = load_build_cache()
+        if build and st.session_state['cluster_build'] is None:
+            st.session_state['cluster_build'] = build
+            st.session_state['cluster_merge_plan'] = merge_plan
+
+
+def _sync_galaxy_state(build):
+    """Library Galaxy colours artists by cluster: the committed album
+    clusters when they exist, else the current build."""
+    reg = cluster_registry.load_registry()
+    if reg:
+        st.session_state['cluster_artist_map'] = cluster_registry.artist_cluster_map(reg)
+        st.session_state['cluster_tag_mapping'] = (build or {}).get('tag_mapping')
+    elif build:
+        st.session_state['cluster_artist_map'] = artist_cluster_map_from_albums(build['clusters'], build['albums'])
+        st.session_state['cluster_tag_mapping'] = build.get('tag_mapping')
 
 
 def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
     st.title("🗂️ Library Clusters")
     st.caption(
-        "Groups your whole library into a handful of sections by genre and mood — "
-        "lock in any clusters you already know you want (or let Gemini suggest a "
-        "full set first), and Gemini sorts every genre/mood tag into one of them."
+        "Your whole library, grouped into album clusters. Make playlists and Live Mixes from any "
+        "cluster below; the clusters themselves are kept up to date automatically (new albums daily, "
+        "re-curation every week). Use 🛠️ Build clusters further down to generate a new set from scratch."
     )
-
-    if 'cluster_results' not in st.session_state:
-        st.session_state['cluster_results'] = None
-    if 'cluster_results_raw' not in st.session_state:
-        st.session_state['cluster_results_raw'] = None
-    if 'cluster_tag_mapping_raw' not in st.session_state:
-        st.session_state['cluster_tag_mapping_raw'] = None
-    if 'cluster_merge_plan' not in st.session_state:
-        st.session_state['cluster_merge_plan'] = []  # [{"members": [...], "new_name": str}, ...]
-    if 'cluster_removed_keys' not in st.session_state:
-        st.session_state['cluster_removed_keys'] = {}  # {cluster_name: {ratingKey, ...}}
-    if 'cluster_names_used' not in st.session_state:
-        st.session_state['cluster_names_used'] = []
-    if 'cluster_locked' not in st.session_state:
-        st.session_state['cluster_locked'] = ""
-    if 'suggested_snapshot' not in st.session_state:
-        st.session_state['suggested_snapshot'] = None  # {tags, total, clusters, mapping}
-    if 'cluster_tag_counts' not in st.session_state:
-        st.session_state['cluster_tag_counts'] = None  # {"genre": n, "mood": n} from last Preview Tags
-    if 'cluster_artist_map' not in st.session_state:
-        st.session_state['cluster_artist_map'] = None  # {artist_ratingKey: cluster_name}, for Library Galaxy
-    if 'cluster_saved_playlists' not in st.session_state:
-        st.session_state['cluster_saved_playlists'] = {}  # {cluster_name: playlist_name}, which clusters are already saved to Plex
-    if 'cluster_cache_checked' not in st.session_state:
-        # Runs once per session: if nothing's been built yet THIS session,
-        # try loading the last build from disk so a restarted app doesn't
-        # show an empty Results section — costs zero Gemini/Plex calls
-        # beyond plex.fetchItem per cached track.
-        st.session_state['cluster_cache_checked'] = True
-        if st.session_state['cluster_results_raw'] is None:
-            cached_results, cached_mapping, cached_saved_playlists = load_cluster_results_cache(plex, debug=debug_box)
-            if cached_results:
-                st.session_state['cluster_results_raw'] = cached_results
-                st.session_state['cluster_tag_mapping_raw'] = cached_mapping
-                st.session_state['cluster_names_used'] = list(cached_results.keys())
-                st.session_state['cluster_artist_map'] = build_artist_cluster_map(cached_results)
-                st.session_state['cluster_saved_playlists'] = cached_saved_playlists or {}
+    _init_state()
 
     try:
-        cluster_music_section = next(s for s in plex.library.sections() if s.type in ['artist', 'music'])
+        music_section = next(s for s in plex.library.sections() if s.type in ['artist', 'music'])
     except StopIteration:
-        cluster_music_section = None
         st.error("No music library section found on this Plex server.")
         st.stop()
 
+    raw_build = st.session_state['cluster_build']
+    build = apply_merge_plan(raw_build, st.session_state['cluster_merge_plan']) if raw_build else None
+    _sync_galaxy_state(build)
+
     registry_panel.render(plex, plex_url, plex_token, gemini_api_key)
 
+    st.write("---")
+    st.header("🛠️ Build clusters")
+    st.caption(
+        "Generates a new set of clusters over the whole library. Nothing changes until you review the "
+        "result and press **📌 Commit as album clusters** — that replaces the 🧬 album clusters above "
+        "(Live Mixes follow their cluster by album overlap)."
+    )
+    _render_clean_slate(debug_box)
+    settings = _render_build_settings(music_section, gemini_api_key)
+    _render_build_step(plex, music_section, gemini_api_key, debug_box, settings)
+
+    raw_build = st.session_state['cluster_build']
+    if raw_build:
+        _render_review(plex, raw_build, gemini_api_key)
+
+
+# --- Clean slate ----------------------------------------------------------
+
+def _render_clean_slate(debug_box):
     with st.expander("🧹 Clean slate", expanded=False):
         st.caption(
-            "Clears every cache this app keeps for Library Clusters \u2014 the tag\u2192cluster "
-            "mapping, per-artist sonic profiles, the saved cluster build, and the in-process "
-            "artist scan \u2014 so the next build starts completely from scratch with zero "
-            "assumptions carried over from before. Doesn't touch anything already saved as a "
-            "Plex playlist, and keeps the album cluster registry (🧬 above) — committing a new "
-            "build replaces that."
+            "Clears the build caches — the tag→cluster mapping, per-artist sonic profiles, the saved "
+            "build and the in-process artist scan — so the next build starts from scratch. Keeps the "
+            "🧬 album clusters and anything already saved as a Plex playlist."
         )
-        if st.button("🧹 Clear all caches and start fresh"):
+        if st.button("🧹 Clear build caches"):
             summary = clear_all_caches(debug=debug_box)
-            resets = {
-                'cluster_results': None,
-                'cluster_results_raw': None,
-                'cluster_tag_mapping': None,
-                'cluster_tag_mapping_raw': None,
-                'cluster_merge_plan': [],
-                'cluster_removed_keys': {},
-                'cluster_names_used': [],
-                'cluster_artist_map': None,
-                'cluster_saved_playlists': {},
-                'cluster_tag_counts': None,
-                'cluster_tag_preview': None,
-                'suggested_snapshot': None,
-                'cluster_results_cache_signature': None,
-            }
-            for key, value in resets.items():
-                st.session_state[key] = value
-            # Stashed for display AFTER the rerun below — a st.success()
-            # called right before st.rerun() never actually gets seen, since
-            # the rerun wipes it before the browser paints it.
+            for key, value in _SESSION_DEFAULTS.items():
+                st.session_state[key] = value if not isinstance(value, list) else list(value)
+            # Shown after the rerun — a message right before st.rerun() is never painted.
             st.session_state['clean_slate_confirmation'] = summary
             st.rerun()
 
     confirmation = st.session_state.pop('clean_slate_confirmation', None)
     if confirmation is not None:
-        cleared_n = len(confirmation['cleared'])
-        missing_n = len(confirmation['missing'])
-        error_n = len(confirmation['errors'])
-        if error_n:
+        if confirmation['errors']:
             st.warning(
-                f"Clean slate mostly finished, but {error_n} file(s) couldn't be removed: "
-                f"{', '.join(p for p, _ in confirmation['errors'])}. Everything else is cleared."
+                f"Clean slate mostly finished, but {len(confirmation['errors'])} file(s) couldn't be removed: "
+                f"{', '.join(p for p, _ in confirmation['errors'])}."
             )
         else:
-            detail = (
-                f"{cleared_n} cache file(s) deleted, {missing_n} already didn't exist "
-                "(nothing to clear there)." if (cleared_n or missing_n) else ""
-            )
-            st.success(f"✅ Clean slate finished — in-process scan cleared, all disk caches reset. {detail}")
+            st.success(f"✅ Build caches cleared ({len(confirmation['cleared'])} file(s) deleted).")
 
-    # --- Step 1: scan the library's tags first. Zero-cost, no API call —
-    # doing this before the settings below means the cluster-count guidance
-    # has real numbers to work with immediately, instead of asking the user
-    # to configure things blind and find the tag scan buried further down.
+
+# --- Settings ---------------------------------------------------------------
+
+def _render_build_settings(music_section, gemini_api_key):
     st.subheader("1. Scan your library")
-    st.caption("Zero-cost — no Gemini call. Run this first so the cluster count below has real numbers to work from.")
+    st.caption("Free — no Gemini call. Gives the cluster count below real numbers to work from.")
     if st.button("👀 Scan genre/mood tags"):
-        # The "Force rescan" toggle lives in Advanced settings further down
-        # (most people never need it) — reading it here by key still works
-        # since Streamlit session_state persists across reruns regardless
-        # of render order.
         if st.session_state.get('force_rescan_artists', False):
             clear_artist_scan_cache()
         with st.spinner("Scanning library tags..."):
-            genre_tags, mood_tags = get_all_genre_and_mood_tags(cluster_music_section)
+            genre_tags, mood_tags = get_all_genre_and_mood_tags(music_section)
         st.session_state['cluster_tag_counts'] = {"genre": len(genre_tags), "mood": len(mood_tags)}
         st.session_state['cluster_tag_preview'] = {"genre_tags": genre_tags, "mood_tags": mood_tags}
-        total_tags = len(genre_tags) + len(mood_tags)
-        suggested_low = max(2, total_tags // 25)
-        suggested_high = max(suggested_low, total_tags // 15)
-        st.session_state['cluster_total'] = min(40, max(2, round((suggested_low + suggested_high) / 2)))
+        low, high = _suggested_range(len(genre_tags) + len(mood_tags))
+        st.session_state['cluster_total'] = min(40, max(2, round((low + high) / 2)))
 
     tag_preview = st.session_state.get('cluster_tag_preview')
     if tag_preview:
@@ -157,546 +150,262 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
             st.write("**Mood tags:**")
             st.code(", ".join(tag_preview['mood_tags']) or "(none found)")
 
-    st.write("---")
-
-    # --- Step 2: pick a cluster count and (optionally) a few vibes. That's
-    # it for required input — clustering method, signal weights, sampling,
-    # and everything else has a sensible auto-picked default and lives in
-    # Advanced settings below for anyone who wants to override it.
     st.subheader("2. Cluster count & vibes")
-    total_clusters_input = st.number_input(
+    total_clusters = int(st.number_input(
         "Maximum number of clusters", min_value=2, max_value=40, value=10, key="cluster_total"
-    )
-    total_clusters = int(total_clusters_input)
+    ))
     st.caption(
-        "A real cap in both modes now: Gemini uses fewer if the library doesn't naturally "
-        "support this many distinct groups (Tags mode), and Relational mode keeps only the "
-        "top this-many mixes, ranked by connection strength and how full they end up."
+        "A real cap: Gemini may use fewer if the library doesn't support this many distinct groups "
+        "(Tags mode), and Relational mode keeps the strongest this-many communities. Committing also "
+        "makes it the album clusters' cap, so weekly curation never grows past it."
     )
     tag_counts = st.session_state['cluster_tag_counts']
     if tag_counts:
         total_tags = tag_counts["genre"] + tag_counts["mood"]
-        suggested_low = max(2, total_tags // 25)
-        suggested_high = max(suggested_low, total_tags // 15)
-        st.caption(
-            f"Rule of thumb: ~1 cluster per 15\u201325 genre/mood tags. Your library has "
-            f"{total_tags} distinct tags (from step 1's scan), suggesting roughly "
-            f"{suggested_low}\u2013{suggested_high} clusters \u2014 the field above defaults "
-            f"to the midpoint of that range; adjust as you like."
-        )
-    else:
-        st.caption(
-            "Tip: run the tag scan in step 1 above to get a suggested cluster range here."
-        )
+        low, high = _suggested_range(total_tags)
+        st.caption(f"Rule of thumb: ~1 cluster per 15–25 genre/mood tags. {total_tags} tags → roughly "
+                   f"{low}–{high} clusters.")
 
     if gemini_api_key:
-        if st.button("🔍 Suggest Clusters"):
-            with st.spinner("Analyzing your library's genres/moods..."):
-                try:
-                    genre_tags, mood_tags = get_all_genre_and_mood_tags(cluster_music_section)
-                    clusters, mapping = suggest_cluster_names(
-                        genre_tags, mood_tags, total_clusters, gemini_api_key
-                    )
-                    st.session_state['suggested_snapshot'] = {
-                        "genre_tags": genre_tags,
-                        "mood_tags": mood_tags,
-                        "total_clusters": total_clusters,
-                        "clusters": clusters,
-                        "mapping": mapping,
-                    }
-                    st.session_state['suggested_review_selection'] = list(clusters)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to suggest clusters: {e}")
-        st.caption(
-            "Suggest Clusters proposes a full set of names from scratch (one Gemini "
-            "call). Review the list below, uncheck any you don't want, then apply \u2014 "
-            "accepting them as-is skips a second Gemini call."
-        )
-
-        snap = st.session_state.get('suggested_snapshot')
-        if snap:
-            st.write(f"**Suggested {len(snap['clusters'])} clusters** \u2014 untick any to drop them:")
-            selected = []
-            cols = st.columns(2)
-            for i, cluster_name in enumerate(snap['clusters']):
-                with cols[i % 2]:
-                    checked = st.checkbox(
-                        cluster_name, value=True, key=f"suggest_review_{cluster_name}"
-                    )
-                    if checked:
-                        selected.append(cluster_name)
-
-            col_apply, col_dismiss = st.columns([1, 1])
-            with col_apply:
-                if st.button("✅ Apply selected as locked clusters", disabled=not selected):
-                    st.session_state['cluster_locked'] = ", ".join(selected)
-                    st.rerun()
-            with col_dismiss:
-                if st.button("✕ Dismiss suggestions"):
-                    st.session_state['suggested_snapshot'] = None
-                    st.rerun()
+        _render_suggest(music_section, total_clusters, gemini_api_key)
 
     locked_input = st.text_input(
         "Cluster vibes / names you want (comma-separated, optional)",
-        placeholder="e.g. Metal, Punk Rock, Classic Rock",
-        key="cluster_locked",
+        placeholder="e.g. Metal, Punk Rock, Classic Rock", key="cluster_locked",
     )
-    st.caption(
-        "Kept exactly as typed and always exist if relevant tags/artists are found. "
-        "Everything else is decided automatically."
-    )
+    st.caption("Kept exactly as typed and always exist if relevant tags/artists are found. Committed "
+               "clusters with these names are locked against weekly curation.")
     locked_clusters = [c.strip() for c in locked_input.split(",") if c.strip()]
 
-    st.write("---")
-
-    # --- Advanced settings: sensible defaults throughout — most people
-    # never need to open this. Clustering method defaults to Relational
-    # (Plex Similar Artist + optional sonic boost — see
-    # clustering.build_relational_graph), which is what actually runs
-    # unless this is opened and changed.
     with st.expander("⚙️ Advanced settings", expanded=False):
-        top_n = st.number_input(
-            "Total tracks per cluster", min_value=3, max_value=90, value=30, key="cluster_top_n",
-        )
-        st.caption(
-            "Split roughly into thirds: popular plays, sonically similar tracks, "
-            "and tracks from related artists \u2014 same blend style as Artist Mix."
-        )
-
-        max_tracks_per_artist = st.number_input(
-            "Max songs per artist, per cluster", min_value=0, max_value=30, value=3,
-            key="cluster_max_per_artist",
-        )
-        st.caption(
-            "Caps how many tracks from the same artist can land in one cluster's final list, "
-            "so one prolific or heavily-played artist can't fill up a whole mix by itself. "
-            "0 = no cap. A hard limit \u2014 if a cluster doesn't have enough different artists "
-            "to hit 'Total tracks per cluster' under this cap, that cluster ends up smaller "
-            "rather than the cap being relaxed."
-        )
-        min_artists_needed = ceil(top_n / max_tracks_per_artist) if max_tracks_per_artist else 1
-
-        clustering_mode_label = st.radio(
+        mode_label = st.radio(
             "Clustering method",
-            options=[
-                "Relational: Plex Similar Artist + sonic (recommended)",
-                "Genre/mood tags only (Gemini)",
-            ],
+            options=["Relational: Plex Similar Artist + sonic (recommended)", "Genre/mood tags only (Gemini)"],
             index=0,
-            horizontal=False,
         )
-        clustering_mode = "tags" if clustering_mode_label.startswith("Genre") else "sonic"
+        clustering_mode = "tags" if mode_label.startswith("Genre") else "sonic"
         st.caption(
-            "**Relational:** mixes are built from Plex's own \u2018Similar Artist\u2019 links "
-            "\u2014 the SAME data 🌌 Library Galaxy visualizes, so a mix here reflects a branch "
-            "you could trace by eye there \u2014 optionally boosted by real audio matching. Tags "
-            "never decide who's grouped together, only what the result is called afterward. "
-            "**Tags only:** every track is assigned purely by its genre/mood tags."
+            "**Relational:** artists are grouped by Plex's 'Similar Artist' links (what 🌌 Library Galaxy "
+            "shows), optionally strengthened by audio matching; each group's artists bring all their "
+            "albums. Tags only name the result. **Tags only:** every track is sorted by its genre/mood "
+            "tags; each album joins the cluster holding most of its tracks."
         )
-
+        settings = {
+            "clustering_mode": clustering_mode, "total_clusters": total_clusters,
+            "locked_clusters": locked_clusters,
+            "sonic_boost": 0.5, "sonic_artist_sample_size": 6, "sonic_use_cache": True,
+            "refine_unsorted": False, "sonic_weight": 0.0, "reassign_tagged_via_sonic": False,
+            "sonic_propagation_rounds": 2,
+        }
         if clustering_mode == "sonic":
-            sonic_boost = st.slider(
-                "Sonic boost", min_value=0.0, max_value=1.0, value=0.5, step=0.05,
-                key="sonic_boost",
-            )
-            st.caption(
-                "How much real audio matching (a few sampled top tracks per artist) can "
-                "strengthen a Similar-Artist link that already exists. It never creates a new "
-                "connection on its own \u2014 0 uses pure Similar-Artist topology."
-            )
-            sonic_artist_sample_size = st.slider(
-                "Sampled tracks per artist", min_value=3, max_value=10, value=6, step=1,
-                key="sonic_artist_sample_size",
-            )
-            st.caption(
-                "How many of an artist's most-played tracks (or Plex-popular, as a fallback "
-                "for artists with no play history) get sonically analyzed."
-            )
-            sonic_use_cache = st.checkbox(
-                "Reuse cached artist profiles", value=True, key="sonic_use_cache",
-            )
-            st.caption(
-                "Unchecking forces every artist's sample tracks to be re-analyzed against Plex "
-                "this build, ignoring any cached profile."
-            )
-            per_artist_display = max_tracks_per_artist or "\u221e"
-            st.caption(
-                f"'Maximum number of clusters' below is a real cap here \u2014 mixes are ranked "
-                f"by how tightly-connected they are and how close they get to filling "
-                f"'Total tracks per cluster' ({top_n}\u00f7{per_artist_display} = "
-                f"{min_artists_needed} artists for a full mix), and only the strongest survive. "
-                "A small, tightly-connected mix can still outrank a bigger, looser one."
-            )
+            settings["sonic_boost"] = st.slider("Sonic boost", 0.0, 1.0, 0.5, 0.05, key="sonic_boost")
+            st.caption("How much audio matching can strengthen an existing Similar-Artist link. It never "
+                       "creates a link on its own — 0 = pure Similar-Artist topology.")
+            settings["sonic_artist_sample_size"] = st.slider("Sampled tracks per artist", 3, 10, 6, 1,
+                                                             key="sonic_artist_sample_size")
+            settings["sonic_use_cache"] = st.checkbox("Reuse cached artist profiles", value=True,
+                                                      key="sonic_use_cache")
         else:
-            sonic_boost = 0.5
-            sonic_artist_sample_size = 6
-            sonic_use_cache = True
-
-        if clustering_mode == "tags":
-            refine_unsorted = st.checkbox(
-                "Refine 'Unsorted' via sonic similarity", value=False,
+            refine = st.checkbox("Refine 'Unsorted' via sonic similarity", value=False)
+            st.caption("Infers a cluster for untagged/unmatched tracks from Plex's sonic neighbours. "
+                       "No Gemini calls, just local Plex lookups.")
+            settings["refine_unsorted"] = refine
+            settings["sonic_weight"] = st.slider("Sonic influence", 0, 100, 0, 10, disabled=not refine) / 100.0
+            settings["reassign_tagged_via_sonic"] = st.checkbox(
+                "Also let sonic evidence reassign already-tagged tracks", value=False, disabled=not refine,
             )
-            st.caption(
-                "Extrapolates genre/mood for 'Unsorted' tracks from Plex's own sonic-similarity "
-                "analysis instead of tags. No extra Gemini calls, just local Plex lookups."
-            )
-
-            sonic_weight_pct = st.slider(
-                "Sonic influence", min_value=0, max_value=100, value=0, step=10,
-                disabled=not refine_unsorted,
-            )
-            sonic_weight = sonic_weight_pct / 100.0
-            st.caption(
-                "How much weight sonic-similarity evidence gets vs. genre/mood tags, for both "
-                "the 'Unsorted' refinement above and (if enabled below) already-tagged tracks. "
-                "0 = original strict thresholds (6+ neighbors agreeing, a clear margin, a real "
-                "majority share of votes). Higher values relax those thresholds so more tracks "
-                "get moved on weaker sonic consensus \u2014 sonic similarity is a noisier signal "
-                "than genre tags, so higher settings trade some accuracy for more reassignments."
-            )
-
-            reassign_tagged_via_sonic = st.checkbox(
-                "Also let sonic evidence reassign already-tagged tracks", value=False,
-                disabled=not refine_unsorted,
-            )
-            st.caption(
-                "Off by default: normally sonic similarity only fills in 'Unsorted' tracks. "
-                "Turn this on to let a strong sonic-neighbor consensus move a track OUT of "
-                "the cluster its genre/mood tags gave it (e.g. correcting a mistagged track) "
-                "\u2014 gated by a stricter bar than Unsorted recovery, since these tracks "
-                "already have real tag evidence behind their current cluster."
-            )
-
-            sonic_propagation_rounds = st.slider(
-                "Sonic propagation rounds", min_value=1, max_value=4, value=2,
-                disabled=not refine_unsorted,
-            )
-            st.caption(
-                "How many passes the sonic-neighbor voting runs. Each round lets tracks that "
-                "flipped clusters in the previous round pass that influence on to their own "
-                "neighbors, so sonic agreement can propagate through a chain of tracks rather "
-                "than only ever comparing to the original tag-based labels once. Each track's "
-                "sonic neighbors are still only fetched from Plex once, no matter how many "
-                "rounds run \u2014 higher values are free in API calls, just slightly slower "
-                "to compute locally."
-            )
-        else:
-            # Sonic mode: membership already comes from the sonic graph itself,
-            # so the tag-refinement knobs above don't apply here.
-            refine_unsorted = False
-            sonic_weight = 0.0
-            reassign_tagged_via_sonic = False
-            sonic_propagation_rounds = 2
-
-        force_rescan = st.checkbox(
+            settings["sonic_propagation_rounds"] = st.slider("Sonic propagation rounds", 1, 4, 2,
+                                                             disabled=not refine)
+        st.checkbox(
             "Force rescan library (ignore cached artist scan)", value=False, key="force_rescan_artists",
-            help="The library's artist list is cached in-memory for a while so repeated scans/builds "
-                 "don't each re-fetch it from Plex separately. Check this if you've added/changed "
-                 "music since your last scan this session and want fresh data immediately.",
+            help="The artist list is cached in memory for a while. Check this if you've just added music.",
         )
+    settings["force_rescan"] = st.session_state.get("force_rescan_artists", False)
+    return settings
 
-    locked_clusters = [c.strip() for c in locked_input.split(",") if c.strip()]
 
-    st.write("---")
+def _suggested_range(total_tags):
+    low = max(2, total_tags // 25)
+    return low, max(low, total_tags // 15)
 
-    # --- Step 3: build.
+
+def _render_suggest(music_section, total_clusters, gemini_api_key):
+    if st.button("🔍 Suggest Clusters"):
+        with st.spinner("Analyzing your library's genres/moods..."):
+            try:
+                genre_tags, mood_tags = get_all_genre_and_mood_tags(music_section)
+                clusters, mapping = suggest_cluster_names(genre_tags, mood_tags, total_clusters, gemini_api_key)
+                st.session_state['suggested_snapshot'] = {
+                    "genre_tags": genre_tags, "mood_tags": mood_tags, "total_clusters": total_clusters,
+                    "clusters": clusters, "mapping": mapping,
+                }
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to suggest clusters: {e}")
+    st.caption("Proposes a full set of names (one Gemini call). Untick any you don't want, then apply — "
+               "accepting them unchanged skips a second Gemini call at build time.")
+
+    snap = st.session_state.get('suggested_snapshot')
+    if not snap:
+        return
+    st.write(f"**Suggested {len(snap['clusters'])} clusters** — untick any to drop them:")
+    selected = []
+    cols = st.columns(2)
+    for i, name in enumerate(snap['clusters']):
+        with cols[i % 2]:
+            if st.checkbox(name, value=True, key=f"suggest_review_{name}"):
+                selected.append(name)
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✅ Apply selected as locked clusters", disabled=not selected):
+            st.session_state['cluster_locked'] = ", ".join(selected)
+            st.rerun()
+    with c2:
+        if st.button("✕ Dismiss suggestions"):
+            st.session_state['suggested_snapshot'] = None
+            st.rerun()
+
+
+# --- Build ------------------------------------------------------------------
+
+def _render_build_step(plex, music_section, gemini_api_key, debug_box, settings):
     st.subheader("3. Build")
     dry_run = st.checkbox(
-        "🧪 Dry run (no Gemini call — test the pipeline/UI for free)", disabled=(clustering_mode == "sonic"),
+        "🧪 Dry run (no Gemini call — test the pipeline for free)",
+        disabled=(settings["clustering_mode"] == "sonic"),
     )
-    st.caption(
-        "Uses a simple offline keyword mapper instead of Gemini. Clusters won't be "
-        "accurate, but this lets you test track assignment, ranking, and playlist "
-        "saving without spending any tokens. Not available in Sonic mode — clustering "
-        "there doesn't depend on the tag mapping, only naming does."
-    )
+    st.caption("Uses an offline keyword mapper instead of Gemini — clusters won't be accurate, but the whole "
+               "flow (review, commit, playlists) can be tested without spending tokens. Not needed in "
+               "Relational mode, where tags only name the clusters.")
 
     if not gemini_api_key and not dry_run:
         st.warning("Enter a Gemini API key in the sidebar to build clusters, or check 'Dry run' to test for free.")
-    elif len(locked_clusters) > total_clusters:
+        return
+    if len(settings["locked_clusters"]) > settings["total_clusters"]:
         st.error("You've locked in more cluster names than the total cluster count allows.")
-    else:
-        build_clicked = st.button("🧩 Build / Refresh Clusters", use_container_width=True)
-        st.caption(
-            "Re-scans tracks and play counts. Reuses the cached genre mapping (disk + "
-            "memory) if nothing's changed — no Gemini call, no cost. In dry run mode, "
-            "never calls Gemini at all."
-        )
-        remap_clicked = st.button("🔁 Force Re-map Genres", disabled=dry_run, use_container_width=True)
-        st.caption(
-            "Forces a fresh Gemini call even if a mapping is cached on disk or in "
-            "memory. Disabled in dry run mode (there's nothing to remap)."
-        )
-
-        if build_clicked or remap_clicked:
-            # If the user accepted a Suggest Clusters result unchanged (same tags,
-            # same total, same cluster names), reuse that mapping directly instead
-            # of paying for a second Gemini call.
-            snap = st.session_state.get('suggested_snapshot')
-            preloaded = None
-            if snap and not remap_clicked and not dry_run:
-                current_genre_tags, current_mood_tags = get_all_genre_and_mood_tags(cluster_music_section)
-                same_tags = (sorted(current_genre_tags) == sorted(snap["genre_tags"]) and
-                             sorted(current_mood_tags) == sorted(snap["mood_tags"]))
-                same_total = total_clusters == snap["total_clusters"]
-                same_clusters = sorted(locked_clusters, key=str.lower) == sorted(snap["clusters"], key=str.lower)
-                if same_tags and same_total and same_clusters:
-                    preloaded = (snap["clusters"], snap["mapping"])
-                    debug_box.write("**Using Suggest Clusters mapping directly — no extra Gemini call.**")
-
-            with st.spinner("Analyzing genres and building clusters..."):
-                try:
-                    if force_rescan:
-                        clear_artist_scan_cache()
-                    results, tag_mapping = build_genre_clusters(
-                        cluster_music_section,
-                        plex,
-                        locked_clusters=locked_clusters,
-                        total_clusters=total_clusters,
-                        api_key=gemini_api_key,
-                        top_n_per_cluster=int(top_n),
-                        debug=debug_box,
-                        force_remap=remap_clicked,
-                        dry_run=dry_run,
-                        preloaded_mapping=preloaded,
-                        refine_unsorted=refine_unsorted,
-                        sonic_weight=sonic_weight,
-                        reassign_tagged_via_sonic=reassign_tagged_via_sonic,
-                        sonic_propagation_rounds=sonic_propagation_rounds,
-                        clustering_mode=clustering_mode,
-                        sonic_neighbor_limit=15,
-                        sonic_artist_sample_size=int(sonic_artist_sample_size),
-                        sonic_boost=float(sonic_boost),
-                        sonic_use_cache=bool(sonic_use_cache),
-                        max_tracks_per_artist=int(max_tracks_per_artist),
-                    )
-                    st.session_state['cluster_results_raw'] = results
-                    st.session_state['cluster_tag_mapping_raw'] = tag_mapping
-                    st.session_state['cluster_merge_plan'] = []  # fresh build invalidates any prior grouping
-                    st.session_state['cluster_removed_keys'] = {}
-                    st.session_state['cluster_names_used'] = list(results.keys())
-                    st.session_state['cluster_artist_map'] = build_artist_cluster_map(results)
-                    if remap_clicked:
-                        # Force Re-map throws out the whole genre mapping and
-                        # rebuilds from scratch, so cluster membership can
-                        # shift enough that an old "already saved" badge would
-                        # likely be lying about what's in the cluster now.
-                        st.session_state['cluster_saved_playlists'] = {}
-                    else:
-                        # A plain rebuild (re-scan tracks/play counts, same
-                        # cached genre mapping) usually keeps the same
-                        # cluster identities. Carry saved-playlist status
-                        # over by matching cluster NAME — drop it only for
-                        # clusters that didn't come back under that name.
-                        old_saved = st.session_state.get('cluster_saved_playlists', {})
-                        st.session_state['cluster_saved_playlists'] = {
-                            name: playlist_name for name, playlist_name in old_saved.items()
-                            if name in results
-                        }
-                    save_cluster_results_cache(results, tag_mapping, st.session_state['cluster_saved_playlists'])
-                except Exception as e:
-                    st.error(f"Failed to build clusters: {e}")
-                    st.session_state['cluster_results_raw'] = None
-
-    st.write("---")
-    st.subheader("4. Results")
-
-    raw_results = st.session_state['cluster_results_raw']
-    raw_tag_mapping = st.session_state['cluster_tag_mapping_raw']
-
-    if not raw_results:
-        st.info("Complete steps 1\u20133 above, then build clusters to see them here.")
         return
 
-    # --- Cluster size summary, sorted largest-first, so imbalance is
-    # visible at a glance without digging through the debug log. Small
-    # clusters are the natural candidates to fold into a bigger one via
-    # the "Combine clusters" step below.
-    size_order = sorted(raw_results.items(), key=lambda kv: len(kv[1]), reverse=True)
-    with st.expander(f"📊 Cluster sizes ({len(raw_results)} clusters)", expanded=False):
-        max_size = max((len(tracks) for _, tracks in size_order), default=0)
-        for cluster_name, tracks in size_order:
-            count = len(tracks)
-            bar_frac = (count / max_size) if max_size else 0
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.progress(bar_frac, text=cluster_name)
-            with col2:
-                st.write(f"{count}")
+    c1, c2 = st.columns(2)
+    build_clicked = c1.button("🧩 Build clusters", use_container_width=True,
+                              help="Reuses the cached genre mapping if nothing changed — no Gemini cost.")
+    remap_clicked = c2.button("🔁 Force re-map genres", disabled=dry_run, use_container_width=True,
+                              help="Forces a fresh Gemini call even if a mapping is cached.")
+    if not (build_clicked or remap_clicked):
+        return
 
-    # --- Phase 2: combine fine-grained clusters into broader buckets ---
-    # Pure local operation (no Gemini call) — build narrow clusters first
-    # (phase 1, above), then decide here which of those to merge into a
-    # broader final bucket. The merge plan is stored separately from the
-    # raw build so it can be freely changed/reset without re-running
-    # anything against Plex or Gemini.
-    with st.expander(f"🔗 Combine clusters ({len(raw_results)} fine-grained clusters currently)"):
-        st.caption(
-            "Pick two or more of the clusters above to combine into one broader bucket. "
-            "Free and instant — no Gemini call, just relabeling and merging the track lists "
-            "you already have."
-        )
-        available_names = sorted(raw_results.keys())
-        already_grouped = {m for g in st.session_state['cluster_merge_plan'] for m in g["members"]}
-        selectable = [n for n in available_names if n not in already_grouped]
+    preloaded = None
+    snap = st.session_state.get('suggested_snapshot')
+    if snap and not remap_clicked and not dry_run:
+        genre_tags, mood_tags = get_all_genre_and_mood_tags(music_section)
+        same_tags = sorted(genre_tags) == sorted(snap["genre_tags"]) and sorted(mood_tags) == sorted(snap["mood_tags"])
+        same_total = settings["total_clusters"] == snap["total_clusters"]
+        same_clusters = (sorted(settings["locked_clusters"], key=str.lower)
+                         == sorted(snap["clusters"], key=str.lower))
+        if same_tags and same_total and same_clusters:
+            preloaded = (snap["clusters"], snap["mapping"])
+            debug_box.write("**Using Suggest Clusters mapping directly — no extra Gemini call.**")
 
-        merge_members = st.multiselect(
-            "Clusters to combine", selectable, key="merge_members_select"
-        )
-        merge_name = st.text_input(
-            "Name for the combined cluster", key="merge_name_input",
-            placeholder="e.g. Heavy & Punk",
-        )
-        if st.button("➕ Add this merge group", disabled=len(merge_members) < 2 or not merge_name.strip()):
-            st.session_state['cluster_merge_plan'].append({
-                "members": merge_members, "new_name": merge_name.strip()
-            })
+    with st.spinner("Building clusters over the whole library..."):
+        try:
+            if settings["force_rescan"]:
+                clear_artist_scan_cache()
+            build = build_clusters(
+                music_section, plex,
+                locked_clusters=settings["locked_clusters"], total_clusters=settings["total_clusters"],
+                api_key=gemini_api_key, debug=debug_box, force_remap=remap_clicked, dry_run=dry_run,
+                preloaded_mapping=preloaded, refine_unsorted=settings["refine_unsorted"],
+                sonic_weight=settings["sonic_weight"],
+                reassign_tagged_via_sonic=settings["reassign_tagged_via_sonic"],
+                sonic_propagation_rounds=settings["sonic_propagation_rounds"],
+                clustering_mode=settings["clustering_mode"],
+                sonic_artist_sample_size=int(settings["sonic_artist_sample_size"]),
+                sonic_boost=float(settings["sonic_boost"]), sonic_use_cache=bool(settings["sonic_use_cache"]),
+            )
+            st.session_state['cluster_build'] = build
+            st.session_state['cluster_merge_plan'] = []
+            save_build_cache(build, [])
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to build clusters: {e}")
+
+
+# --- Review & commit ----------------------------------------------------------
+
+def _cluster_summary(build, name):
+    keys = build["clusters"].get(name, [])
+    albums = build["albums"]
+    by_artist = {}
+    plays = 0
+    for k in keys:
+        info = albums.get(k) or {}
+        artist = info.get("artist") or "?"
+        by_artist[artist] = by_artist.get(artist, 0) + 1 + (info.get("plays") or 0) / 1000.0
+        plays += info.get("plays") or 0
+    top = [a for a, _ in sorted(by_artist.items(), key=lambda kv: kv[1], reverse=True)[:5]]
+    return len(keys), len(by_artist), plays, top
+
+
+def _render_review(plex, raw_build, gemini_api_key):
+    st.subheader("4. Review & commit")
+    plan = st.session_state['cluster_merge_plan']
+    build = apply_merge_plan(raw_build, plan)
+    total_albums = len(build["albums"])
+    claimed = sum(len(v) for v in build["clusters"].values())
+    mode = "Relational" if build.get("mode") == "sonic" else "Tags"
+    st.caption(
+        f"{mode} build from {build.get('built_at')}: **{len(build['clusters'])} clusters** covering "
+        f"{claimed} of {total_albums} albums ({len(build.get('unsorted', []))} unsorted). Unsorted albums "
+        "aren't lost — on commit every album is scored, and the ones that fit nowhere go to Unclustered."
+    )
+
+    rows = sorted(build["clusters"], key=lambda n: len(build["clusters"][n]), reverse=True)
+    max_albums = max((len(build["clusters"][n]) for n in rows), default=0) or 1
+    for name in rows:
+        n_albums, n_artists, plays, top = _cluster_summary(build, name)
+        col1, col2 = st.columns([3, 2])
+        with col1:
+            st.progress(n_albums / max_albums, text=f"**{name}** — {n_albums} albums · {n_artists} artists · "
+                                                     f"{plays} plays")
+        with col2:
+            st.caption(", ".join(top))
+
+    with st.expander(f"🔗 Combine clusters ({len(raw_build['clusters'])} in the build)"):
+        st.caption("Pick two or more clusters to combine into one broader cluster before committing. "
+                   "Free and instant — no Gemini call.")
+        grouped = {m for g in plan for m in g["members"]}
+        selectable = sorted(n for n in raw_build["clusters"] if n not in grouped)
+        members = st.multiselect("Clusters to combine", selectable, key="merge_members_select")
+        new_name = st.text_input("Name for the combined cluster", key="merge_name_input",
+                                 placeholder="e.g. Heavy & Punk")
+        if st.button("➕ Add this merge group", disabled=len(members) < 2 or not new_name.strip()):
+            plan.append({"members": members, "new_name": new_name.strip()})
+            save_build_cache(raw_build, plan)
+            st.rerun()
+        for i, group in enumerate(plan):
+            c1, c2 = st.columns([5, 1])
+            c1.write(f"- **{group['new_name']}** ← {', '.join(group['members'])}")
+            if c2.button("✕", key=f"remove_merge_group_{i}"):
+                plan.pop(i)
+                save_build_cache(raw_build, plan)
+                st.rerun()
+        if plan and st.button("↩️ Reset all merges"):
+            plan.clear()
+            save_build_cache(raw_build, plan)
             st.rerun()
 
-        if st.session_state['cluster_merge_plan']:
-            st.write("**Current merge groups:**")
-            for i, group in enumerate(st.session_state['cluster_merge_plan']):
-                col1, col2 = st.columns([5, 1])
-                with col1:
-                    st.write(f"- **{group['new_name']}** ← {', '.join(group['members'])}")
-                with col2:
-                    if st.button("✕", key=f"remove_merge_group_{i}"):
-                        st.session_state['cluster_merge_plan'].pop(i)
-                        st.rerun()
-            if st.button("↩️ Reset all merges"):
-                st.session_state['cluster_merge_plan'] = []
-                st.rerun()
-
-    if st.session_state['cluster_merge_plan']:
-        merged_results, merged_tag_mapping = apply_cluster_merge_plan(
-            raw_results, raw_tag_mapping, st.session_state['cluster_merge_plan']
-        )
-    else:
-        merged_results, merged_tag_mapping = raw_results, raw_tag_mapping
-
-    # Apply any manual per-track removals on top of the current merged view.
-    removed_keys = st.session_state['cluster_removed_keys']
-    cluster_results = {
-        name: [t for t in tracks if getattr(t, 'ratingKey', None) not in removed_keys.get(name, set())]
-        for name, tracks in merged_results.items()
-    }
-    st.session_state['cluster_results'] = cluster_results
-    st.session_state['cluster_tag_mapping'] = merged_tag_mapping
-    # Keep the artist-cluster map (used by Library Galaxy) in sync with
-    # what's actually shown here — merges/removals change membership
-    # without a fresh build, so it needs refreshing on every render, not
-    # just right after "Build Clusters". The disk cache, though, is only
-    # written when membership actually changed since the last save (cheap
-    # signature check) — this whole block re-runs on every Streamlit
-    # interaction (e.g. clicking play on an unrelated track row), and a
-    # full JSON write every single rerun would be needless disk churn.
-    st.session_state['cluster_artist_map'] = build_artist_cluster_map(cluster_results)
-    results_signature = tuple(sorted(
-        (name, tuple(sorted(getattr(t, 'ratingKey', None) for t in tracks)))
-        for name, tracks in cluster_results.items()
-    ))
-    if st.session_state.get('cluster_results_cache_signature') != results_signature:
-        save_cluster_results_cache(cluster_results, merged_tag_mapping, st.session_state['cluster_saved_playlists'])
-        st.session_state['cluster_results_cache_signature'] = results_signature
-
-    # --- Commit to the album cluster registry. The build above is a
-    # one-off grouping + display sample; committing turns it into album-level
-    # clusters with stable IDs (every album scored, unfitting ones form new
-    # clusters or go to Unclustered) that Live Mixes and the weekly
-    # curation work from. Runs in the background — first commit analyses
-    # every album once.
-    registry_busy = cluster_registry.get_job_status()["running"]
-    if st.button("📌 Commit build as album clusters", use_container_width=True, disabled=registry_busy,
-                 help="Replaces the 🧬 album clusters with this build (merges included), and sets their "
-                      "cluster cap to 'Maximum number of clusters' above. Existing Live "
-                      "Mixes follow their cluster by album overlap; mixes whose cluster disappears are "
-                      "marked stale and deleted at the next weekly curation."):
-        started = cluster_registry.run_background_job(
-            "Commit build", curation.commit_build, plex, cluster_results,
-            locked_names=locked_clusters, api_key=gemini_api_key, max_clusters=total_clusters,
-        )
-        if not started:
+    busy = cluster_registry.get_job_status()["running"]
+    has_registry = cluster_registry.load_registry() is not None
+    if st.button("📌 Commit as album clusters", type="primary", use_container_width=True, disabled=busy,
+                 help=f"Seeds the 🧬 album clusters with this build's full album membership (merges included) "
+                      f"and caps them at {build.get('total_clusters')} clusters. Existing Live Mixes follow "
+                      f"their cluster by album overlap; mixes whose cluster disappears are marked stale and "
+                      f"deleted at the next weekly curation."):
+        if not cluster_registry.run_background_job("Commit build", curation.commit_build, plex, build,
+                                                   api_key=gemini_api_key):
             st.warning("Another cluster job is already running.")
         st.rerun()
-
-    st.write("---")
-
-    cluster_tabs = st.tabs(list(cluster_results.keys()))
-    for cluster_name, sub_tab in zip(cluster_results.keys(), cluster_tabs):
-        with sub_tab:
-            tracks = cluster_results[cluster_name]
-            if not tracks:
-                st.info("No tracks left in this cluster.")
-                continue
-            st.caption(f"{len(tracks)} tracks — a blend of popular plays, sonically similar picks, and related artists. Tap ✕ to drop one before saving.")
-            for idx, track in enumerate(tracks):
-                render_track_row(
-                    track, idx, key_prefix=f"cluster_{cluster_name}", mode="cluster",
-                    plex_url=plex_url, plex_token=plex_token, cluster_name=cluster_name
-                )
-
-            already_saved_name = st.session_state['cluster_saved_playlists'].get(cluster_name)
-            if already_saved_name:
-                st.success(f"✅ Already saved as Plex playlist **'{already_saved_name}'** — saving again below will update/re-create it.")
-
-            save_name = st.text_input(
-                "Playlist name:", value=already_saved_name or cluster_name,
-                key=f"cluster_playlist_name_{cluster_name}"
-            )
-
-            make_live = st.checkbox(
-                "🎧 Keep this updated automatically (Live Mix)",
-                key=f"cluster_make_live_{cluster_name}",
-                help="Rebuilds daily — part seeded from this cluster's artists, part sonic-similarity "
-                     "expansion — using a '[Mix]' prefix on the name.",
-            )
-
-            if make_live:
-                live_target_size = st.number_input(
-                    "Target size", min_value=5, max_value=200, value=len(tracks) or 30,
-                    key=f"live_target_{cluster_name}"
-                )
-                live_cluster_pct = st.slider(
-                    "Cluster-seeded %", min_value=10, max_value=100, value=67,
-                    key=f"live_pct_{cluster_name}"
-                )
-                live_sonic_seeds = st.number_input(
-                    "Sonic expansion seed songs", min_value=1, max_value=30, value=10,
-                    key=f"live_seeds_{cluster_name}"
-                )
-                live_rotation_pct = st.slider(
-                    "Daily rotation %", min_value=5, max_value=100, value=85, step=5,
-                    key=f"live_rot_{cluster_name}"
-                )
-
-            if st.button("💾 Save", key=f"save_cluster_{cluster_name}", use_container_width=True):
-                if make_live:
-                    live_name = f"[Mix] {cluster_name}"
-                    try:
-                        # Shared with live_tab.py's cluster-save cards — one
-                        # code path for "save a cluster as a Live Mix" no
-                        # matter which tab it's triggered from.
-                        live_playlists.save_cluster_as_live_mix(
-                            plex, plex_url, plex_token, cluster_name, live_name,
-                            target_size=live_target_size, rotation_percent=live_rotation_pct,
-                            cluster_ratio=live_cluster_pct / 100, sonic_seed_count=live_sonic_seeds,
-                            debug=debug_box,
-                        )
-                        st.success(f"'{live_name}' saved and subscribed — it'll refresh automatically every day and now shows up in 🔴 Live Playlists.")
-                    except Exception as e:
-                        st.error(f"Failed to set up live mix: {e}")
-                else:
-                    try:
-                        plex.createPlaylist(title=save_name, items=tracks)
-                        st.success(f"Created playlist '{save_name}' with {len(tracks)} tracks.")
-                        # Remember this cluster's saved-playlist name and persist it
-                        # to disk (alongside the tracks/mapping) so the "already
-                        # saved" status above survives a reload/restart instead of
-                        # only living in this session's memory.
-                        st.session_state['cluster_saved_playlists'][cluster_name] = save_name
-                        save_cluster_results_cache(
-                            cluster_results, merged_tag_mapping, st.session_state['cluster_saved_playlists']
-                        )
-                    except Exception as e:
-                        st.error(f"Failed to create playlist: {e}")
+    st.caption(
+        ("Replaces the current 🧬 album clusters. " if has_registry else "")
+        + "Runs in the background; the first commit analyses every album once (sonic neighbours + tags), "
+          "later commits only new or changed albums."
+    )

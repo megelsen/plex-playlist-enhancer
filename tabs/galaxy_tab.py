@@ -8,6 +8,7 @@ import plotly.utils
 import streamlit as st
 import streamlit.components.v1 as components
 
+import cluster_registry
 from galaxy import build_similarity_graph, render_galaxy_figure
 
 
@@ -101,6 +102,10 @@ def _render_galaxy_html(figure, height=650):
 
 
 def render(plex, debug_box):
+    if not st.session_state.get('cluster_artist_map'):
+        reg = cluster_registry.load_registry()
+        if reg:
+            st.session_state['cluster_artist_map'] = cluster_registry.artist_cluster_map(reg)
     st.title("🌌 Library Galaxy")
     st.caption(
         "A 3D star map of your artists, connected by Plex's 'Similar Artist' data — "

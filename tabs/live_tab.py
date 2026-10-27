@@ -17,7 +17,7 @@ import streamlit as st
 
 import cluster_registry as cr
 import live_playlists as lp
-from clustering import load_cluster_results_cache
+from clustering import apply_merge_plan, load_build_cache
 
 
 def render(plex, plex_url, plex_token, debug_box):
@@ -58,8 +58,8 @@ def render(plex, plex_url, plex_token, debug_box):
     st.write("---")
     st.subheader("🗂️ Save a Cluster as a Live Mix")
     st.caption(
-        "All clusters from your last saved build in 🗂️ Library Clusters — same options as "
-        "saving from that tab. Saving here shows up in the overview above immediately."
+        "Every 🧬 album cluster from 🗂️ Library Clusters — a Live Mix draws from all tracks of the "
+        "cluster's albums. Saving here shows up in the overview above immediately."
     )
     _render_cluster_save_section(plex, plex_url, plex_token, debug_box)
 
@@ -194,8 +194,7 @@ def _render_cluster_save_section(plex, plex_url, plex_token, debug_box):
     clusters, existing_live = _get_available_clusters(plex, debug_box)
     if not clusters:
         st.warning(
-            "No saved cluster build found — open 🗂️ Library Clusters, build clusters, "
-            "and save at least one first."
+            "No clusters yet — open 🗂️ Library Clusters, build clusters and commit them first."
         )
         return
 
@@ -240,22 +239,17 @@ def _render_cluster_save_section(plex, plex_url, plex_token, debug_box):
 
 
 def _get_available_clusters(plex, debug_box):
-    """[(cluster_id, name)] to offer as Live Mixes. The album cluster
-    registry wins when it exists (stable IDs that survive re-curation);
-    otherwise the current session's build, falling back to the build saved
-    on disk, with cluster_id None (resolved by name at run time). Also
-    returns the set of ids/names that already have a non-stale live mix."""
+    """[(cluster_id, name)] to offer as Live Mixes: the 🧬 album clusters
+    (stable IDs that survive weekly curation) when committed, otherwise the
+    last saved build's clusters (cluster_id None, resolved by name at run
+    time). Also returns the ids/names that already have a non-stale mix."""
     registry = cr.load_registry()
     if registry:
         clusters = [(cid, c["name"]) for cid, c, n in cr.list_clusters(registry) if n]
     else:
-        session_results = st.session_state.get("cluster_results")
-        if session_results:
-            names = sorted(session_results.keys())
-        else:
-            results, _tag_mapping, _saved = load_cluster_results_cache(plex, debug=debug_box)
-            names = sorted(results.keys()) if results else []
-        clusters = [(None, n) for n in names]
+        build, merge_plan = load_build_cache()
+        build = apply_merge_plan(build, merge_plan) if build else None
+        clusters = [(None, n) for n in sorted(build["clusters"])] if build else []
 
     existing_live = set()
     for s in lp.list_cluster_mix_subscriptions():

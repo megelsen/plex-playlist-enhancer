@@ -1,8 +1,18 @@
-"""Library-wide genre+mood clustering pipeline: collects distinct genre and
-mood tags, uses Gemini to map them into a fixed number of clusters (some of
-which the user can lock in by name), assigns every track to a cluster based
-on both its genre and mood tags, and ranks each cluster's tracks by
-popularity.
+"""Library-wide cluster BUILD: groups the whole library into a set of
+clusters and returns their full album membership (build_clusters). Two
+methods:
+
+  - "tags": Gemini maps every genre/mood tag to a cluster (some locked in by
+    name), every track is assigned by its tags (optionally corrected via
+    sonic neighbours), and each album goes to the cluster holding most of
+    its tracks.
+  - "sonic" (Relational): Louvain communities over Plex's Similar-Artist
+    graph (optionally sonic-boosted); each community's artists contribute
+    all their albums.
+
+The build is a starting point: committing it seeds the album cluster
+registry (cluster_registry.py), which owns the live clusters, playlists
+and Live Mixes from then on. Nothing here picks playlist tracks.
 
 The only network/LLM cost in this whole pipeline is the single Gemini
 call in build_tag_cluster_mapping — everything else is local plexapi
@@ -14,10 +24,8 @@ tag list, locked clusters, total count, or prompt logic actually change.
 import hashlib
 import json
 import os
-import random
 import time
 from collections import defaultdict
-from math import ceil
 
 import requests
 import streamlit as st
@@ -348,259 +356,6 @@ def build_dry_run_mapping(genre_tags, mood_tags, locked_clusters, total_clusters
     return clusters, mapping
 
 
-def _cap_per_artist(tracks, max_per_artist):
-    if not max_per_artist:
-        return list(tracks)
-    result = []
-    counts = defaultdict(int)
-    for t in tracks:
-        artist_key = getattr(t, 'grandparentRatingKey', None)
-        if artist_key is not None and counts[artist_key] >= max_per_artist:
-            continue
-        result.append(t)
-        if artist_key is not None:
-            counts[artist_key] += 1
-    return result
-
-
-# --- TUNING PATCH: weighted-random popularity selection ------------------
-#
-# Previously _select_popular used a hard sorted(...)[:n] (fully
-# deterministic — same top-N every rebuild) and _select_sonic seeded from
-# a uniform random.sample of that pool (ignored play count entirely). Both
-# now go through _weighted_sample: a track's (viewCount + 1) is its
-# sampling weight, so more-played tracks are much MORE LIKELY to be picked
-# without being mathematically guaranteed every single time. This is what
-# gives "populars, mostly, but not the identical set every rebuild".
-
-def _weighted_sample(tracks, n):
-    """Picks up to n tracks from `tracks` without replacement, using
-    (viewCount + 1) as the sampling weight — heavily favors popular
-    tracks without being fully deterministic. The +1 means a zero-play
-    track still has a small chance instead of being mathematically
-    excluded."""
-    if not tracks:
-        return []
-    n = min(n, len(tracks))
-    weights = [(getattr(t, 'viewCount', 0) or 0) + 1 for t in tracks]
-
-    pool = list(tracks)
-    pool_weights = list(weights)
-    picked = []
-    for _ in range(n):
-        chosen = random.choices(pool, weights=pool_weights, k=1)[0]
-        idx = pool.index(chosen)
-        picked.append(pool.pop(idx))
-        pool_weights.pop(idx)
-    return picked
-
-
-def _select_popular(tracks, n, max_per_artist=None):
-    """Weighted-random by viewCount (see _weighted_sample) — tracks with
-    more plays are much more likely to be picked, but the exact set
-    varies between rebuilds instead of always being the identical top-N.
-    Falls back to a plain random sample if nothing in the pool has ever
-    been played (same fallback condition as before).
-
-    max_per_artist (None or 0 = no cap) limits how many tracks from the
-    same artist can land in the result — enforced via _cap_per_artist,
-    applied AFTER the weighted pick so the artist-diversity cap doesn't
-    skew the popularity weighting itself."""
-    if not tracks or n <= 0:
-        return []
-
-    top_view_count = max((getattr(t, 'viewCount', 0) or 0) for t in tracks)
-    if top_view_count <= 0:
-        pool = list(tracks)
-        random.shuffle(pool)
-        picked = pool
-    else:
-        # Oversample before capping per-artist: a hard artist cap can eat
-        # into the picked set, so grab a bit more than n up front when a
-        # cap is active.
-        pick_n = n if not max_per_artist else min(len(tracks), n * 3)
-        picked = _weighted_sample(tracks, pick_n)
-
-    if max_per_artist:
-        picked = _cap_per_artist(picked, max_per_artist)
-
-    return picked[:n]
-
-
-def _select_sonic(seed_tracks, exclude_keys, n, cluster_name, tag_mapping, seed_pool_size=6, debug=None):
-    """
-    Seeds sonicallySimilar() calls from `seed_pool_size` tracks drawn via
-    weighted-random sampling (by play count) from the popular pool —
-    previously a uniform random.sample that ignored play count entirely.
-    Most-played tracks are now the most LIKELY seeds, but which ones you
-    get still varies between rebuilds.
-
-    Candidates are still FILTERED to only those that themselves tag-map
-    into the same cluster_name (via assign_track_cluster) — sonic
-    similarity alone often crosses genre lines (e.g. an acoustic cover, a
-    shared production style), which is what was diluting cluster purity
-    before this filter existed. Anything that doesn't independently belong
-    to this cluster is discarded rather than included "for variety".
-    """
-    d = debug.write if debug else (lambda *a, **k: None)
-    if not seed_tracks or n <= 0:
-        return []
-
-    candidates = []
-    seeds = _weighted_sample(seed_tracks, seed_pool_size)
-    for seed in seeds:
-        seed_name = f"{getattr(seed, 'grandparentTitle', 'Unknown')} - {seed.title}"
-        try:
-            matches = seed.sonicallySimilar(limit=15)
-        except Exception as e:
-            d(f"└ ❌ Sonic lookup failed for `{seed_name}`: `{e}`")
-            continue
-        for m in matches:
-            rk = getattr(m, 'ratingKey', None)
-            if not rk or rk in exclude_keys:
-                continue
-            if assign_track_cluster(m, tag_mapping) != cluster_name:
-                continue
-            setattr(m, 'recommendation_type', 'Sonic Match')
-            setattr(m, 'match_percent', get_sonic_match_percent(m))
-            setattr(m, 'match_seed', seed_name)
-            candidates.append(m)
-            exclude_keys.add(rk)
-
-    random.shuffle(candidates)
-    return candidates[:n]
-# --- END weighted-random popularity selection -----------------------------
-
-
-def _select_related(seed_tracks, music_section, plex, exclude_keys, n, cluster_name, tag_mapping, debug=None):
-    """
-    Finds related artists for up to 6 of the cluster's popular tracks (via
-    each seed's artist.similar()), pulls each related artist's top tracks.
-    Same genre-purity filter as _select_sonic: a candidate track only
-    counts if it independently tag-maps into cluster_name — "related artist"
-    per Plex doesn't mean "same genre", so without this filter a Metal
-    cluster could easily pull in a related artist's non-metal tracks.
-    """
-    d = debug.write if debug else (lambda *a, **k: None)
-    if not seed_tracks or n <= 0:
-        return []
-
-    candidates = []
-    seen_artist_keys = set()
-    seeds = random.sample(seed_tracks, min(len(seed_tracks), 6))
-
-    for seed in seeds:
-        artist_key = getattr(seed, 'grandparentRatingKey', None)
-        if not artist_key:
-            continue
-        try:
-            artist = plex.fetchItem(artist_key)
-            similar_artists = artist.similar() if hasattr(artist, 'similar') else []
-            if callable(similar_artists):
-                similar_artists = similar_artists()
-        except Exception as e:
-            d(f"└ ❌ Similar-artist fetch failed for artist key {artist_key}: `{e}`")
-            continue
-
-        for sim in (similar_artists or []):
-            name = getattr(sim, 'tag', None)
-            if not name:
-                continue
-            try:
-                found = music_section.searchArtists(title=name)
-                if not found:
-                    continue
-                real_artist = found[0]
-                if real_artist.ratingKey in seen_artist_keys:
-                    continue
-                seen_artist_keys.add(real_artist.ratingKey)
-                top_tracks = get_top_tracks_for_artist(real_artist, limit=4, per_album_sample=2)
-                for t in top_tracks:
-                    rk = getattr(t, 'ratingKey', None)
-                    if not rk or rk in exclude_keys:
-                        continue
-                    if assign_track_cluster(t, tag_mapping) != cluster_name:
-                        continue
-                    setattr(t, 'recommendation_type', f'Related Artist ({real_artist.title})')
-                    candidates.append(t)
-                    exclude_keys.add(rk)
-            except Exception as e:
-                d(f"└ ❌ Related artist `{name}` failed: `{e}`")
-
-    random.shuffle(candidates)
-    return candidates[:n]
-
-
-def _blend_cluster_tracks(cluster_name, tracks_pool, music_section, plex, total_n, tag_mapping,
-                           max_per_artist=None, popular_weight=0.5, debug=None):
-    """
-    Builds a cluster's final track list as a blend of three sources:
-      1. Popular   — weighted-random by plays (see _select_popular above).
-                      Takes `popular_weight` of total_n (default 0.5, up
-                      from the original fixed 1/3) — the tuning knob for
-                      "include more populars".
-      2. Sonic     — sonically similar tracks seeded weighted-randomly from
-                      the popular picks (see _select_sonic above), filtered
-                      to only matches that also tag-map into this cluster.
-      3. Related   — top tracks from related artists of the popular picks,
-                      same genre-purity filter (see _select_related).
-
-    Sonic and related split whatever's left after popular_weight evenly.
-
-    If the genre-purity filter leaves the sonic/related buckets short (which
-    is expected — most sonic/related candidates for a narrow genre will get
-    filtered out), backfills from whatever's left in the cluster's own pool
-    rather than pulling in off-genre tracks just to hit total_n.
-
-    max_per_artist (None or 0 = no cap) caps how many tracks from the same
-    artist can appear in the FINAL blended list — applied once across all
-    three sources combined (plus backfill), since an artist could otherwise
-    show up via popular AND sonic AND related independently. A hard cap:
-    if a cluster doesn't have enough distinct artists to hit total_n under
-    the limit, the result is shorter than total_n rather than the cap
-    being relaxed.
-    """
-    d = debug.write if debug else (lambda *a, **k: None)
-
-    popular_n = round(total_n * popular_weight)
-    remaining_n = total_n - popular_n
-    sonic_n = remaining_n // 2
-    related_n = remaining_n - sonic_n
-
-    popular = _select_popular(tracks_pool, popular_n)
-    for t in popular:
-        setattr(t, 'recommendation_type', f'{cluster_name} (Popular)')
-    selected_keys = {getattr(t, 'ratingKey', None) for t in popular}
-
-    sonic = _select_sonic(popular, selected_keys, sonic_n, cluster_name, tag_mapping, debug=debug)
-    related = _select_related(popular, music_section, plex, selected_keys, related_n, cluster_name, tag_mapping, debug=debug)
-
-    combined = popular + sonic + related
-    d(f"└ `{cluster_name}` blend (popular_weight={popular_weight:.2f}, weighted-random): "
-      f"{len(popular)} popular, {len(sonic)} sonic (genre-filtered), {len(related)} related (genre-filtered).")
-
-    if len(combined) < total_n:
-        remaining_pool = [t for t in tracks_pool if getattr(t, 'ratingKey', None) not in selected_keys]
-        random.shuffle(remaining_pool)
-        needed = total_n - len(combined)
-        backfill = remaining_pool[:needed]
-        for t in backfill:
-            if not getattr(t, 'recommendation_type', None):
-                setattr(t, 'recommendation_type', f'{cluster_name} (More)')
-        combined += backfill
-        d(f"└ `{cluster_name}` backfilled {len(backfill)} more from the pool to reach {total_n}.")
-
-    if max_per_artist:
-        before = len(combined)
-        combined = _cap_per_artist(combined, max_per_artist)
-        if len(combined) < before:
-            d(f"└ `{cluster_name}` capped to \u2264{max_per_artist} tracks/artist: "
-              f"{before} \u2192 {len(combined)} tracks.")
-
-    random.shuffle(combined)
-    return combined[:total_n]
-
-
 def _sonic_thresholds_for_weight(sonic_weight):
     w = max(0.0, min(1.0, sonic_weight))
     min_votes = round(REFINE_MIN_NEIGHBOR_VOTES - w * 3)
@@ -750,32 +505,33 @@ def refine_unsorted_via_sonic_neighbors(pools, sonic_weight=0.0, reassign_tagged
     return pools
 
 
-def apply_cluster_merge_plan(raw_results, raw_tag_mapping, merge_plan):
-    member_to_new_name = {}
-    for group in merge_plan:
-        for member in group["members"]:
-            member_to_new_name[member] = group["new_name"]
+def apply_merge_plan(build, merge_plan):
+    """Returns a copy of `build` with each merge group's member clusters
+    combined under the group's new name (album lists unioned, tag mapping
+    relabelled). Pure local operation."""
+    if not build or not merge_plan:
+        return build
+    rename = {m: g["new_name"] for g in merge_plan for m in g["members"]}
+    clusters = defaultdict(set)
+    for name, keys in build["clusters"].items():
+        clusters[rename.get(name, name)].update(keys)
+    merged = dict(build)
+    merged["clusters"] = {name: sorted(keys) for name, keys in clusters.items()}
+    merged["tag_mapping"] = {t: rename.get(c, c) for t, c in (build.get("tag_mapping") or {}).items()}
+    merged["locked"] = sorted({rename.get(n, n) for n in build.get("locked", [])})
+    return merged
 
-    merged_results = defaultdict(list)
-    seen_keys_per_cluster = defaultdict(set)
-    for cluster_name, tracks in raw_results.items():
-        final_name = member_to_new_name.get(cluster_name, cluster_name)
-        for t in tracks:
-            rk = getattr(t, 'ratingKey', None)
-            if rk in seen_keys_per_cluster[final_name]:
-                continue
-            seen_keys_per_cluster[final_name].add(rk)
-            merged_results[final_name].append(t)
 
-    for tracks in merged_results.values():
-        random.shuffle(tracks)
-
-    merged_tag_mapping = {
-        tag: member_to_new_name.get(cluster_name, cluster_name)
-        for tag, cluster_name in raw_tag_mapping.items()
-    }
-
-    return dict(merged_results), merged_tag_mapping
+def artist_cluster_map_from_albums(clusters, albums):
+    """{artist ratingKey (str): cluster name} by majority of the artist's
+    albums — what Library Galaxy colours nodes by."""
+    votes = defaultdict(lambda: defaultdict(int))
+    for name, keys in clusters.items():
+        for k in keys:
+            artist_key = (albums.get(k) or {}).get("artist_key")
+            if artist_key:
+                votes[artist_key][name] += 1
+    return {a: max(c, key=c.get) for a, c in votes.items()}
 
 
 def build_artist_cluster_map(results):
@@ -791,26 +547,47 @@ def build_artist_cluster_map(results):
 CLUSTER_RESULTS_CACHE_PATH = os.environ.get("CLUSTER_RESULTS_CACHE_PATH", "/app/data/cluster_results.json")
 
 
-def save_cluster_results_cache(results, tag_mapping, saved_playlists=None):
+BUILD_VERSION = 2
+
+
+def save_build_cache(build, merge_plan=None):
+    """Persists the latest build (full album membership, v2 format) plus the
+    pending merge plan, so the review survives a restart and the first
+    weekly curation can bootstrap from it."""
     try:
         os.makedirs(os.path.dirname(CLUSTER_RESULTS_CACHE_PATH), exist_ok=True)
-        payload = {
-            "tag_mapping": tag_mapping,
-            "clusters": {name: [getattr(t, 'ratingKey', None) for t in tracks] for name, tracks in results.items()},
-            "saved_playlists": saved_playlists or {},
-        }
-        with open(CLUSTER_RESULTS_CACHE_PATH, "w") as f:
-            json.dump(payload, f)
+        tmp = CLUSTER_RESULTS_CACHE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({**build, "merge_plan": merge_plan or []}, f)
+        os.replace(tmp, CLUSTER_RESULTS_CACHE_PATH)
     except Exception:
         pass
 
 
+def load_build_cache():
+    """(build, merge_plan) from the v2 cache, or (None, []) if there is none
+    (or only a legacy v1 track-sample cache)."""
+    try:
+        with open(CLUSTER_RESULTS_CACHE_PATH, "r") as f:
+            payload = json.load(f)
+    except Exception:
+        return None, []
+    if payload.get("version") != BUILD_VERSION:
+        return None, []
+    merge_plan = payload.pop("merge_plan", [])
+    return payload, merge_plan
+
+
 def load_cluster_results_cache(plex, debug=None):
+    """LEGACY: reads a v1 cache ({cluster_name: [track ratingKeys]} — the
+    old ~30-track display sample). Returns (None, None, {}) for v2 files."""
     d = debug.write if debug else (lambda *a, **k: None)
     try:
         with open(CLUSTER_RESULTS_CACHE_PATH, "r") as f:
             payload = json.load(f)
     except Exception:
+        return None, None, {}
+    if payload.get("version") == BUILD_VERSION:
         return None, None, {}
 
     results = {}
@@ -1347,7 +1124,13 @@ def _rebalance_communities(graph, partition, min_size=2, max_size=60, debug=None
     return final
 
 
-def _score_and_select_communities(graph, communities, target_count, min_artists_needed, debug=None):
+# Relational mode ranks communities by connection strength x "completion".
+# Completion used to be derived from the playlist settings (30 tracks / 3 per
+# artist = 10 artists); it's now measured in albums, independent of playlists.
+FULL_COMMUNITY_ALBUMS = 20
+
+
+def _score_and_select_communities(graph, communities, target_count, album_counts, debug=None):
     d = debug.write if debug else (lambda *a, **k: None)
 
     scored = []
@@ -1355,7 +1138,8 @@ def _score_and_select_communities(graph, communities, target_count, min_artists_
         subgraph = graph.subgraph(members)
         weights = [w for _, _, w in subgraph.edges(data='weight', default=1.0)]
         connection_strength = (sum(weights) / len(weights)) if weights else 0.0
-        completion = min(1.0, len(members) / min_artists_needed) if min_artists_needed else 1.0
+        albums = sum(album_counts.get(m, 0) for m in members)
+        completion = min(1.0, albums / FULL_COMMUNITY_ALBUMS)
         score = connection_strength * completion
         scored.append((cid, score, connection_strength, completion))
 
@@ -1366,15 +1150,17 @@ def _score_and_select_communities(graph, communities, target_count, min_artists_
     d(f"**Ranked {len(scored)} candidate communities, keeping the top {len(kept)}** "
       f"(target {target_count}). Kept scores: "
       f"{[round(s, 2) for _, s, _, _ in kept]}." +
-      (f" Dropped {len(dropped)} weaker/thinner communities." if dropped else ""))
+      (f" Dropped {len(dropped)} weaker/thinner communities — their albums are scored "
+       "individually when you commit." if dropped else ""))
 
     return {cid: communities[cid] for cid, _, _, _ in kept}
 
 
-def build_artist_sonic_clusters(music_section, tag_mapping=None, sample_size=ARTIST_SONIC_SAMPLE_SIZE,
-                                 neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
-                                 sonic_boost=0.5, target_count=10, max_tracks_per_artist=3,
-                                 top_n_per_cluster=30, use_cache=True, api_key=None, debug=None):
+def build_artist_sonic_clusters(music_section, albums_by_artist, tag_mapping=None,
+                                 sample_size=ARTIST_SONIC_SAMPLE_SIZE, neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
+                                 sonic_boost=0.5, target_count=10, use_cache=True, api_key=None, debug=None):
+    """Relational mode: Louvain over the Similar-Artist graph. Returns
+    ({cluster_name: [artist objects]}, {cluster_name: tag vote counts})."""
     d = debug.write if debug else (lambda *a, **k: None)
 
     all_artists = get_cached_artists(music_section, debug=debug)
@@ -1393,10 +1179,9 @@ def build_artist_sonic_clusters(music_section, tag_mapping=None, sample_size=ART
     d(f"**Louvain found {len(set(partition.values()))} raw artist communities** at natural resolution.")
 
     communities_by_key = _rebalance_communities(graph, partition, debug=debug)
-
-    min_artists_needed = ceil(top_n_per_cluster / max_tracks_per_artist) if max_tracks_per_artist else 1
+    album_counts = {k: len(v) for k, v in albums_by_artist.items()}
     selected_by_key = _score_and_select_communities(
-        graph, communities_by_key, target_count, min_artists_needed, debug=debug
+        graph, communities_by_key, target_count, album_counts, debug=debug
     )
     communities = {cid: [artist_by_key[k] for k in keys] for cid, keys in selected_by_key.items()}
 
@@ -1409,30 +1194,55 @@ def build_artist_sonic_clusters(music_section, tag_mapping=None, sample_size=ART
     for community_id, artists in communities.items():
         base_name, vote_counts = names_by_community[community_id]
         name = _finalize_community_name(base_name, used_names)
-
-        tracks = []
-        for artist in artists:
-            try:
-                tracks.extend(artist.tracks())
-            except Exception:
-                continue
-
         community_tag_votes[name] = vote_counts
-        results[name] = tracks
-        d(f"\u2514 Community {community_id}: {len(artists)} artists / {len(tracks)} tracks -> named `{name}` "
+        results[name] = artists
+        n_albums = sum(album_counts.get(str(a.ratingKey), 0) for a in artists)
+        d(f"\u2514 Community {community_id}: {len(artists)} artists / {n_albums} albums -> named `{name}` "
           f"(tag votes: {vote_counts or 'n/a'}).")
 
     return results, community_tag_votes
 
 
+def _albums_by_artist(music_section, debug=None):
+    """{artist ratingKey (str): [album objects]} from one library-wide listing."""
+    d = debug.write if debug else (lambda *a, **k: None)
+    try:
+        albums = music_section.albums()
+    except Exception as e:
+        d(f"\u274c Album listing failed: `{e}`")
+        return {}
+    out = defaultdict(list)
+    for album in albums:
+        out[str(getattr(album, 'parentRatingKey', '') or '')].append(album)
+    return out
 
-def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, api_key,
-                          top_n_per_cluster=30, debug=None, force_remap=False, dry_run=False,
-                          preloaded_mapping=None, refine_unsorted=True, sonic_weight=0.0,
-                          reassign_tagged_via_sonic=False, sonic_propagation_rounds=2,
-                          clustering_mode="tags", sonic_neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
-                          sonic_artist_sample_size=ARTIST_SONIC_SAMPLE_SIZE,
-                          sonic_boost=0.5, sonic_use_cache=True, max_tracks_per_artist=3):
+
+def _album_info(album):
+    return {
+        "title": getattr(album, 'title', None),
+        "artist": getattr(album, 'parentTitle', None),
+        "artist_key": str(getattr(album, 'parentRatingKey', '') or ''),
+        "plays": getattr(album, 'viewCount', 0) or 0,
+    }
+
+
+def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key,
+                   debug=None, force_remap=False, dry_run=False, preloaded_mapping=None,
+                   refine_unsorted=True, sonic_weight=0.0, reassign_tagged_via_sonic=False,
+                   sonic_propagation_rounds=2, clustering_mode="tags",
+                   sonic_neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
+                   sonic_artist_sample_size=ARTIST_SONIC_SAMPLE_SIZE,
+                   sonic_boost=0.5, sonic_use_cache=True):
+    """Builds clusters over the WHOLE library and returns their full album
+    membership:
+
+      {"version": 2, "mode", "built_at", "total_clusters", "locked",
+       "tag_mapping": {tag: cluster},
+       "clusters": {cluster_name: [album ratingKey (str), ...]},
+       "unsorted": [album keys no cluster claimed],
+       "albums": {album key: {"title", "artist", "artist_key", "plays"}}}
+
+    "plays" is a play count (integer)."""
     d = debug.write if debug else (lambda *a, **k: None)
 
     genre_tags, mood_tags = get_all_genre_and_mood_tags(music_section)
@@ -1450,63 +1260,77 @@ def build_genre_clusters(music_section, plex, locked_clusters, total_clusters, a
         )
     d(f"**Final clusters:** {clusters}")
 
+    albums_by_artist = _albums_by_artist(music_section, debug=debug)
+    album_info = {str(a.ratingKey): _album_info(a) for albs in albums_by_artist.values() for a in albs}
+    membership = defaultdict(set)
+
     if clustering_mode == "sonic":
         d(f"**Relational mode:** cluster membership comes from Louvain community detection over "
           f"Plex's own Similar-Artist graph (sonic_boost={sonic_boost:g}); tags only name the "
-          f"result, never decide membership. Keeping the top {total_clusters} mixes by "
-          "connection strength \u00d7 completion.")
-        sonic_pools, community_tag_votes = build_artist_sonic_clusters(
-            music_section, tag_mapping=tag_mapping, sample_size=sonic_artist_sample_size,
-            neighbor_limit=sonic_neighbor_limit, sonic_boost=sonic_boost,
-            target_count=total_clusters, max_tracks_per_artist=max_tracks_per_artist,
-            top_n_per_cluster=top_n_per_cluster, use_cache=sonic_use_cache,
+          f"result. Keeping the top {total_clusters} communities by connection strength \u00d7 size; "
+          "each community's artists bring ALL their albums.")
+        communities, _tag_votes = build_artist_sonic_clusters(
+            music_section, albums_by_artist, tag_mapping=tag_mapping,
+            sample_size=sonic_artist_sample_size, neighbor_limit=sonic_neighbor_limit,
+            sonic_boost=sonic_boost, target_count=total_clusters, use_cache=sonic_use_cache,
             api_key=(None if dry_run else api_key), debug=debug
         )
+        for name, artists in communities.items():
+            for artist in artists:
+                for album in albums_by_artist.get(str(artist.ratingKey), []):
+                    membership[name].add(str(album.ratingKey))
+    else:
+        pools = defaultdict(list)
+        for artist in get_cached_artists(music_section, debug=debug):
+            try:
+                tracks = artist.tracks()
+            except Exception:
+                continue
+            for t in tracks:
+                pools[assign_track_cluster(t, tag_mapping)].append(t)
+        for cluster, tracks in pools.items():
+            d(f"\u2514 `{cluster}`: {len(tracks)} tracks pooled.")
 
-        results = {}
-        for cluster_name, tracks in sonic_pools.items():
-            results[cluster_name] = _select_popular(
-                tracks, min(top_n_per_cluster, len(tracks)), max_per_artist=max_tracks_per_artist
+        if not dry_run:
+            pools, clusters, tag_mapping = _fold_thin_clusters(pools, clusters, tag_mapping, locked_clusters, debug=debug)
+        if (refine_unsorted or reassign_tagged_via_sonic) and not dry_run:
+            pools = refine_unsorted_via_sonic_neighbors(
+                pools, sonic_weight=sonic_weight, reassign_tagged=reassign_tagged_via_sonic,
+                propagation_rounds=sonic_propagation_rounds, debug=debug
             )
-            already_says_mix = cluster_name.endswith("Mix") or " Mix (" in cluster_name
-            label = cluster_name if already_says_mix else f"{cluster_name} (Mix)"
-            for t in results[cluster_name]:
-                setattr(t, 'recommendation_type', label)
-        return results, tag_mapping
 
-    pools = defaultdict(list)
-    all_artists = get_cached_artists(music_section, debug=debug)
+        # Album = the cluster holding most of its tracks (tagged tracks win ties
+        # against Unsorted), so an artist whose albums span genres stays split.
+        votes = defaultdict(lambda: defaultdict(int))
+        for cluster, tracks in pools.items():
+            for t in tracks:
+                album_key = str(getattr(t, 'parentRatingKey', '') or '')
+                if not album_key:
+                    continue
+                votes[album_key][cluster] += 1
+                if album_key not in album_info:
+                    album_info[album_key] = {
+                        "title": getattr(t, 'parentTitle', None), "artist": getattr(t, 'grandparentTitle', None),
+                        "artist_key": str(getattr(t, 'grandparentRatingKey', '') or ''), "plays": 0,
+                    }
+        for album_key, counts in votes.items():
+            tagged = {c: n for c, n in counts.items() if c != "Unsorted"}
+            if tagged and sum(tagged.values()) >= counts.get("Unsorted", 0):
+                membership[max(tagged, key=tagged.get)].add(album_key)
 
-    for artist in all_artists:
-        try:
-            tracks = artist.tracks()
-        except Exception:
-            continue
-        for t in tracks:
-            cluster = assign_track_cluster(t, tag_mapping)
-            pools[cluster].append(t)
-
-    for cluster, tracks in pools.items():
-        d(f"└ `{cluster}`: {len(tracks)} tracks pooled.")
-
-    if not dry_run:
-        pools, clusters, tag_mapping = _fold_thin_clusters(pools, clusters, tag_mapping, locked_clusters, debug=debug)
-
-    if (refine_unsorted or reassign_tagged_via_sonic) and not dry_run:
-        pools = refine_unsorted_via_sonic_neighbors(
-            pools, sonic_weight=sonic_weight, reassign_tagged=reassign_tagged_via_sonic,
-            propagation_rounds=sonic_propagation_rounds, debug=debug
-        )
-
-    results = {}
-    for cluster_name in clusters + (["Unsorted"] if "Unsorted" in pools else []):
-        tracks = pools.get(cluster_name, [])
-        if not tracks:
-            results[cluster_name] = []
-            continue
-        results[cluster_name] = _blend_cluster_tracks(
-            cluster_name, tracks, music_section, plex, top_n_per_cluster, tag_mapping,
-            max_per_artist=max_tracks_per_artist, debug=debug
-        )
-
-    return results, tag_mapping
+    claimed = set().union(*membership.values()) if membership else set()
+    unsorted = sorted(k for k in album_info if k not in claimed)
+    result_clusters = {name: sorted(keys) for name, keys in membership.items() if keys}
+    d(f"**Build done:** {len(result_clusters)} clusters covering {len(claimed)} of {len(album_info)} albums "
+      f"({len(unsorted)} unsorted).")
+    return {
+        "version": BUILD_VERSION,
+        "mode": clustering_mode,
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "total_clusters": int(total_clusters),
+        "locked": list(locked_clusters),
+        "tag_mapping": tag_mapping,
+        "clusters": result_clusters,
+        "unsorted": unsorted,
+        "albums": album_info,
+    }

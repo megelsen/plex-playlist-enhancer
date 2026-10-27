@@ -1,8 +1,15 @@
-"""Album cluster registry panel (rendered inside 🗂️ Library Clusters): the
-auto-curated, album-level clusters that Live Cluster Mixes follow. Shows
-the current generation, the background job status, the last curation
-report, per-cluster details (lock / pin albums), tuning params and
-rollback. All heavy work runs in background threads via
+"""🧬 Album clusters (the main section of 🗂️ Library Clusters): the
+auto-curated, album-level clusters that playlists and Live Cluster Mixes
+are built from. Shows the current generation, the background job status,
+the last curation report, and per cluster:
+
+  - 🎧 Playlist — a playlist drawn from EVERY track in the cluster
+    (length, max share per artist, popular/discovery mix), previewed with
+    play buttons, then saved as a static Plex playlist or a daily Live Mix.
+  - 💿 Albums — the cluster's albums ranked by fit score.
+  - ⚙️ Manage — lock the cluster, pin albums.
+
+Heavy work (sync, curation, rollback) runs in background threads via
 cluster_registry.run_background_job so the page never blocks on it."""
 
 import streamlit as st
@@ -10,6 +17,7 @@ import streamlit as st
 import cluster_registry as cr
 import curation
 import live_playlists as lp
+from ui_components import render_track_row
 
 
 def _fmt_time(dt):
@@ -54,7 +62,8 @@ def _render_report(report):
         if ev["type"] == "retired":
             st.write(f"- 🗑️ Retired **{ev.get('name')}** ({ev.get('albums')} albums)")
         elif ev["type"] == "merged":
-            st.write(f"- 🔗 Merged **{ev.get('name')}** into **{ev.get('into_name')}**")
+            cap = " (cluster cap)" if ev.get("reason") == "cap" else ""
+            st.write(f"- 🔗 Merged **{ev.get('name')}** into **{ev.get('into_name')}**{cap}")
         elif ev["type"] == "split":
             st.write(f"- ✂️ Split **{ev.get('name')}** → {', '.join(ev.get('new_names') or [])}")
         elif ev["type"] == "spawned":
@@ -66,126 +75,220 @@ def _render_report(report):
 
 
 def render(plex, plex_url, plex_token, gemini_api_key):
+    st.subheader("🧬 Album clusters")
     reg = cr.load_registry()
-    with st.expander("🧬 Album clusters — auto-curated every week", expanded=reg is not None):
-        status = _render_job_status()
-        busy = status["running"]
+    status = _render_job_status()
+    busy = status["running"]
 
-        next_cur = lp.get_next_curation_time()
-        if reg is None:
-            st.info(
-                "No album cluster registry yet. Build clusters below, then press "
-                "**📌 Commit build as album clusters** under Results. (If you skip this, the first "
-                "weekly curation bootstraps from your last saved build automatically.)"
-            )
-            return
-
-        rows = cr.list_clusters(reg)
-        n_albums = len(reg["albums"])
-        n_unclustered = next((n for cid, _c, n in rows if cid == cr.UNCLUSTERED_ID), 0)
-        st.caption(
-            f"Generation **{reg['generation']}** · {len(rows) - 1} clusters"
-            f"{' (cap ' + str(reg['params']['max_clusters']) + ')' if reg['params'].get('max_clusters') else ''}"
-            f" · {n_albums} albums "
-            f"({n_unclustered} unclustered) · last updated {reg.get('updated_at')} · "
-            f"next weekly curation: {_fmt_time(next_cur)}. New albums are assigned every day "
-            f"before the Live Mix refresh."
+    if reg is None:
+        st.info(
+            "No album clusters yet. Build a set below (**🛠️ Build clusters**), review it, then press "
+            "**📌 Commit as album clusters**. Playlists and Live Mixes are made from the committed "
+            "clusters. (If you skip the commit, the first weekly curation bootstraps from your last "
+            "saved build automatically.)"
         )
+        return
 
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("➕ Sync new albums now", disabled=busy, use_container_width=True):
-                if not cr.run_background_job("Sync new albums", cr.sync_new_albums, plex):
-                    st.warning("Another cluster job is already running.")
-                st.rerun()
-        with c2:
-            if st.button("🧭 Run weekly curation now", disabled=busy, use_container_width=True,
-                         help="Same as the Monday run: may move albums, merge/split/retire clusters, "
-                              "add new ones, and delete stale Live Mix playlists."):
-                started = cr.run_background_job(
-                    "Weekly curation", curation.run_weekly_curation,
-                    plex_url, plex_token, api_key=gemini_api_key, trigger="manual",
-                )
-                if not started:
-                    st.warning("Another cluster job is already running.")
-                st.rerun()
+    rows = cr.list_clusters(reg)
+    n_albums = len(reg["albums"])
+    n_unclustered = next((n for cid, _c, n in rows if cid == cr.UNCLUSTERED_ID), 0)
+    cap = reg["params"].get("max_clusters")
+    st.caption(
+        f"Generation **{reg['generation']}** · {len(rows) - 1} clusters{f' (cap {cap})' if cap else ''} · "
+        f"{n_albums} albums ({n_unclustered} unclustered) · last updated {reg.get('updated_at')} · "
+        f"next weekly curation: {_fmt_time(lp.get_next_curation_time())}. New albums are assigned every "
+        f"day before the Live Mix refresh."
+    )
 
-        reports = curation.load_reports()
-        if reports:
-            st.write("**Last run**")
-            _render_report(reports[-1])
-            if len(reports) > 1:
-                with st.expander(f"Earlier runs ({len(reports) - 1})"):
-                    for r in reversed(reports[:-1]):
-                        _render_report(r)
-                        st.write("")
-
-        st.write("**Clusters**")
-        for cid, cluster, count in rows:
-            stats = cluster.get("stats") or {}
-            label_bits = [f"{count} albums"]
-            if stats.get("cohesion") is not None:
-                label_bits.append(f"cohesion {stats['cohesion']:.2f}")
-            if stats.get("plays_28d") is not None:
-                label_bits.append(f"{stats['plays_28d']} plays/28d")
-            lock = "🔒 " if cluster.get("locked") else ""
-            with st.expander(f"{lock}{cluster.get('name')} — {' · '.join(label_bits)}"):
-                _render_cluster_detail(reg, cid, cluster, busy)
-
-        with st.expander("⚙️ Curation settings"):
-            _render_params(reg, busy)
-
-        snaps = cr.list_snapshots()
-        if snaps:
-            with st.expander("↩️ Roll back"):
-                st.caption(
-                    "Restores the clusters as they were at a generation and recreates any Live Mix "
-                    "playlists that later curations deleted."
-                )
-                gen = st.selectbox("Generation", [g for g, _ in reversed(snaps)], key="registry_rollback_gen")
-                if st.button("↩️ Roll back to this generation", disabled=busy):
-                    if not cr.run_background_job("Rollback", curation.rollback_to_generation, int(gen), plex):
-                        st.warning("Another cluster job is already running.")
-                    st.rerun()
-
-
-def _render_cluster_detail(reg, cid, cluster, busy):
-    if cid != cr.UNCLUSTERED_ID:
-        locked = st.toggle(
-            "Lock (never merged, split, retired, or loses albums)", value=bool(cluster.get("locked")),
-            key=f"registry_lock_{cid}", disabled=busy,
-        )
-        if locked != bool(cluster.get("locked")):
-            cr.set_cluster_locked(cid, locked)
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("➕ Sync new albums now", disabled=busy, use_container_width=True):
+            if not cr.run_background_job("Sync new albums", cr.sync_new_albums, plex):
+                st.warning("Another cluster job is already running.")
             st.rerun()
+    with c2:
+        if st.button("🧭 Run weekly curation now", disabled=busy, use_container_width=True,
+                     help="Same as the Monday run: may move albums, merge/split/retire clusters, "
+                          "add new ones, and delete stale Live Mix playlists."):
+            started = cr.run_background_job(
+                "Weekly curation", curation.run_weekly_curation,
+                plex_url, plex_token, api_key=gemini_api_key, trigger="manual",
+            )
+            if not started:
+                st.warning("Another cluster job is already running.")
+            st.rerun()
+
+    reports = curation.load_reports()
+    if reports:
+        with st.expander(f"📋 Last run: {reports[-1].get('trigger')} {reports[-1].get('started_at')} — "
+                         f"{reports[-1].get('status')}"):
+            _render_report(reports[-1])
+            for r in reversed(reports[:-1]):
+                st.write("---")
+                _render_report(r)
 
     feats = cr.load_album_features()["albums"]
+    for cid, cluster, count in rows:
+        stats = cluster.get("stats") or {}
+        label_bits = [f"{count} albums"]
+        if stats.get("cohesion") is not None:
+            label_bits.append(f"cohesion {stats['cohesion']:.2f}")
+        if stats.get("plays_28d") is not None:
+            label_bits.append(f"{stats['plays_28d']} plays/28d")
+        lock = "🔒 " if cluster.get("locked") else ""
+        with st.expander(f"{lock}{cluster.get('name')} — {' · '.join(label_bits)}"):
+            tab_pl, tab_albums, tab_manage = st.tabs(["🎧 Playlist", "💿 Albums", "⚙️ Manage"])
+            with tab_pl:
+                _render_playlist_tab(plex, plex_url, plex_token, reg, cid, cluster, count)
+            with tab_albums:
+                _render_album_list(reg, cid, feats)
+            with tab_manage:
+                _render_manage_tab(reg, cid, cluster, feats, busy)
+
+    with st.expander("⚙️ Curation settings"):
+        _render_params(reg, busy)
+
+    snaps = cr.list_snapshots()
+    if snaps:
+        with st.expander("↩️ Roll back"):
+            st.caption(
+                "Restores the clusters as they were at a generation and recreates any Live Mix "
+                "playlists that later curations deleted."
+            )
+            gen = st.selectbox("Generation", [g for g, _ in reversed(snaps)], key="registry_rollback_gen")
+            if st.button("↩️ Roll back to this generation", disabled=busy):
+                if not cr.run_background_job("Rollback", curation.rollback_to_generation, int(gen), plex):
+                    st.warning("Another cluster job is already running.")
+                st.rerun()
+
+
+def _render_playlist_tab(plex, plex_url, plex_token, reg, cid, cluster, count):
+    if not count:
+        st.info("No albums in this cluster right now.")
+        return
+    name = cluster.get("name")
+    st.caption(
+        f"Drawn from every track of all {count} albums in this cluster — a different selection each "
+        f"time you generate it."
+    )
+    c1, c2, c3 = st.columns(3)
+    size = c1.number_input("Songs", min_value=5, max_value=500, value=50, step=5, key=f"pl_size_{cid}")
+    artist_pct = c2.slider("Max per artist (%)", min_value=0, max_value=100, value=10, step=1,
+                           key=f"pl_artist_{cid}",
+                           help="Share of the playlist any one artist may fill (0 = no limit). "
+                                "10% of 50 songs = at most 5 per artist.")
+    popular_pct = c3.slider("Popular (%)", min_value=0, max_value=100, value=50, step=5, key=f"pl_pop_{cid}",
+                            help="This share is picked weighted by your play counts; the rest is picked "
+                                 "at random from the whole cluster (discovery).")
+
+    make_live = st.checkbox(
+        "🎧 Keep it updated daily (Live Mix)", key=f"pl_live_{cid}",
+        help="Rebuilds every day from this cluster's current albums — part whole-cluster, part "
+             "sonic-similarity expansion — and follows the cluster through weekly curation.",
+    )
+    if make_live:
+        l1, l2, l3 = st.columns(3)
+        live_cluster_pct = l1.slider("From the cluster (%)", 10, 100, 67, key=f"pl_live_pct_{cid}",
+                                     help="The rest is sonic-similarity expansion from outside the cluster.")
+        live_seeds = l2.number_input("Sonic seed songs", 1, 30, 10, key=f"pl_live_seeds_{cid}")
+        live_rotation = l3.slider("Daily rotation (%)", 5, 100, 85, step=5, key=f"pl_live_rot_{cid}")
+        playlist_name = f"[Mix] {name}"
+        st.caption(f"Saved as **{playlist_name}**; renamed automatically if the cluster is renamed.")
+    else:
+        playlist_name = st.text_input("Playlist name", value=name, key=f"pl_name_{cid}")
+
+    previews = st.session_state.setdefault("cluster_playlist_preview", {})
+    b1, b2 = st.columns(2)
+    with b1:
+        if not make_live and st.button("🎲 Generate preview", key=f"pl_gen_{cid}", use_container_width=True):
+            with st.spinner(f"Picking {size} songs from {count} albums…"):
+                try:
+                    previews[cid] = lp.build_cluster_playlist(
+                        plex, cid, size=int(size), max_artist_share=artist_pct / 100,
+                        popular_share=popular_pct / 100, registry=reg,
+                    )
+                except Exception as e:
+                    st.error(f"Couldn't build the playlist: {e}")
+    with b2:
+        if st.button("💾 Save to Plex", key=f"pl_save_{cid}", use_container_width=True):
+            with st.spinner("Saving…"):
+                try:
+                    if make_live:
+                        _, n = lp.save_cluster_as_live_mix(
+                            plex, plex_url, plex_token, name, playlist_name, target_size=int(size),
+                            rotation_percent=int(live_rotation), cluster_ratio=live_cluster_pct / 100,
+                            sonic_seed_count=int(live_seeds), cluster_id=cid,
+                        )
+                        st.success(f"'{playlist_name}' saved as a Live Mix ({n} songs) — it refreshes daily "
+                                   "and shows up in 🔴 Live Playlists.")
+                    else:
+                        tracks = previews.get(cid) or lp.build_cluster_playlist(
+                            plex, cid, size=int(size), max_artist_share=artist_pct / 100,
+                            popular_share=popular_pct / 100, registry=reg,
+                        )
+                        lp.upsert_playlist(plex, playlist_name, tracks)
+                        st.success(f"Saved '{playlist_name}' with {len(tracks)} songs "
+                                   "(an existing playlist with that name is replaced).")
+                except Exception as e:
+                    st.error(f"Failed to save: {e}")
+
+    preview = previews.get(cid)
+    if preview and not make_live:
+        artists = len({getattr(t, "grandparentRatingKey", None) for t in preview})
+        short = ""
+        if len(preview) < size and artist_pct:
+            short = (f" Shorter than {size}: with {artists} artists and at most {artist_pct}% per artist, "
+                     f"that's all that fits — raise 'Max per artist' for a longer playlist.")
+        st.caption(f"Preview: {len(preview)} songs from {artists} artists.{short} Generate again for a new "
+                   f"selection.")
+        for idx, track in enumerate(preview):
+            render_track_row(track, idx, key_prefix=f"clpl_{cid}", mode="view",
+                             plex_url=plex_url, plex_token=plex_token)
+
+
+def _album_label(feats, a):
+    f = feats.get(a, {})
+    return f"{f.get('artist_title') or '?'} — {f.get('title') or a}"
+
+
+def _render_album_list(reg, cid, feats):
     members = cr.cluster_album_keys(reg, cid)
-
-    def _label(a):
-        f = feats.get(a, {})
-        return f"{f.get('artist_title') or '?'} — {f.get('title') or a}"
-
-    pinned_now = [a for a in members if reg["albums"][a].get("pinned")]
-    if cid != cr.UNCLUSTERED_ID:
-        pinned = st.multiselect(
-            "Pinned albums (never moved by curation)", members, default=pinned_now,
-            format_func=_label, key=f"registry_pins_{cid}", disabled=busy,
-        )
-        if set(pinned) != set(pinned_now):
-            cr.set_albums_pinned(set(pinned) - set(pinned_now), True)
-            cr.set_albums_pinned(set(pinned_now) - set(pinned), False)
-            st.rerun()
-
     ranked = sorted(members, key=lambda a: reg["albums"][a].get("score") or 0, reverse=True)
+    artists = len({feats.get(a, {}).get("artist_key") for a in members})
+    st.caption(f"{len(members)} albums by {artists} artists, best fit first (fit score 0–1).")
     lines = []
-    for a in ranked[:60]:
+    for a in ranked[:100]:
         score = reg["albums"][a].get("score")
-        lines.append(f"{'📌 ' if reg['albums'][a].get('pinned') else ''}{_label(a)}"
+        lines.append(f"{'📌 ' if reg['albums'][a].get('pinned') else ''}{_album_label(feats, a)}"
                      + (f"  ({score:.2f})" if score is not None else ""))
     st.code("\n".join(lines) or "(empty)")
-    if len(ranked) > 60:
-        st.caption(f"…and {len(ranked) - 60} more.")
+    if len(ranked) > 100:
+        st.caption(f"…and {len(ranked) - 100} more.")
+
+
+def _render_manage_tab(reg, cid, cluster, feats, busy):
+    if cid == cr.UNCLUSTERED_ID:
+        st.caption("Albums that don't fit any cluster well enough yet. The weekly curation tries to form "
+                   "new clusters from them when there's room under the cluster cap.")
+        return
+    locked = st.toggle(
+        "Lock (never merged, split, retired, or loses albums)", value=bool(cluster.get("locked")),
+        key=f"registry_lock_{cid}", disabled=busy,
+    )
+    if locked != bool(cluster.get("locked")):
+        cr.set_cluster_locked(cid, locked)
+        st.rerun()
+
+    members = cr.cluster_album_keys(reg, cid)
+    pinned_now = [a for a in members if reg["albums"][a].get("pinned")]
+    pinned = st.multiselect(
+        "Pinned albums (never moved by curation)", members, default=pinned_now,
+        format_func=lambda a: _album_label(feats, a), key=f"registry_pins_{cid}", disabled=busy,
+    )
+    if set(pinned) != set(pinned_now):
+        cr.set_albums_pinned(set(pinned) - set(pinned_now), True)
+        cr.set_albums_pinned(set(pinned_now) - set(pinned), False)
+        st.rerun()
 
 
 def _render_params(reg, busy):

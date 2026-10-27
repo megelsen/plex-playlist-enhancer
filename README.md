@@ -11,21 +11,24 @@ organize music across three tools:
 - **🎨 Artist Mix** — pick one artist and build a blended mix of their own
   tracks, sonically similar tracks, and tracks from related artists, then
   save it as a new Plex playlist.
-- **🗂️ Library Clusters** — groups your *entire* library into a handful of
-  sections (e.g. Metal, Indie, Folk). Two ways to decide what goes where:
-  **Hybrid** (recommended) blends real audio similarity, shared tags, and
-  agreement with your Gemini-defined clusters into one weighted graph, then
-  groups artists via Louvain community detection — each weight is
-  adjustable, so you can lean toward crisp sonic-driven clusters or looser
-  tag-driven ones. Or go **Tags-only**, where an LLM (Google Gemini by
-  default) invents cluster names and sorts every genre/mood tag in your
-  library into one of them, with optional sonic-similarity correction for
-  leftover/mistagged tracks afterward. Each cluster shows its most-played
-  tracks and can be saved as a playlist. Commit a build as **🧬 album
-  clusters** and every album in the library gets a cluster (or
-  `Unclustered`); new albums are assigned daily, and the clusters are
-  re-curated automatically every Monday at 03:00 (Paris time) — see
-  [docs/weekly-recluster.md](./docs/weekly-recluster.md).
+- **🗂️ Library Clusters** — groups your *entire* library into album
+  clusters (e.g. Metal, Indie, Folk).
+  - **Build a set** in one of two ways:
+    - **Relational** (recommended): Louvain communities over Plex's
+      Similar-Artist graph, optionally strengthened by audio matching.
+    - **Tags only**: Gemini sorts every genre/mood tag into a cluster, and
+      each album follows its tracks' tags.
+  - **Review and commit:** review the full result (albums, artists and top
+    artists per cluster), optionally combine clusters, and commit them as
+    **🧬 album clusters**. Every album then gets a cluster, or goes to
+    `Unclustered`.
+  - **Make playlists** from any cluster. They draw on every track in the
+    cluster, with adjustable length, max share per artist and
+    popular/discovery mix, and can be saved as a static playlist or a daily
+    Live Mix.
+  - **Stays up to date:** new albums are assigned daily, and the clusters
+    are re-curated automatically every Monday at 03:00 (Paris time) — see
+    [docs/weekly-recluster.md](./docs/weekly-recluster.md).
 - **🔴 Live Playlists** — subscribe an Artist Mix or a Library Cluster to a
   daily 4am refresh (configurable) so the playlist stays current without
   manual rebuilding. Artist Mixes simply re-run with the same settings each
@@ -314,9 +317,9 @@ itself automatically once a day, without opening the app.
   disable, manually trigger, or remove any subscription — and shows each
   one's last run time, track count, and any error from the most recent
   attempt.
-- **Requirements:** a Cluster Mix subscription needs at least one saved
-  build in Library Clusters first (Live Playlists reads from that same
-  disk cache — it doesn't rebuild clusters itself). Both subscription types
+- **Requirements:** a Cluster Mix needs committed 🧬 album clusters (or
+  at least a saved build) in Library Clusters first — Live Playlists draws
+  from them and doesn't rebuild clusters itself. Both subscription types
   need real `PLEX_URL`/`PLEX_TOKEN` values set as container environment
   variables, since the background job has no sidebar to read from.
 
@@ -324,11 +327,17 @@ itself automatically once a day, without opening the app.
 
 Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
 
-- **Commit a build:** in Library Clusters, press **📌 Commit build as album
-  clusters**. Every album is scored against every cluster (sonic neighbours,
-  tags, artist). It joins a cluster only above a threshold. Albums that fit
-  nowhere try to form new clusters among themselves; the rest go to
-  `Unclustered`.
+- **Commit a build:** in Library Clusters → 🛠️ Build clusters, build, review
+  and press **📌 Commit as album clusters**.
+  - The build's full album membership seeds the clusters, capped at the
+    build's cluster count.
+  - Every album is then scored against every cluster (sonic neighbours,
+    tags, artist). Unseeded albums join a cluster only above a threshold,
+    else they go to `Unclustered`.
+- **Playlists:** 🧬 → a cluster → 🎧 Playlist. They draw on every track of
+  the cluster, with length, max share per artist and popular/discovery mix
+  adjustable and a preview before saving. Tick "Keep it updated daily" for
+  a Live Mix instead.
 - **Daily (04:00):** albums added since the last scan are assigned to a
   fitting cluster before the Live Mixes refresh.
 - **Weekly (Monday 03:00, Paris):** the clusters are re-curated
