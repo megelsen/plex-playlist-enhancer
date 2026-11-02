@@ -23,7 +23,9 @@ tag list, locked clusters, total count, or prompt logic actually change.
 
 import hashlib
 import json
+import math
 import os
+import re
 import time
 from collections import defaultdict
 
@@ -233,6 +235,10 @@ CRITICAL RULES for assigning tags to clusters:
    existing cluster instead of standing up a fragile one-off bucket. It is
    completely fine — and expected — to end up with fewer clusters than the
    ceiling for this reason.
+8. Name every invented cluster by GENRE FAMILY, genre first, in 1–3 words
+   (e.g. "Metal", "Punk", "Folk", "Hip Hop", "Electronic", "Ska Punk").
+   Never add era or vibe words like "Modern", "Contemporary", "Epic",
+   "Fury" or "Vibes" — "Classic Rock" is fine because it's a genre.
 
 Genre tags to classify:
 {genre_tags}
@@ -264,7 +270,7 @@ fences, no commentary:
                     text = text[4:]
             text = text.strip()
             parsed = json.loads(text)
-            return parsed["clusters"], parsed["mapping"]
+            return _clean_mapping_names(parsed["clusters"], parsed["mapping"], locked_clusters)
         except requests.exceptions.Timeout as e:
             last_error = e
             if attempt < max_retries:
@@ -701,6 +707,157 @@ def _is_always_generic_tag(tag):
     return tag is not None and tag.strip().lower() in ALWAYS_GENERIC_NAME_TAGS
 
 
+# --- Genre-first cluster naming ---------------------------------------------
+#
+# Clusters are named after their most DISTINCTIVE genre/style: one that
+# covers a good share of the cluster's albums but few other clusters (so
+# "Stoner Rock" beats "Rock"). Plex keeps broad tags in `genres` and the
+# specific ones in `styles`, so both are used. Gemini is only a fallback,
+# and every name goes through clean_cluster_name.
+
+# Era / mood / marketing words that say nothing about the genre.
+NAME_FILLER_WORDS = {
+    "modern", "contemporary", "fury", "vibes", "vibe", "anthems", "legends",
+    "atmospheres", "essentials", "sounds", "mix", "hits", "favorites", "favourites",
+}
+NAME_MIN_SHARE = 0.2   # a tag must cover at least this share of a cluster's albums
+
+
+def clean_cluster_name(name):
+    """Drops era/mood filler ("Modern Metalcore Fury" -> "Metalcore",
+    "Classic Heavy Metal" -> "Heavy Metal"; "Classic Rock" stays) and any
+    " — <mood>" suffix. Returns the original if nothing would be left."""
+    if not name:
+        return name
+    base = re.split(r"\s+[—–]\s+", name.strip())[0]
+    words = base.split()
+    kept = []
+    for i, word in enumerate(words):
+        lw = word.lower().strip(",.&·")
+        nxt = words[i + 1].lower() if i + 1 < len(words) else ""
+        if lw in NAME_FILLER_WORDS or (lw == "classic" and nxt != "rock"):
+            continue
+        kept.append(word)
+    cleaned = " ".join(kept).strip(" ,&·-–—")
+    return cleaned or name.strip()
+
+
+def _clean_mapping_names(clusters, mapping, locked_clusters):
+    """Applies clean_cluster_name to Gemini's invented cluster names (locked
+    names are the user's and stay as typed), keeping the mapping consistent."""
+    locked = set(locked_clusters)
+    rename = {}
+    used = set(locked)
+    for c in clusters:
+        if c in locked:
+            continue
+        new = _finalize_community_name(clean_cluster_name(c), used)
+        rename[c] = new
+    return ([rename.get(c, c) for c in clusters],
+            {tag: rename.get(c, c) for tag, c in mapping.items()})
+
+
+def _tag_title(tag):
+    """'ska punk' -> 'Ska Punk'; tags that already have capitals stay as they are."""
+    return tag if any(ch.isupper() for ch in tag) else tag.title()
+
+
+def genre_first_names(groups, used_names=(), api_key=None, debug=None):
+    """Names clusters genre first.
+
+    groups: {group_id: {"tags": {tag: number of the group's albums carrying
+             it}, "size": number of albums, "artists": [artist names, most
+             important first]}} — tags = genres + styles (moods not used).
+    Returns {group_id: name}, unique and distinct from `used_names`.
+
+    A tag qualifies if it covers >= NAME_MIN_SHARE of the group's albums and
+    isn't generic; it's scored share × ln(1 + groups / groups-using-it), so a
+    tag that's common here but rare elsewhere wins. If a group's best tags are
+    all taken, its top artist is added in brackets; groups with no qualifying
+    tag go to Gemini (genre-first prompt) if a key is available, else get
+    their two main artists' names."""
+    d = debug.write if debug else (lambda *a, **k: None)
+    n_groups = max(len(groups), 1)
+    usage = defaultdict(int)
+    for g in groups.values():
+        size = max(g["size"], 1)
+        for tag, count in g["tags"].items():
+            if count / size >= NAME_MIN_SHARE:
+                usage[tag.lower()] += 1
+
+    ranked = {}
+    for gid, g in groups.items():
+        size = max(g["size"], 1)
+        cands = []
+        for tag, count in g["tags"].items():
+            share = count / size
+            if share < NAME_MIN_SHARE or _is_always_generic_tag(tag):
+                continue
+            cands.append((share * math.log(1 + n_groups / usage[tag.lower()]), tag))
+        ranked[gid] = [t for _, t in sorted(cands, reverse=True)]
+
+    used = {u.lower() for u in used_names if u}
+    names, fallback = {}, {}
+    # Groups with the clearest genre pick first.
+    for gid in sorted(groups, key=lambda x: (not ranked[x], -groups[x]["size"])):
+        options = [clean_cluster_name(_tag_title(t)) for t in ranked[gid]]
+        name = next((o for o in options if o.lower() not in used), None)
+        if name is None and options:
+            top_artist = (groups[gid].get("artists") or [""])[0]
+            name = f"{options[0]} ({top_artist})" if top_artist else None
+        if name is None:
+            fallback[gid] = {"artists": groups[gid].get("artists", [])[:5], "tags": ranked[gid][:3]}
+            continue
+        names[gid] = name
+        used.add(name.lower())
+
+    if fallback:
+        llm = _llm_name_fallback_communities(fallback, api_key, debug=debug) if api_key else {}
+        for gid, info in fallback.items():
+            artists = info["artists"]
+            names[gid] = llm.get(gid) or (" & ".join(artists[:2]) if artists else "New Cluster")
+
+    final, taken = {}, {u for u in used_names if u}
+    for gid in groups:
+        final[gid] = _finalize_community_name(names[gid], taken)
+    d(f"**Cluster names (genre first):** {sorted(final.values())}")
+    return final
+
+
+def _album_genre_tags(album, artist=None):
+    """Genres + styles of an album (falling back to its artist's), lower-cased."""
+    tags = {t.tag.strip().lower() for attr in ("genres", "styles")
+            for t in (getattr(album, attr, None) or []) if getattr(t, "tag", None)}
+    if not tags and artist is not None:
+        tags = {t.tag.strip().lower() for attr in ("genres", "styles")
+                for t in (getattr(artist, attr, None) or []) if getattr(t, "tag", None)}
+    return tags
+
+
+def _artist_groups_for_naming(communities, albums_by_artist, album_features=None):
+    """{group_id: [artist objects]} -> genre_first_names input, counting each
+    album's genres/styles (from the album feature cache when available —
+    those include styles from a full reload — else from the Plex objects)."""
+    feats = album_features or {}
+    groups = {}
+    for gid, artists in communities.items():
+        tags = defaultdict(int)
+        size = 0
+        weight = {}
+        for artist in artists:
+            albums = albums_by_artist.get(str(getattr(artist, "ratingKey", "")), [])
+            weight[getattr(artist, "title", "?")] = len(albums) + (getattr(artist, "viewCount", 0) or 0) / 1000.0
+            for album in albums:
+                size += 1
+                f = feats.get(str(album.ratingKey))
+                album_tags = set(f["genres"]) if f else _album_genre_tags(album, artist)
+                for t in album_tags:
+                    tags[t] += 1
+        groups[gid] = {"tags": dict(tags), "size": size,
+                       "artists": [a for a, _ in sorted(weight.items(), key=lambda kv: kv[1], reverse=True)]}
+    return groups
+
+
 def _representative_names(items, is_track, max_names=2):
     if is_track:
         seen = {}
@@ -734,29 +891,26 @@ def _llm_name_fallback_communities(fallback_info, api_key, model=None, timeout=6
         items.append(f'{{"id": "{cid}", "artists": "{artists}", "hint_tags": "{tags}"}}')
 
     prompt = f"""You are naming groups of musical artists that were clustered together by
-real listening/similarity data. Each group's genre tags were too generic (or
-absent) in this library to produce a good name on their own — some groups do
-have a mood hint (e.g. "Aggressive", "Dreamy"), but a bare mood by itself is a
-weak, repetitive name that doesn't say what the music actually IS. Trust your
-own knowledge of these artists' actual sound more than the hint tags, which
-may be vague, misleading, or (for mood) just one dimension of a fuller vibe.
+real listening/similarity data. The library's tags were too vague to name
+some groups, so use your own knowledge of these artists' actual sound.
 
-For each group below, invent a short, evocative 2-4 word name that captures
-what these artists actually sound like — genre-forward when there's a clear
-one (e.g. "Epic Folk Metal", "Balkan Gypsy Punk", "Melancholic Post-Rock",
-"90s Alt Rock"), or a regional/vibe-forward name when that fits better (e.g.
-"Anatolian Vibes", "Iberian Ska-Punk", "Sun-Bleached Surf Rock"). Be specific
-and confident — avoid vague filler like "Great Music", "Mixed Bag", or
-reusing the mood hint verbatim as the whole name. If you don't recognize
-enough of a group's artists to name it well, OMIT that group's id from your
-response rather than guessing badly.
+Name each group by its GENRE — the most specific genre that fits most of its
+artists, in 1–3 words, e.g. "Folk Metal", "Ska Punk", "Post-Punk",
+"Stoner Rock", "Metalcore", "Hip Hop", "Psychedelic Rock", "Thrash Metal".
+Only add a word if it's needed to tell two groups apart: a subgenre, or a
+region when the group really is regional (e.g. "German Punk").
+NEVER use era, mood or marketing words: no "Modern", "Contemporary",
+"Classic" (except the genre "Classic Rock"), "Epic", "Fury", "Vibes",
+"Anthems", "Legends", "Atmospheres", "Groove" (unless it's "Groove Metal").
+If you don't recognize enough of a group's artists to name its genre,
+OMIT that group's id from your response rather than guessing.
 
 Groups:
 {chr(10).join(items)}
 
 Respond with ONLY a JSON object mapping id -> name, nothing else, no markdown
 fences, no commentary:
-{{"0": "Epic Folk Metal", "2": "Anatolian Vibes"}}"""
+{{"0": "Folk Metal", "2": "Anatolian Rock"}}"""
 
     try:
         resp = requests.post(
@@ -775,127 +929,13 @@ fences, no commentary:
         for cid in order:
             name = parsed.get(str(cid))
             if isinstance(name, str) and name.strip():
-                result[cid] = name.strip()
+                result[cid] = clean_cluster_name(name.strip())
         d(f"**LLM named {len(result)}/{len(fallback_info)} fallback communities** "
           "(replacing bare artist-name labels with real genre/vibe names).")
         return result
     except Exception as e:
         d(f"⚠️ LLM community naming failed ({e}) — using artist-name fallback instead.")
         return {}
-
-
-def _name_communities(community_members, tag_mapping, is_track, generic_tag_threshold=0.25,
-                       api_key=None, debug=None):
-    d = debug.write if debug else (lambda *a, **k: None)
-
-    per_community = {}
-    genre_users = defaultdict(set)
-    mood_users = defaultdict(set)
-    for community_id, members in community_members.items():
-        if is_track:
-            pairs = [_track_genre_and_mood_tags(m) for m in members]
-        else:
-            pairs = [get_artist_genre_and_mood_tags(m) for m in members]
-        all_genres = [g for gs, _ in pairs for g in gs]
-        all_moods = [m for _, ms in pairs for m in ms]
-
-        vote_counts = {}
-        if tag_mapping:
-            votes = defaultdict(int)
-            for tag in all_genres + all_moods:
-                cluster = tag_mapping.get(tag)
-                if cluster:
-                    votes[cluster] += 1
-            vote_counts = dict(votes)
-
-        dominant_genre = _most_common_tag(all_genres)
-        dominant_mood = _most_common_tag(all_moods)
-        if dominant_genre:
-            genre_users[dominant_genre].add(community_id)
-        if dominant_mood:
-            mood_users[dominant_mood].add(community_id)
-
-        per_community[community_id] = {
-            "dominant_genre": dominant_genre,
-            "dominant_mood": dominant_mood,
-            "vote_counts": vote_counts,
-        }
-
-    n_communities = max(len(community_members), 1)
-    max_users = max(1, round(generic_tag_threshold * n_communities))
-
-    def _is_generic(tag, users_by_tag):
-        return tag is not None and (len(users_by_tag.get(tag, ())) > max_users or _is_always_generic_tag(tag))
-
-    generic_genres = {t for t in genre_users if _is_generic(t, genre_users)}
-    generic_moods = {t for t in mood_users if _is_generic(t, mood_users)}
-    if generic_genres or generic_moods:
-        d(f"**Tag genericity check:** treating "
-          f"{', '.join(sorted(generic_genres)) or '(none)'} as too common to name a genre by, "
-          f"and {', '.join(sorted(generic_moods)) or '(none)'} as too common to name a mood by "
-          f"(shared by more than {generic_tag_threshold:.0%} of {n_communities} communities) — "
-          "affected communities are named from representative artists instead.")
-
-    fallback_info = {}
-    for community_id, members in community_members.items():
-        info = per_community[community_id]
-        genre = info["dominant_genre"] if info["dominant_genre"] not in generic_genres else None
-        mood = info["dominant_mood"] if info["dominant_mood"] not in generic_moods else None
-        if genre:
-            continue
-        names = _representative_names(members, is_track, max_names=5)
-        hint_tags = sorted({info["dominant_genre"], info["dominant_mood"]} - {None})
-        fallback_info[community_id] = {"artists": names, "tags": hint_tags, "mood_only": mood is not None}
-
-    llm_names = _llm_name_fallback_communities(fallback_info, api_key, debug=debug) if fallback_info else {}
-
-    result = {}
-    for community_id, members in community_members.items():
-        info = per_community[community_id]
-        genre = info["dominant_genre"] if info["dominant_genre"] not in generic_genres else None
-        mood = info["dominant_mood"] if info["dominant_mood"] not in generic_moods else None
-
-        if genre:
-            name = genre
-            if mood and mood.lower() not in genre.lower():
-                name = f"{genre} — {mood}"
-        elif community_id in llm_names:
-            name = llm_names[community_id]
-        elif mood:
-            name = mood
-        else:
-            names = _representative_names(members, is_track)
-            if names:
-                name = f"{' & '.join(names)} Mix"
-            else:
-                named_votes = {k: v for k, v in info["vote_counts"].items() if k != "Unsorted"}
-                name = max(named_votes, key=named_votes.get) if named_votes else f"Sonic Cluster {community_id}"
-
-        result[community_id] = (name, info["vote_counts"])
-
-    name_to_ids = defaultdict(list)
-    for community_id, (name, _) in result.items():
-        name_to_ids[name].append(community_id)
-    duplicate_ids = {cid for ids in name_to_ids.values() if len(ids) > 1 for cid in ids}
-
-    if duplicate_ids:
-        dup_fallback_info = {}
-        for community_id in duplicate_ids:
-            members = community_members[community_id]
-            names = _representative_names(members, is_track, max_names=5)
-            dup_fallback_info[community_id] = {"artists": names, "tags": [result[community_id][0]]}
-        dup_llm_names = _llm_name_fallback_communities(dup_fallback_info, api_key, debug=debug)
-
-        for community_id in duplicate_ids:
-            base_name, vote_counts = result[community_id]
-            if community_id in dup_llm_names:
-                result[community_id] = (dup_llm_names[community_id], vote_counts)
-                continue
-            names = _representative_names(community_members[community_id], is_track, max_names=2)
-            if names:
-                result[community_id] = (f"{base_name} ({' & '.join(names)})", vote_counts)
-
-    return result
 
 
 def _finalize_community_name(base_name, used_names):
@@ -1158,9 +1198,11 @@ def _score_and_select_communities(graph, communities, target_count, album_counts
 
 def build_artist_sonic_clusters(music_section, albums_by_artist, tag_mapping=None,
                                  sample_size=ARTIST_SONIC_SAMPLE_SIZE, neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
-                                 sonic_boost=0.5, target_count=10, use_cache=True, api_key=None, debug=None):
+                                 sonic_boost=0.5, target_count=10, use_cache=True, api_key=None,
+                                 album_features=None, debug=None):
     """Relational mode: Louvain over the Similar-Artist graph. Returns
-    ({cluster_name: [artist objects]}, {cluster_name: tag vote counts})."""
+    ({cluster_name: [artist objects]}, {}) — names are genre first
+    (genre_first_names)."""
     d = debug.write if debug else (lambda *a, **k: None)
 
     all_artists = get_cached_artists(music_section, debug=debug)
@@ -1185,22 +1227,16 @@ def build_artist_sonic_clusters(music_section, albums_by_artist, tag_mapping=Non
     )
     communities = {cid: [artist_by_key[k] for k in keys] for cid, keys in selected_by_key.items()}
 
-    results = {}
-    community_tag_votes = {}
-    used_names = set()
-    names_by_community = _name_communities(
-        communities, tag_mapping, is_track=False, api_key=api_key, debug=debug
+    names = genre_first_names(
+        _artist_groups_for_naming(communities, albums_by_artist, album_features), api_key=api_key, debug=debug
     )
+    results = {}
     for community_id, artists in communities.items():
-        base_name, vote_counts = names_by_community[community_id]
-        name = _finalize_community_name(base_name, used_names)
-        community_tag_votes[name] = vote_counts
-        results[name] = artists
+        results[names[community_id]] = artists
         n_albums = sum(album_counts.get(str(a.ratingKey), 0) for a in artists)
-        d(f"\u2514 Community {community_id}: {len(artists)} artists / {n_albums} albums -> named `{name}` "
-          f"(tag votes: {vote_counts or 'n/a'}).")
+        d(f"\u2514 Community {community_id}: {len(artists)} artists / {n_albums} albums -> `{names[community_id]}`.")
 
-    return results, community_tag_votes
+    return results, {}
 
 
 def _albums_by_artist(music_section, debug=None):
@@ -1232,7 +1268,7 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
                    sonic_propagation_rounds=2, clustering_mode="tags",
                    sonic_neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
                    sonic_artist_sample_size=ARTIST_SONIC_SAMPLE_SIZE,
-                   sonic_boost=0.5, sonic_use_cache=True):
+                   sonic_boost=0.5, sonic_use_cache=True, album_features=None):
     """Builds clusters over the WHOLE library and returns their full album
     membership:
 
@@ -1273,7 +1309,7 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
             music_section, albums_by_artist, tag_mapping=tag_mapping,
             sample_size=sonic_artist_sample_size, neighbor_limit=sonic_neighbor_limit,
             sonic_boost=sonic_boost, target_count=total_clusters, use_cache=sonic_use_cache,
-            api_key=(None if dry_run else api_key), debug=debug
+            api_key=(None if dry_run else api_key), album_features=album_features, debug=debug
         )
         for name, artists in communities.items():
             for artist in artists:
@@ -1334,3 +1370,80 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
         "unsorted": unsorted,
         "albums": album_info,
     }
+
+
+# --- Library scan: how many clusters, and which ----------------------------
+
+PROPOSAL_MAX_CLUSTERS = 19
+PROPOSAL_RESOLUTIONS = (0.3, 0.45, 0.6, 0.8, 1.0, 1.25, 1.5, 2.0)
+
+
+def propose_clusters(music_section, max_clusters=PROPOSAL_MAX_CLUSTERS, album_features=None,
+                     api_key=None, debug=None):
+    """Scans the library and proposes a cluster count (3..max_clusters, at
+    most 19) plus genre-first names — no Gemini needed unless some group has
+    no usable genre tags.
+
+    Louvain runs over the Similar-Artist graph (no sonic lookups, so it's
+    quick) at several resolutions. Each run counts its "real" clusters:
+    communities holding at least max(10, 1.5% of the library) albums. The run
+    with the best modularity × coverage (share of all albums inside those
+    clusters) wins; ties go to fewer clusters.
+
+    Returns {"count", "clusters": [{"name", "albums", "artists",
+    "top_artists"}] (largest first), "coverage" (0..1), "modularity",
+    "resolution", "unlinked_artists"}."""
+    d = debug.write if debug else (lambda *a, **k: None)
+    max_clusters = min(int(max_clusters), PROPOSAL_MAX_CLUSTERS)
+
+    artists = get_cached_artists(music_section, debug=debug)
+    albums_by_artist = _albums_by_artist(music_section, debug=debug)
+    total_albums = sum(len(v) for v in albums_by_artist.values()) or 1
+    graph, artist_by_key, _cache = build_relational_graph(artists, sonic_boost=0, use_cache=False, debug=debug)
+    linked = sorted(n for n in graph.nodes() if graph.degree(n) > 0)
+    sub = graph.subgraph(linked)
+    if sub.number_of_edges() == 0:
+        raise ValueError("No Similar-Artist links in this library — can't propose clusters from them.")
+
+    min_albums = max(10, round(0.015 * total_albums))
+
+    def _albums(keys):
+        return sum(len(albums_by_artist.get(k, [])) for k in keys)
+
+    runs = []
+    for resolution in PROPOSAL_RESOLUTIONS:
+        partition = community_louvain.best_partition(sub, weight='weight', resolution=resolution, random_state=42)
+        groups = defaultdict(list)
+        for key, cid in partition.items():
+            groups[cid].append(key)
+        real = sorted((g for g in groups.values() if _albums(g) >= min_albums), key=_albums, reverse=True)
+        coverage = sum(_albums(g) for g in real) / total_albums
+        modularity = community_louvain.modularity(partition, sub, weight='weight')
+        runs.append({"resolution": resolution, "groups": real, "count": len(real),
+                     "coverage": coverage, "modularity": modularity})
+        d(f"\u2514 resolution {resolution}: {len(real)} clusters, coverage {coverage:.0%}, modularity {modularity:.2f}")
+
+    valid = [r for r in runs if 3 <= r["count"] <= max_clusters]
+    if valid:
+        best = max(valid, key=lambda r: (round(r["modularity"] * r["coverage"], 3), -r["count"]))
+    else:
+        best = min(runs, key=lambda r: abs(r["count"] - max_clusters))
+        best = dict(best, groups=best["groups"][:max_clusters], count=min(best["count"], max_clusters))
+
+    communities = {i: [artist_by_key[k] for k in g] for i, g in enumerate(best["groups"])}
+    names = genre_first_names(_artist_groups_for_naming(communities, albums_by_artist, album_features),
+                              api_key=api_key, debug=debug)
+    clusters = []
+    for i, members in communities.items():
+        keys = [str(a.ratingKey) for a in members]
+        top = sorted(members, key=lambda a: (len(albums_by_artist.get(str(a.ratingKey), [])),
+                                             getattr(a, "viewCount", 0) or 0), reverse=True)
+        clusters.append({"name": names[i], "albums": _albums(keys), "artists": len(members),
+                         "top_artists": [a.title for a in top[:5]]})
+    clusters.sort(key=lambda c: c["albums"], reverse=True)
+    d(f"**Proposal:** {len(clusters)} clusters (resolution {best['resolution']}), "
+      f"covering {best['coverage']:.0%} of albums.")
+    return {"count": len(clusters), "clusters": clusters, "coverage": best["coverage"],
+            "modularity": best["modularity"], "resolution": best["resolution"],
+            "unlinked_artists": graph.number_of_nodes() - len(linked)}
+

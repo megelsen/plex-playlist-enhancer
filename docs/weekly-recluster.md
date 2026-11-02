@@ -477,3 +477,85 @@ The pool is every track of every album currently in the cluster.
 There are no "tracks per cluster" or "songs per artist per cluster" build
 settings any more: cluster membership and playlist length are independent.
 
+---
+
+## 13. Placing albums by hand
+
+**Where:**
+- **🧬 → Unclustered → 🧩 Assign:** albums nothing has claimed yet.
+- **🧬 → any cluster → 💿 Albums:** the same table with "Move to", for
+  albums in the wrong cluster.
+
+**The table** (`tabs/album_editor.py`) has one row per album (or per artist
+with **Group by artist**):
+- **Columns:** artist, album, plays, the best-fitting cluster, its fit
+  (0–1, the same score curation uses) and why. For example: *sonic 62% ·
+  tags 40% · 3 album(s) by this artist there*. Suggestions come from
+  `cluster_registry.suggest_clusters`.
+- **Pre-fill:** in Unclustered, a suggestion fills in "Assign to"
+  automatically when its fit is at least 0.25 (adjustable). Clear cases
+  just need **✅ Apply**.
+- **🪄 Accept every suggestion with fit ≥ x:** applies all of them in one
+  click.
+- **Tick ✓** to act on several albums at once: move them, create a **new
+  cluster** from them (named genre-first, locked by default), mark them
+  **🚫 never cluster** (Unclustered only), unpin them, or listen to the
+  first album's top tracks.
+- **📱 Card view** for phones: one card per album, with a button for each
+  suggestion.
+- **↩️ Undo** reverses the last change; up to 20 changes are kept per
+  session.
+
+**How placed albums behave:**
+- **Pinned and marked manual (📌):** weekly curation never moves them, and
+  they count as normal members, so they shape the cluster's profile.
+- **Conflicts:** every write re-reads the registry and only touches albums
+  that are still where the page saw them. A background job changing them
+  in between is never overwritten; those albums are reported as skipped.
+- **Commit:** manual albums stay with their cluster (under its continued
+  ID, or the cluster it merged into). If their cluster was retired, they go
+  back to Unclustered and the report lists them.
+- **Hand-made clusters:** a **locked** cluster you made by hand survives a
+  commit as it is.
+- **Retired cluster:** if curation retires an unlocked cluster, its manual
+  albums are unpinned and treated normally again.
+- **Never cluster** (`excluded`): kept in Unclustered but left out of
+  curation, new clusters, Live Mixes and album counts. **Include again**
+  undoes it.
+
+## 14. Names and proposals
+
+**Genre-first names** (`clustering.genre_first_names`):
+- **The tag:** each cluster is named after the genre/style that covers at
+  least 20% of its albums and is rarest in the other clusters. Score =
+  share × ln(1 + clusters / clusters using the tag), so "Stoner Rock" beats
+  "Rock".
+- **Plex tags:** keeps broad tags in `genres` and specific ones in
+  `styles`; both are used.
+- **Taken names:** if a name is taken, the next tag is tried; then
+  "Genre (Top Artist)".
+- **No usable genre:** Gemini is asked for a *genre* name (if a key is
+  set), else the two main artists are used.
+- **Cleaning** (`clean_cluster_name`): every name drops era, mood and
+  marketing words (Modern, Contemporary, Fury, Vibes, Anthems, Legends,
+  Atmospheres…), "Classic" (except "Classic Rock") and " — mood" suffixes.
+  Gemini's tag-mapping names (Tags mode) are cleaned too; your locked names
+  are left as typed.
+- **🧬 → 🏷️ Names** proposes new names for the existing clusters (locked
+  ones keep theirs), lets you edit or untick them, and applies them. Live
+  Mix playlists named `[Mix] <cluster>` follow.
+- **⚙️ Manage → Name:** renames one cluster.
+
+**🔎 Scan & propose clusters** (`clustering.propose_clusters`, Build step 1):
+- **What it suggests:** a cluster count (3 to 19) and names. It's free: no
+  Gemini call unless a group has no usable genre tags.
+- **How:** Louvain runs over the Similar-Artist graph at several
+  resolutions (no sonic lookups, so it's quick). Each run's "real" clusters
+  are the communities holding at least max(10, 1.5% of the library)
+  albums. The run with the best modularity × coverage (share of all albums
+  inside those clusters) wins; ties go to fewer clusters.
+- **Result:** each proposed cluster is shown with its albums, artists and
+  top artists. **Use N as the cluster count** fills the count;
+  **Also use these names as vibes** fills the names, which Tags mode builds
+  exactly and a commit locks.
+

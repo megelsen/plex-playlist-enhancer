@@ -345,6 +345,20 @@ Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
   the cluster, with length, max share per artist and popular/discovery mix
   adjustable and a preview before saving. Tick "Keep it updated daily" for
   a Live Mix instead.
+- **Placing albums by hand:**
+  - **🧬 → Unclustered → 🧩 Assign:** suggested clusters per album, with a
+    reason; apply edits in bulk, accept every suggestion above a fit, make
+    a new cluster, or mark albums "never cluster".
+  - **💿 Albums in any cluster:** "Move to".
+  - Placed albums are pinned (📌): weekly curation and commits keep them
+    where you put them. A card view works on phones, and every change can
+    be undone.
+- **Names:** clusters are named genre first from Plex genres and styles
+  ("Folk Metal", "Ska Punk"), without era/mood words like "Modern" or
+  "Fury". 🧬 → 🏷️ Names re-names existing clusters this way.
+- **🔎 Scan & propose clusters** (Build step 1): proposes a cluster count
+  (at most 19) and names from your library's Similar-Artist structure,
+  without Gemini.
 - **A Live Mix for every cluster:** 🧬 → 🎧 Live Mixes for all clusters →
   **🔄 Create & update all** creates the missing mixes and applies the same
   settings to the existing ones, in one go. With **🔁 Keep it that way** on, new

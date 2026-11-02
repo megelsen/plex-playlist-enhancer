@@ -270,7 +270,7 @@ def commit_build(plex, build, api_key=None, debug=None):
         "started_at": _now_iso(), "finished_at": _now_iso(),
         "from_generation": old["generation"] if old else None, "to_generation": boot["generation"],
         "events": boot["events"], "marked_stale": marked, "deleted_subscriptions": [],
-        "created_mixes": created,
+        "created_mixes": created, "manual": boot.get("manual"),
         **{k: boot["stats"].get(k) for k in ("moved", "assigned", "ejected", "clusters", "unclustered")},
     })
     return boot

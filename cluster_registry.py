@@ -40,7 +40,7 @@ from datetime import datetime
 
 from clustering import (
     HAS_SONIC_GRAPH_DEPS, _build_plex_similar_edges, _finalize_community_name, _is_always_generic_tag,
-    _llm_name_fallback_communities, build_artist_cluster_map, get_cached_artists,
+    build_artist_cluster_map, genre_first_names, get_cached_artists,
 )
 from plex_helpers import get_sonic_match_percent
 
@@ -184,6 +184,9 @@ def load_registry():
 
 def save_registry(reg):
     reg["updated_at"] = _now_iso()
+    # Bumped on every save: UI widget keys and caches use it, since updated_at
+    # only has one-second resolution.
+    reg["revision"] = reg.get("revision", 0) + 1
     with _IO_LOCK:
         _atomic_write_json(REGISTRY_PATH, reg)
 
@@ -243,15 +246,23 @@ def find_cluster_id_by_name(reg, name):
     return None
 
 
-def cluster_album_keys(reg, cid):
-    return [a for a, e in reg["albums"].items() if e.get("cluster") == cid]
+def cluster_album_keys(reg, cid, include_excluded=False):
+    """Album keys in a cluster. Albums marked "never cluster" (excluded) sit in
+    Unclustered but are left out unless include_excluded."""
+    return [a for a, e in reg["albums"].items()
+            if e.get("cluster") == cid and (include_excluded or not e.get("excluded"))]
+
+
+def excluded_album_keys(reg):
+    return [a for a, e in reg["albums"].items() if e.get("excluded")]
 
 
 def list_clusters(reg):
     """[(cluster_id, cluster_dict, album_count)], largest first, Unclustered last."""
     counts = defaultdict(int)
     for e in reg["albums"].values():
-        counts[e.get("cluster")] += 1
+        if not e.get("excluded"):
+            counts[e.get("cluster")] += 1
     rows = [(cid, c, counts.get(cid, 0)) for cid, c in reg["clusters"].items()]
     rows.sort(key=lambda r: (r[0] == UNCLUSTERED_ID, -r[2], r[1].get("name", "")))
     return rows
@@ -295,6 +306,173 @@ def update_params(**fields):
         if k in DEFAULT_PARAMS:
             reg["params"][k] = v
     save_registry(reg)
+
+
+# --- Manual assignment ------------------------------------------------------
+#
+# Albums you place by hand are pinned (curation never moves them) and marked
+# "manual"; they count as normal cluster members, so they also shape the
+# cluster's profile. A commit keeps them with their cluster
+# (_carry_manual_albums). Every write re-reads the registry and only touches
+# albums that are still where the page saw them (`expected`), so a background
+# job changing the registry meanwhile is never overwritten.
+
+CHANGELOG_KEEP = 200
+
+
+def album_state(reg, album_keys):
+    """{album: {"cluster", "pinned", "manual", "excluded"}} — for undo and `expected`."""
+    out = {}
+    for a in album_keys:
+        e = reg["albums"].get(a)
+        if e is not None:
+            out[a] = {"cluster": e.get("cluster"), "pinned": bool(e.get("pinned")),
+                      "manual": bool(e.get("manual")), "excluded": bool(e.get("excluded"))}
+    return out
+
+
+def _log_change(reg, action, album_keys, cluster_id=None):
+    reg.setdefault("changelog", []).append({
+        "at": _now_iso(), "action": action, "albums": len(album_keys),
+        "cluster": (reg["clusters"].get(cluster_id) or {}).get("name") if cluster_id else None,
+    })
+    del reg["changelog"][:-CHANGELOG_KEEP]
+
+
+def _apply_states(album_states, expected=None, action="restore", cluster_id=None):
+    """Writes {album: state} to the registry. Albums whose current cluster
+    differs from expected[album]["cluster"] are skipped. Returns (applied, skipped)."""
+    reg = load_registry()
+    if not reg:
+        raise ValueError("No album clusters yet.")
+    applied, skipped = [], []
+    for a, state in album_states.items():
+        entry = reg["albums"].get(a)
+        if entry is None or (expected and a in expected
+                             and entry.get("cluster") != expected[a]["cluster"]):
+            skipped.append(a)
+            continue
+        if state["cluster"] not in reg["clusters"]:
+            skipped.append(a)
+            continue
+        entry["cluster"] = state["cluster"]
+        entry["pinned"] = bool(state.get("pinned"))
+        for flag in ("manual", "excluded"):
+            if state.get(flag):
+                entry[flag] = True
+            else:
+                entry.pop(flag, None)
+        entry["score"] = None
+        entry["assigned_gen"] = reg.get("generation", 0)
+        applied.append(a)
+    if applied:
+        _log_change(reg, action, applied, cluster_id)
+        _refresh_counts(reg)
+        save_registry(reg)
+    return applied, skipped
+
+
+def assign_albums(album_keys, cluster_id, expected=None):
+    """Puts albums into a cluster by hand: pinned + manual. Returns (applied, skipped)."""
+    state = {"cluster": cluster_id, "pinned": True, "manual": True, "excluded": False}
+    return _apply_states({a: state for a in album_keys}, expected, "assign", cluster_id)
+
+
+def unassign_albums(album_keys, expected=None):
+    """Back to Unclustered, unpinned (curation may place them again)."""
+    state = {"cluster": UNCLUSTERED_ID, "pinned": False, "manual": False, "excluded": False}
+    return _apply_states({a: state for a in album_keys}, expected, "unassign")
+
+
+def exclude_albums(album_keys, excluded=True, expected=None):
+    """"Never cluster": kept in Unclustered, out of curation, new clusters and mixes."""
+    state = {"cluster": UNCLUSTERED_ID, "pinned": False, "manual": False, "excluded": bool(excluded)}
+    return _apply_states({a: state for a in album_keys}, expected, "exclude" if excluded else "include")
+
+
+def restore_album_states(previous_states, expected_states):
+    """Undo: puts albums back to `previous_states`, but only those still in
+    the state the change left them in (`expected_states`)."""
+    return _apply_states(previous_states, expected_states, "undo")
+
+
+def create_cluster_from_albums(album_keys, name, locked=True, expected=None):
+    """New cluster made by hand from the given albums (pinned). Locked by
+    default, so curation won't retire it for being small or merge it away
+    under the cluster cap. Returns (cluster_id, applied, skipped)."""
+    reg = load_registry()
+    if not reg:
+        raise ValueError("No album clusters yet.")
+    used = {c.get("name") for c in reg["clusters"].values()}
+    cid = _new_cluster_id()
+    gen = reg.get("generation", 0)
+    reg["clusters"][cid] = {"name": _finalize_community_name(name.strip() or "New Cluster", used),
+                            "locked": bool(locked), "system": False, "created_gen": gen, "updated_gen": gen,
+                            "origin": "manual", "stats": {}}
+    save_registry(reg)
+    applied, skipped = assign_albums(album_keys, cid, expected)
+    return cid, applied, skipped
+
+
+def rename_cluster(cid, name):
+    reg = load_registry()
+    if not reg or cid not in reg["clusters"] or cid == UNCLUSTERED_ID or not name.strip():
+        return None
+    used = {c.get("name") for k, c in reg["clusters"].items() if k != cid}
+    reg["clusters"][cid]["name"] = _finalize_community_name(name.strip(), used)
+    save_registry(reg)
+    return reg["clusters"][cid]["name"]
+
+
+def suggest_clusters(reg, album_keys, top=3):
+    """{album: [(cluster_id, score 0..1, reason), ...]} best first, excluding
+    the album's current cluster. Uses the same scoring as curation."""
+    store = load_album_features()
+    feats = store["albums"]
+    labels = {a: e.get("cluster") for a, e in reg["albums"].items() if a in feats}
+    scorer = _Scorer(labels, list(reg["clusters"]), feats, store.get("artist_similar"), reg["params"])
+    out = {}
+    for a in album_keys:
+        if a not in feats:
+            out[a] = []
+            continue
+        scores, detail = scorer.scores_for(a, explain=True)
+        current = labels.get(a)
+        ranked = sorted(((c, sc) for c, sc in scores.items() if c != current), key=lambda kv: kv[1], reverse=True)
+        out[a] = [(c, round(sc, 3), _reason(detail[c])) for c, sc in ranked[:top] if sc > 0]
+    return out
+
+
+def _reason(why):
+    bits = []
+    if why.get("sonic") is not None:
+        bits.append(f"sonic {why['sonic']:.0%}")
+    if why.get("tags") is not None:
+        bits.append(f"tags {why['tags']:.0%}")
+    if why.get("same_artist"):
+        bits.append(f"{why['same_artist']} album(s) by this artist there")
+    return " · ".join(bits)
+
+
+def propose_genre_names(reg, api_key=None):
+    """{cluster_id: new genre-first name} for every cluster except locked ones
+    (their names are yours) and Unclustered; unchanged names are omitted."""
+    feats = load_album_features()["albums"]
+    targets = [cid for cid, c in reg["clusters"].items() if cid != UNCLUSTERED_ID and not c.get("locked")]
+    keep = [c.get("name") for cid, c in reg["clusters"].items() if cid not in targets and c.get("name")]
+    members = {cid: cluster_album_keys(reg, cid) for cid in targets}
+    names = genre_first_names(_album_groups_for_naming(feats, members), used_names=keep, api_key=api_key)
+    return {cid: n for cid, n in names.items() if n != reg["clusters"][cid].get("name")}
+
+
+def apply_cluster_names(names):
+    reg = load_registry()
+    used = {c.get("name") for k, c in reg["clusters"].items() if k not in names}
+    for cid, name in names.items():
+        if cid in reg["clusters"]:
+            reg["clusters"][cid]["name"] = _finalize_community_name(name, used)
+    save_registry(reg)
+    return reg
 
 
 # --- Album features -------------------------------------------------------
@@ -475,7 +653,9 @@ class _Scorer:
         self.tag_norms = {cid: math.sqrt(sum(v * v for v in s.values())) for cid, s in self.tag_sums.items()}
         self.artist_majority = {ak: max(c, key=c.get) for ak, c in artist_counts.items() if c}
 
-    def scores_for(self, a):
+    def scores_for(self, a, explain=False):
+        """{cluster_id: affinity}; with explain, (scores, {cluster_id: {"sonic":
+        share 0..1 or None, "tags": cosine 0..1 or None, "same_artist": albums}})."""
         p = self.params
         f = self.feats[a]
         own = self.labels.get(a)
@@ -506,10 +686,13 @@ class _Scorer:
         vec = self.vectors[a]
         w_self = self.anchor[a]
         out = {}
+        detail = {}
         for cid in self.cluster_ids:
             num = wsum = 0.0
+            why = {"sonic": None, "tags": None, "same_artist": same_artist.get(cid, 0)}
             if sonic_denom > 0:
-                num += p["w_sonic"] * sonic_in.get(cid, 0.0) / sonic_denom
+                why["sonic"] = sonic_in.get(cid, 0.0) / sonic_denom
+                num += p["w_sonic"] * why["sonic"]
                 wsum += p["w_sonic"]
             if vec and cid in self.tag_sums:
                 sums = self.tag_sums[cid]
@@ -519,7 +702,8 @@ class _Scorer:
                     dot -= w_self
                     norm_sq = norm_sq - 2 * w_self * (dot + w_self) + w_self * w_self
                 if norm_sq > 1e-12:
-                    num += p["w_tag"] * max(0.0, dot) / math.sqrt(norm_sq)
+                    why["tags"] = max(0.0, dot) / math.sqrt(norm_sq)
+                    num += p["w_tag"] * why["tags"]
                     wsum += p["w_tag"]
             parts = []
             if others:
@@ -532,7 +716,8 @@ class _Scorer:
             score = (num / wsum) if wsum else 0.0
             score -= self.penalties.get((a, cid), 0.0)
             out[cid] = max(0.0, score)
-        return out
+            detail[cid] = why
+        return (out, detail) if explain else out
 
     def score_all(self, albums=None):
         return {a: self.scores_for(a) for a in (albums if albums is not None else self.feats)}
@@ -719,63 +904,38 @@ def _louvain_groups(graph, resolution=1.0):
 
 # --- Naming ---------------------------------------------------------------
 
+def _album_groups_for_naming(feats, members, plays=None):
+    """{cid: [album keys]} -> genre_first_names input from the album features."""
+    plays = plays or {}
+    groups = {}
+    for cid, albs in members.items():
+        tags = defaultdict(int)
+        artist_weight = defaultdict(float)
+        for a in albs:
+            f = feats.get(a) or {}
+            for t in f.get("genres", []):
+                tags[t] += 1
+            if f.get("artist_title"):
+                artist_weight[f["artist_title"]] += 1 + plays.get(a, 0)
+        groups[cid] = {"tags": dict(tags), "size": len(albs),
+                       "artists": [n for n, _ in sorted(artist_weight.items(), key=lambda kv: kv[1], reverse=True)]}
+    return groups
+
+
 def _name_clusters(reg, feats, cids, labels, plays, api_key=None, debug=None):
-    """Names freshly created clusters from their albums' most distinctive
-    genre (idf-weighted, must cover >= 30% of the cluster) plus a dominant
-    mood; falls back to Gemini (if a key is available) or artist names."""
+    """Names freshly created clusters genre first (genre_first_names), keeping
+    clear of every other cluster's name."""
     if not cids:
         return
     members = defaultdict(list)
     for a, cid in labels.items():
         if cid in cids:
             members[cid].append(a)
-
-    n_all = max(len(feats), 1)
-    df = defaultdict(int)
-    for f in feats.values():
-        for t in set(f["genres"]):
-            df[t] += 1
-
-    used = {c.get("name") for cid, c in reg["clusters"].items() if cid not in cids and c.get("name")}
-    proposed, fallback = {}, {}
+    used = [c.get("name") for cid, c in reg["clusters"].items() if cid not in cids and c.get("name")]
+    names = genre_first_names(_album_groups_for_naming(feats, {c: members.get(c, []) for c in cids}, plays),
+                              used_names=used, api_key=api_key, debug=debug)
     for cid in cids:
-        albs = members.get(cid, [])
-        size = max(len(albs), 1)
-        g_counts, m_counts, artist_plays = defaultdict(int), defaultdict(int), defaultdict(int)
-        for a in albs:
-            f = feats[a]
-            for t in f["genres"]:
-                g_counts[t] += 1
-            for t in f["moods"]:
-                m_counts[t] += 1
-            if f.get("artist_title"):
-                artist_plays[f["artist_title"]] += 1 + plays.get(a, 0)
-
-        genre_candidates = [
-            (cnt / size * math.log(1 + n_all / df[t]), t) for t, cnt in g_counts.items()
-            if cnt / size >= 0.3 and not _is_always_generic_tag(t)
-        ]
-        genre = max(genre_candidates)[1] if genre_candidates else None
-        mood_candidates = [(cnt, t) for t, cnt in m_counts.items() if cnt / size >= 0.3]
-        mood = max(mood_candidates)[1] if mood_candidates else None
-        top_artists = [n for n, _ in sorted(artist_plays.items(), key=lambda kv: kv[1], reverse=True)[:5]]
-
-        if genre:
-            name = genre.title()
-            if mood and mood.lower() not in genre.lower():
-                name = f"{name} — {mood.title()}"
-            proposed[cid] = name
-        else:
-            fallback[cid] = {"artists": top_artists, "tags": [mood] if mood else []}
-            proposed[cid] = (f"{' & '.join(top_artists[:2])} Mix" if top_artists else "New Cluster")
-
-    if fallback and api_key:
-        llm = _llm_name_fallback_communities(fallback, api_key, debug=debug)
-        for cid, name in llm.items():
-            proposed[cid] = name
-
-    for cid in cids:
-        reg["clusters"][cid]["name"] = _finalize_community_name(proposed[cid], used)
+        reg["clusters"][cid]["name"] = names[cid]
 
 
 # --- Core curation pass -----------------------------------------------
@@ -835,7 +995,8 @@ def curate(reg, store, mode, plays=None, recent_plays=None, penalties=None, only
     for a in feats:
         cid = reg["albums"].get(a, {}).get("cluster")
         labels[a] = cid if cid in clusters else None
-    pinned = {a for a, e in reg["albums"].items() if e.get("pinned") and a in feats}
+    pinned = {a for a, e in reg["albums"].items() if (e.get("pinned") or e.get("excluded")) and a in feats}
+    unpinned = set()  # pinned albums whose cluster was retired go back to normal
     locked = {cid for cid, c in clusters.items() if c.get("locked")}
     pending = reg.setdefault("pending_moves", {})
     events = []
@@ -874,6 +1035,9 @@ def curate(reg, store, mode, plays=None, recent_plays=None, penalties=None, only
             if size < p["min_cluster_albums"]:
                 for a in scorer.members.get(cid, ()):
                     labels[a] = UNCLUSTERED_ID
+                    if a in pinned:
+                        pinned.discard(a)
+                        unpinned.add(a)
                 events.append({"type": "retired", "cluster_id": cid, "name": clusters[cid].get("name"),
                                "albums": size})
                 d(f"└ Retired `{clusters[cid].get('name')}` ({size} album(s) < {p['min_cluster_albums']}).")
@@ -1045,7 +1209,10 @@ def curate(reg, store, mode, plays=None, recent_plays=None, penalties=None, only
     for a in feats:
         cid = labels.get(a) or UNCLUSTERED_ID
         old = reg["albums"].get(a, {})
-        entry = {"cluster": cid, "pinned": bool(old.get("pinned"))}
+        entry = {"cluster": cid, "pinned": bool(old.get("pinned")) and a not in unpinned}
+        for flag in ("manual", "excluded"):
+            if old.get(flag) and a not in unpinned:
+                entry[flag] = True
         sc = table.get(a)
         if sc is None and old.get("cluster") == cid:
             entry["score"] = old.get("score")
@@ -1203,6 +1370,16 @@ def bootstrap_from_seeds(plex, seeds, locked_names=(), api_key=None, max_cluster
             if _assigned(e["cluster"]):
                 new_members[e["cluster"]].add(a)
         id_map, merged, retired = match_lineage(old_members, new_members)
+        # Clusters you made by hand and locked survive a commit as they are.
+        carried = [oid for oid, c in old["clusters"].items()
+                   if c.get("origin") == "manual" and c.get("locked") and oid not in id_map.values()]
+        for oid in carried:
+            reg["clusters"][oid] = dict(old["clusters"][oid], updated_gen=gen)
+            merged.pop(oid, None)
+            if oid in retired:
+                retired.remove(oid)
+        if carried:
+            d(f"└ Kept {len(carried)} locked cluster(s) you made by hand.")
 
         rename = {}
         for new_id, old_id in id_map.items():
@@ -1219,9 +1396,6 @@ def bootstrap_from_seeds(plex, seeds, locked_names=(), api_key=None, max_cluster
                 e["runner_up"][0] = rename.get(e["runner_up"][0], e["runner_up"][0])
         for e in events:
             e["cluster_id"] = rename.get(e["cluster_id"], e["cluster_id"])
-        for a, e in old["albums"].items():
-            if e.get("pinned") and a in reg["albums"]:
-                reg["albums"][a]["pinned"] = True
         for old_id, new_id in merged.items():
             into = rename.get(new_id, new_id)
             events.append({"type": "merged", "cluster_id": old_id, "name": old["clusters"].get(old_id, {}).get("name"),
@@ -1233,9 +1407,60 @@ def bootstrap_from_seeds(plex, seeds, locked_names=(), api_key=None, max_cluster
         d(f"└ Lineage vs gen {old['generation']}: {len(id_map)} continued, {len(merged)} merged, "
           f"{len(retired)} retired.")
 
+        manual = _carry_manual_albums(old, reg, rename, merged, feats)
+        if manual["kept"] or manual["returned"]:
+            d(f"└ Manual albums: {manual['kept']} kept in their cluster, "
+              f"{len(manual['returned'])} back to Unclustered (their cluster was retired).")
+    else:
+        manual = {"kept": 0, "returned": [], "excluded": 0}
+
+    _refresh_counts(reg)
     reg["last_scan_at"] = _now_iso()
     save_registry(reg)
-    return {"events": events, "stats": {k: v for k, v in stats.items() if k != "events"}, "generation": gen}
+    return {"events": events, "stats": {k: v for k, v in stats.items() if k != "events"}, "generation": gen,
+            "manual": manual}
+
+
+def _carry_manual_albums(old, reg, rename, merged, feats):
+    """After a commit's lineage step: albums you placed (or pinned) by hand
+    stay with their cluster — under its continued ID, or the cluster it
+    merged into; if it was retired they go back to Unclustered, unpinned.
+    "Never cluster" albums stay excluded. Returns a summary for the report."""
+    kept, returned, excluded = 0, [], 0
+    for a, e in old["albums"].items():
+        entry = reg["albums"].get(a)
+        if entry is None:
+            continue
+        if e.get("excluded"):
+            entry.update(cluster=UNCLUSTERED_ID, excluded=True, pinned=False)
+            excluded += 1
+            continue
+        if not e.get("pinned"):
+            continue
+        old_cid = e.get("cluster")
+        target = old_cid if old_cid in reg["clusters"] else None
+        if target is None and old_cid in merged:
+            target = rename.get(merged[old_cid], merged[old_cid])
+        if target and target != UNCLUSTERED_ID and target in reg["clusters"]:
+            entry.update(cluster=target, pinned=True, score=None)
+            if e.get("manual"):
+                entry["manual"] = True
+            kept += 1
+        else:
+            entry.update(cluster=UNCLUSTERED_ID, pinned=False)
+            entry.pop("manual", None)
+            f = feats.get(a) or {}
+            returned.append(f"{f.get('artist_title') or '?'} — {f.get('title') or a}")
+    return {"kept": kept, "returned": returned, "excluded": excluded}
+
+
+def _refresh_counts(reg):
+    counts = defaultdict(int)
+    for e in reg["albums"].values():
+        if not e.get("excluded"):
+            counts[e.get("cluster")] += 1
+    for cid, c in reg["clusters"].items():
+        c.setdefault("stats", {})["albums"] = counts.get(cid, 0)
 
 
 def sync_new_albums(plex, debug=None):

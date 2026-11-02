@@ -15,8 +15,8 @@ import streamlit as st
 import cluster_registry
 import curation
 from clustering import (
-    apply_merge_plan, artist_cluster_map_from_albums, build_clusters, clear_all_caches,
-    clear_artist_scan_cache, get_all_genre_and_mood_tags, load_build_cache, save_build_cache,
+    PROPOSAL_MAX_CLUSTERS, apply_merge_plan, artist_cluster_map_from_albums, build_clusters, clear_all_caches,
+    clear_artist_scan_cache, get_all_genre_and_mood_tags, load_build_cache, propose_clusters, save_build_cache,
     suggest_cluster_names,
 )
 from tabs import registry_panel
@@ -25,6 +25,7 @@ _SESSION_DEFAULTS = {
     'cluster_build': None,          # raw build dict from clustering.build_clusters
     'cluster_merge_plan': [],       # [{"members": [...], "new_name": str}, ...]
     'cluster_locked': "",
+    'cluster_total': 10,            # "Maximum number of clusters" (set by the input, the scan or a proposal)
     'suggested_snapshot': None,     # {genre_tags, mood_tags, total_clusters, clusters, mapping}
     'cluster_tag_counts': None,     # {"genre": n, "mood": n} from the tag scan
     'cluster_tag_preview': None,
@@ -128,7 +129,20 @@ def _render_clean_slate(debug_box):
 
 def _render_build_settings(music_section, gemini_api_key):
     st.subheader("1. Scan your library")
-    st.caption("Free — no Gemini call. Gives the cluster count below real numbers to work from.")
+    st.caption("Free — no Gemini call (except to name a group whose tags say nothing about its genre).")
+    if st.button("🔎 Scan & propose clusters", type="primary"):
+        if st.session_state.get('force_rescan_artists', False):
+            clear_artist_scan_cache()
+        with st.spinner("Scanning the library and trying different cluster counts..."):
+            try:
+                st.session_state['cluster_proposal'] = propose_clusters(
+                    music_section, album_features=cluster_registry.load_album_features()["albums"],
+                    api_key=gemini_api_key,
+                )
+            except Exception as e:
+                st.error(f"Couldn't propose clusters: {e}")
+    _render_proposal()
+
     if st.button("👀 Scan genre/mood tags"):
         if st.session_state.get('force_rescan_artists', False):
             clear_artist_scan_cache()
@@ -152,7 +166,7 @@ def _render_build_settings(music_section, gemini_api_key):
 
     st.subheader("2. Cluster count & vibes")
     total_clusters = int(st.number_input(
-        "Maximum number of clusters", min_value=2, max_value=40, value=10, key="cluster_total"
+        "Maximum number of clusters", min_value=2, max_value=40, key="cluster_total"
     ))
     st.caption(
         "A real cap: Gemini may use fewer if the library doesn't support this many distinct groups "
@@ -222,6 +236,32 @@ def _render_build_settings(music_section, gemini_api_key):
         )
     settings["force_rescan"] = st.session_state.get("force_rescan_artists", False)
     return settings
+
+
+def _render_proposal():
+    proposal = st.session_state.get('cluster_proposal')
+    if not proposal:
+        return
+    with st.container(border=True):
+        st.markdown(
+            f"**Proposed: {proposal['count']} clusters** (at most {PROPOSAL_MAX_CLUSTERS}) covering "
+            f"{proposal['coverage']:.0%} of your albums — the count where your artists split into the most "
+            f"clearly separated groups. {proposal['unlinked_artists']} artist(s) have no 'Similar Artist' links in "
+            f"Plex; their albums get scored individually when you commit."
+        )
+        for c in proposal["clusters"]:
+            st.markdown(f"- **{c['name']}** — {c['albums']} albums · {c['artists']} artists  \n"
+                        f"  <small>{', '.join(c['top_artists'])}</small>", unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        if c1.button(f"✅ Use {proposal['count']} as the cluster count", use_container_width=True):
+            st.session_state['cluster_total'] = proposal['count']
+            st.rerun()
+        if c2.button("🏷️ Also use these names as vibes", use_container_width=True,
+                     help="Fills 'Cluster vibes / names' below. In Tags mode Gemini then builds exactly these "
+                          "clusters; committed clusters with these names are locked against weekly curation."):
+            st.session_state['cluster_total'] = proposal['count']
+            st.session_state['cluster_locked'] = ", ".join(c["name"] for c in proposal["clusters"])
+            st.rerun()
 
 
 def _suggested_range(total_tags):
@@ -320,6 +360,7 @@ def _render_build_step(plex, music_section, gemini_api_key, debug_box, settings)
                 clustering_mode=settings["clustering_mode"],
                 sonic_artist_sample_size=int(settings["sonic_artist_sample_size"]),
                 sonic_boost=float(settings["sonic_boost"]), sonic_use_cache=bool(settings["sonic_use_cache"]),
+                album_features=cluster_registry.load_album_features()["albums"],
             )
             st.session_state['cluster_build'] = build
             st.session_state['cluster_merge_plan'] = []

@@ -12,11 +12,13 @@ the last curation report, and per cluster:
 Heavy work (sync, curation, rollback) runs in background threads via
 cluster_registry.run_background_job so the page never blocks on it."""
 
+import pandas as pd
 import streamlit as st
 
 import cluster_registry as cr
 import curation
 import live_playlists as lp
+from tabs import album_editor
 from ui_components import render_track_row
 
 
@@ -72,6 +74,11 @@ def _render_report(report):
         sub = rec["sub"]
         what = "playlist deleted" if rec.get("playlist_deleted") else (rec.get("note") or "removed")
         st.write(f"- 🧹 Stale mix **{sub.get('playlist_name')}** — {(sub.get('stale') or {}).get('reason')} ({what})")
+    manual = report.get("manual") or {}
+    if manual.get("kept") or manual.get("returned"):
+        st.write(f"- 📌 Albums placed by hand: {manual.get('kept', 0)} kept in their cluster"
+                 + (f", {len(manual['returned'])} back to Unclustered (cluster retired): "
+                    + ", ".join(manual["returned"][:5]) if manual.get("returned") else ""))
     for rec in report.get("created_mixes") or []:
         if rec.get("error"):
             st.write(f"- ⚠️ Live Mix for **{rec.get('name')}** failed: {rec['error']}")
@@ -135,22 +142,39 @@ def render(plex, plex_url, plex_token, gemini_api_key):
                 _render_report(r)
 
     feats = cr.load_album_features()["albums"]
+    album_editor.render_undo(busy)
+    manual_counts = {}
+    for e in reg["albums"].values():
+        if e.get("manual"):
+            manual_counts[e.get("cluster")] = manual_counts.get(e.get("cluster"), 0) + 1
     for cid, cluster, count in rows:
         stats = cluster.get("stats") or {}
         label_bits = [f"{count} albums"]
+        if manual_counts.get(cid):
+            label_bits.append(f"{manual_counts[cid]} 📌")
         if stats.get("cohesion") is not None:
             label_bits.append(f"cohesion {stats['cohesion']:.2f}")
         if stats.get("plays_28d") is not None:
             label_bits.append(f"{stats['plays_28d']} plays/28d")
         lock = "🔒 " if cluster.get("locked") else ""
         with st.expander(f"{lock}{cluster.get('name')} — {' · '.join(label_bits)}"):
+            if cid == cr.UNCLUSTERED_ID:
+                tab_assign, tab_pl = st.tabs(["🧩 Assign", "🎧 Playlist"])
+                with tab_assign:
+                    album_editor.render(plex, plex_url, plex_token, reg, cid, feats, busy)
+                with tab_pl:
+                    _render_playlist_tab(plex, plex_url, plex_token, reg, cid, cluster, count)
+                continue
             tab_pl, tab_albums, tab_manage = st.tabs(["🎧 Playlist", "💿 Albums", "⚙️ Manage"])
             with tab_pl:
                 _render_playlist_tab(plex, plex_url, plex_token, reg, cid, cluster, count)
             with tab_albums:
-                _render_album_list(reg, cid, feats)
+                album_editor.render(plex, plex_url, plex_token, reg, cid, feats, busy)
             with tab_manage:
                 _render_manage_tab(reg, cid, cluster, feats, busy)
+
+    with st.expander("🏷️ Names"):
+        _render_names(reg, gemini_api_key, busy)
 
     with st.expander("⚙️ Curation settings"):
         _render_params(reg, busy)
@@ -325,29 +349,19 @@ def _album_label(feats, a):
     return f"{f.get('artist_title') or '?'} — {f.get('title') or a}"
 
 
-def _render_album_list(reg, cid, feats):
-    members = cr.cluster_album_keys(reg, cid)
-    ranked = sorted(members, key=lambda a: reg["albums"][a].get("score") or 0, reverse=True)
-    artists = len({feats.get(a, {}).get("artist_key") for a in members})
-    st.caption(f"{len(members)} albums by {artists} artists, best fit first (fit score 0–1).")
-    lines = []
-    for a in ranked[:100]:
-        score = reg["albums"][a].get("score")
-        lines.append(f"{'📌 ' if reg['albums'][a].get('pinned') else ''}{_album_label(feats, a)}"
-                     + (f"  ({score:.2f})" if score is not None else ""))
-    st.code("\n".join(lines) or "(empty)")
-    if len(ranked) > 100:
-        st.caption(f"…and {len(ranked) - 100} more.")
-
-
 def _render_manage_tab(reg, cid, cluster, feats, busy):
-    if cid == cr.UNCLUSTERED_ID:
-        st.caption("Albums that don't fit any cluster well enough yet. The weekly curation tries to form "
-                   "new clusters from them when there's room under the cluster cap.")
-        return
+    new_name = st.text_input("Name", value=cluster.get("name"), key=f"registry_name_{cid}_{reg.get('revision')}", disabled=busy)
+    if new_name.strip() and new_name.strip() != cluster.get("name") and st.button(
+            "💾 Rename", key=f"registry_rename_{cid}", disabled=busy):
+        cr.rename_cluster(cid, new_name)
+        lp.apply_cluster_events([], cr.load_registry())  # its Live Mix follows the new name
+        st.rerun()
+    # Widget keys carry the registry version: Streamlit keeps a keyed widget's old
+    # value across reruns, so after a change made elsewhere (e.g. albums pinned in
+    # the album editor) a stale multiselect would otherwise undo it.
     locked = st.toggle(
         "Lock (never merged, split, retired, or loses albums)", value=bool(cluster.get("locked")),
-        key=f"registry_lock_{cid}", disabled=busy,
+        key=f"registry_lock_{cid}_{reg.get('revision')}", disabled=busy,
     )
     if locked != bool(cluster.get("locked")):
         cr.set_cluster_locked(cid, locked)
@@ -357,11 +371,35 @@ def _render_manage_tab(reg, cid, cluster, feats, busy):
     pinned_now = [a for a in members if reg["albums"][a].get("pinned")]
     pinned = st.multiselect(
         "Pinned albums (never moved by curation)", members, default=pinned_now,
-        format_func=lambda a: _album_label(feats, a), key=f"registry_pins_{cid}", disabled=busy,
+        format_func=lambda a: _album_label(feats, a), key=f"registry_pins_{cid}_{reg.get('revision')}", disabled=busy,
     )
     if set(pinned) != set(pinned_now):
         cr.set_albums_pinned(set(pinned) - set(pinned_now), True)
         cr.set_albums_pinned(set(pinned_now) - set(pinned), False)
+        st.rerun()
+
+
+def _render_names(reg, gemini_api_key, busy):
+    st.caption("Re-names every cluster after its most distinctive genre or style (e.g. 'Folk Metal', "
+               "'Ska Punk', 'Metalcore') — no era or mood words. Locked clusters keep their names. Live Mix "
+               "playlists named '[Mix] <cluster>' are renamed along with them.")
+    if st.button("🏷️ Propose genre names", disabled=busy, key="names_propose"):
+        st.session_state["names_proposal"] = cr.propose_genre_names(reg, api_key=gemini_api_key)
+    proposal = st.session_state.get("names_proposal")
+    if proposal is None:
+        return
+    if not proposal:
+        st.success("All cluster names already match their genre.")
+        return
+    rows = [{"Rename": True, "Now": reg["clusters"][cid]["name"], "New": name, "cid": cid}
+            for cid, name in proposal.items() if cid in reg["clusters"]]
+    edited = st.data_editor(pd.DataFrame(rows), hide_index=True, use_container_width=True, key="names_editor",
+                            column_config={"cid": None, "Rename": st.column_config.CheckboxColumn(width="small")},
+                            disabled=["Now"])
+    chosen = {r["cid"]: r["New"].strip() for _, r in edited.iterrows() if r["Rename"] and str(r["New"]).strip()}
+    if st.button(f"✅ Apply {len(chosen)} name(s)", type="primary", disabled=busy or not chosen, key="names_apply"):
+        lp.apply_cluster_events([], cr.apply_cluster_names(chosen))
+        st.session_state.pop("names_proposal", None)
         st.rerun()
 
 
