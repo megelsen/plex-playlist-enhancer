@@ -104,7 +104,7 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key, lastfm_api_key
 # --- 1. Method ----------------------------------------------------------------
 
 _METHODS = {
-    "sonic": "🔗 Relational — similar artists (recommended, no Gemini)",
+    "sonic": "🔗 Relational — similar artists (recommended)",
     "tags": "🏷️ Tags — your genre/mood tags (uses Gemini)",
 }
 
@@ -115,9 +115,10 @@ def _render_method():
                      label_visibility="collapsed")
     mode = next(m for m, text in _METHODS.items() if text == label)
     if mode == "sonic":
-        st.caption("Artists are grouped by Plex's 'Similar Artist' links (what 🌌 Library Galaxy shows), "
-                   "optionally strengthened by audio matching; each group brings all its artists' albums. "
-                   "Clusters are named after their genre. Needs no Gemini key.")
+        st.caption("Artists are grouped by similarity — Plex's 'Similar Artist' links (what 🌌 Library Galaxy "
+                   "shows), Last.fm's similar artists and genre tags if you have a key, optionally audio matching; "
+                   "each group brings all its artists' albums. Works without Gemini (names then come from genre "
+                   "tags); with a Gemini key, one Gemini call checks the groups and names them by genre.")
     else:
         st.caption("Gemini sorts every genre/mood tag in your library into clusters; each album joins the "
                    "cluster most of its tracks' tags point to. Best when your tags are clean and you want "
@@ -138,7 +139,8 @@ def _render_relational_clusters(music_section, gemini_api_key, lastfm_api_key=No
                    "and better names.")
     if st.button("🔎 Scan & propose", type="primary",
                  help="Tries several cluster counts on your artists' similarity links and picks the one with the "
-                      "most clearly separated groups (at most 19). Free."):
+                      "most clearly separated groups (at most 19). With a Gemini key, one Gemini call names the "
+                      "proposed groups."):
         with st.spinner("Scanning the library and trying different cluster counts..."):
             try:
                 proposal = propose_clusters(
@@ -163,11 +165,12 @@ def _render_relational_clusters(music_section, gemini_api_key, lastfm_api_key=No
         sample_size = st.slider("Sampled tracks per artist", 3, 10, 6, 1, key="sonic_artist_sample_size")
         use_cache = st.checkbox("Reuse cached artist profiles", value=True, key="sonic_use_cache")
         gemini_check = st.checkbox(
-            "🤖 Let Gemini check the groups", value=bool(gemini_api_key), disabled=not gemini_api_key,
+            "🤖 Let Gemini check and name the groups", value=bool(gemini_api_key), disabled=not gemini_api_key,
             key="gemini_check",
             help="One Gemini call after grouping: artists that clearly don't fit their group's genre (e.g. a "
-                 "post-punk band in a rap group) move to a better group, or are left for scoring on commit. "
-                 "At most 15% of a group's artists. Needs a Gemini key.",
+                 "post-punk band in a rap group) move to a better group, or are left for scoring on commit "
+                 "(at most 15% of a group's artists), and every group gets a genre name. Off: names come from "
+                 "genre tags. Needs a Gemini key.",
         )
         _render_rescan_option()
     return {
@@ -190,6 +193,7 @@ def _render_proposal():
             f"where your artists split into the most clearly separated groups. "
             f"{proposal['unlinked_artists']} artist(s) have no 'Similar Artist' links in Plex; their albums are "
             f"scored individually when you commit. The count below is set to {proposal['count']}."
+            + (" Names by 🤖 Gemini." if proposal.get("named_by_gemini") else " Names from genre tags.")
         )
         for c in proposal["clusters"]:
             st.markdown(f"- **{c['name']}** — {c['albums']} albums · {c['artists']} artists  \n"
@@ -374,6 +378,8 @@ def _render_review(plex, raw_build, gemini_api_key):
     mode = "Relational" if build.get("mode") == "sonic" else "Tags"
     if build.get("lastfm"):
         mode += " + Last.fm"
+    if build.get("named_by_gemini"):
+        mode += f" · 🤖 {build['named_by_gemini']} name(s) by Gemini"
     st.caption(
         f"{mode} build from {build.get('built_at')}: **{len(build['clusters'])} clusters** covering "
         f"{claimed} of {total_albums} albums ({len(build.get('unsorted', []))} unsorted). Unsorted albums "

@@ -41,7 +41,7 @@ from datetime import datetime
 import lastfm
 from clustering import (
     HAS_SONIC_GRAPH_DEPS, _build_plex_similar_edges, _finalize_community_name, _is_always_generic_tag,
-    build_artist_cluster_map, genre_first_names, get_cached_artists, lastfm_naming_group,
+    build_artist_cluster_map, gemini_names, genre_first_names, get_cached_artists, lastfm_naming_group,
 )
 from plex_helpers import get_sonic_match_percent
 
@@ -459,14 +459,15 @@ def _reason(why):
 
 def propose_genre_names(reg, api_key=None):
     """{cluster_id: new genre-first name} for every cluster except locked ones
-    (their names are yours) and Unclustered; unchanged names are omitted."""
+    (their names are yours) and Unclustered — by Gemini (one call) when a key
+    is given, else from Last.fm / album tags; unchanged names are omitted."""
     store = load_album_features()
     feats = store["albums"]
     targets = [cid for cid, c in reg["clusters"].items() if cid != UNCLUSTERED_ID and not c.get("locked")]
     keep = [c.get("name") for cid, c in reg["clusters"].items() if cid not in targets and c.get("name")]
     members = {cid: cluster_album_keys(reg, cid) for cid in targets}
-    names = genre_first_names(_album_groups_for_naming(feats, members, lastfm_tags=store.get("lastfm_tags")),
-                              used_names=keep, api_key=api_key)
+    groups = _album_groups_for_naming(feats, members, lastfm_tags=store.get("lastfm_tags"))
+    names, _n = gemini_names(groups, genre_first_names(groups, used_names=keep), api_key, used_names=keep)
     return {cid: n for cid, n in names.items() if n != reg["clusters"][cid].get("name")}
 
 
@@ -961,9 +962,9 @@ def _name_clusters(reg, feats, cids, labels, plays, api_key=None, lastfm_tags=No
         if cid in cids:
             members[cid].append(a)
     used = [c.get("name") for cid, c in reg["clusters"].items() if cid not in cids and c.get("name")]
-    names = genre_first_names(_album_groups_for_naming(feats, {c: members.get(c, []) for c in cids}, plays,
-                                                       lastfm_tags),
-                              used_names=used, api_key=api_key, debug=debug)
+    groups = _album_groups_for_naming(feats, {c: members.get(c, []) for c in cids}, plays, lastfm_tags)
+    names, _n = gemini_names(groups, genre_first_names(groups, used_names=used, debug=debug), api_key,
+                             used_names=used, debug=debug)
     for cid in cids:
         reg["clusters"][cid]["name"] = names[cid]
 

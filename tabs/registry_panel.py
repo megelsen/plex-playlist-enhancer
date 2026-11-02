@@ -380,9 +380,10 @@ def _render_manage_tab(reg, cid, cluster, feats, busy):
 
 
 def _render_names(reg, gemini_api_key, busy):
-    st.caption("Re-names every cluster after its most distinctive genre or style (e.g. 'Folk Metal', "
-               "'Ska Punk', 'Metalcore') — no era or mood words. Locked clusters keep their names. Live Mix "
-               "playlists named '[Mix] <cluster>' are renamed along with them.")
+    st.caption("Re-names every cluster by its genre (e.g. 'Folk Metal', 'Ska Punk', 'Metalcore') — no era or "
+               "mood words. With a Gemini key, one Gemini call names them from their artists; otherwise the "
+               "names come from Last.fm / Plex genre tags. Locked clusters keep their names. Live Mix playlists "
+               "named '[Mix] <cluster>' are renamed along with them.")
     if st.button("🏷️ Propose genre names", disabled=busy, key="names_propose"):
         st.session_state["names_proposal"] = cr.propose_genre_names(reg, api_key=gemini_api_key)
     proposal = st.session_state.get("names_proposal")

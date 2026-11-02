@@ -367,9 +367,14 @@ Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
     AllMusic styles ("British Metal", "Pop/Rock").
   - **Album fit:** weekly curation uses the tags too when scoring albums.
   - **Cost:** two calls per artist, cached for 30 days.
-- **🤖 Gemini group check (Relational, optional):** after grouping, Gemini
-  flags artists that clearly don't fit their group's genre and moves them
-  (at most 15% per group). The review lists every move and its reason.
+- **🤖 Gemini check and naming (Relational, optional):** one Gemini call
+  after grouping:
+  - **Check:** it flags artists that clearly don't fit their group's genre
+    and moves them (at most 15% per group).
+  - **Names:** it names every group by genre ("Folk Metal", "Nu Metal").
+  - **Elsewhere:** the proposal, 🏷️ Names and new clusters from curation
+    use Gemini names too.
+  - **Fallback:** genre-tag names when there's no key or Gemini fails.
 - **Building clusters:** 1. pick the method → 2. clusters → 3. build → 4.
   review & commit, showing only the chosen method's controls.
   - **Relational** (default) needs no Gemini at all. 🔎 Scan & propose

@@ -826,6 +826,25 @@ def genre_first_names(groups, used_names=(), api_key=None, debug=None):
     return final
 
 
+GEMINI_NAMING_ARTISTS = 8   # artists per group shown to Gemini for naming
+
+
+def gemini_names(groups, tag_names, api_key, used_names=(), debug=None):
+    """Names groups with Gemini (one call), genre first, falling back to
+    `tag_names` for groups Gemini leaves out (or all of them without a key /
+    if the call fails). groups: genre_first_names input. Returns ({group_id:
+    name}, number named by Gemini) — unique and clear of used_names."""
+    llm = {}
+    if api_key and groups:
+        info = {gid: {"artists": g.get("artists", [])[:GEMINI_NAMING_ARTISTS],
+                      "tags": [t for t, _ in sorted(g["tags"].items(), key=lambda kv: kv[1], reverse=True)[:3]]}
+                for gid, g in groups.items()}
+        llm = _llm_name_fallback_communities(info, api_key, debug=debug)
+    taken = {u for u in used_names if u}
+    final = {gid: _finalize_community_name(llm.get(gid) or tag_names[gid], taken) for gid in groups}
+    return final, sum(1 for gid in groups if llm.get(gid))
+
+
 def _album_genre_tags(album, artist=None):
     """Genres + styles of an album (falling back to its artist's), lower-cased."""
     tags = {t.tag.strip().lower() for attr in ("genres", "styles")
@@ -901,17 +920,20 @@ GEMINI_CHECK_MAX_SHARE = 0.15       # at most this share of a group's artists ca
 
 def gemini_check_groups(communities, albums_by_artist, api_key, lastfm_artists=None, model=None,
                         timeout=GEMINI_TIMEOUT_SECONDS, debug=None):
-    """Asks Gemini which artists clearly don't belong to their group's genre
-    (e.g. a post-punk band in a rap group) and where they fit better.
+    """One Gemini call that (a) flags artists that clearly don't belong to
+    their group's genre (e.g. a post-punk band in a rap group), with the group
+    they fit better, and (b) names every group genre first.
 
-    communities: {group name: [artist objects]}. Returns a list of
-    {"artist": artist object, "from": name, "to": name or None, "reason": str}
-    — only artists that really are in "from", "to" only if it's another
-    group, at most GEMINI_CHECK_MAX_SHARE of a group's artists (at least 1).
-    Returns [] if Gemini fails; the build then simply keeps its groups."""
+    communities: {group name: [artist objects]}. Returns (moves, names):
+    moves = [{"artist": artist object, "from": name, "to": name or None,
+    "reason": str}] — only artists that really are in "from", "to" only if
+    it's another group, at most GEMINI_CHECK_MAX_SHARE of a group's artists
+    (at least 1); names = {current group name: cleaned new name}.
+    Returns ([], {}) if Gemini fails; the build then keeps its groups and
+    tag-based names."""
     d = debug.write if debug else (lambda *a, **k: None)
-    if not api_key or len(communities) < 2:
-        return []
+    if not api_key or not communities:
+        return [], {}
     lines = []
     by_name = {}
     for name, artists in communities.items():
@@ -934,11 +956,22 @@ artist's Last.fm genre tags, where known.
 For each flagged artist, give the group it fits better — exactly one of the
 group names below — or null if none of them fits.
 
+Then NAME every group by its GENRE as it stands after your moves: the most
+specific genre that fits most of its artists, in 1–3 words, e.g. "Folk
+Metal", "Nu Metal", "Post-Punk", "Ska Punk", "Metalcore", "Hip Hop",
+"Stoner Rock". Every group needs a different name; add a subgenre or a real
+regional word (e.g. "German Punk") only to tell two groups apart. NEVER use
+era, mood or marketing words: no "Modern", "Contemporary", "Classic" (except
+the genre "Classic Rock"), "Epic", "Fury", "Vibes", "Anthems", "Legends",
+"Atmospheres". The current group names come from tags and may be wrong.
+
 Groups:
 {chr(10).join(lines)}
 
-Respond with ONLY a JSON object, no markdown fences, no commentary:
-{{"moves": [{{"artist": "IDLES", "from": "Rap", "to": "Post-Punk", "reason": "post-punk band"}}]}}"""
+Respond with ONLY a JSON object, no markdown fences, no commentary. "names"
+maps each group's CURRENT name (as listed above) to its new name:
+{{"moves": [{{"artist": "IDLES", "from": "Rap", "to": "Post-Punk", "reason": "post-punk band"}}],
+  "names": {{"Rap": "Hip Hop", "Post-Punk": "Post-Punk"}}}}"""
     try:
         resp = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model or DEFAULT_GEMINI_MODEL}"
@@ -951,10 +984,12 @@ Respond with ONLY a JSON object, no markdown fences, no commentary:
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
-        raw_moves = json.loads(text.strip()).get("moves") or []
+        parsed = json.loads(text.strip())
+        raw_moves = parsed.get("moves") or []
+        raw_names = parsed.get("names") or {}
     except Exception as e:
-        d(f"⚠️ Gemini group check failed ({e}) — keeping the groups as they are.")
-        return []
+        d(f"⚠️ Gemini group check failed ({e}) — keeping the groups and their tag-based names.")
+        return [], {}
 
     moves, per_group = [], defaultdict(int)
     for m in raw_moves:
@@ -968,9 +1003,12 @@ Respond with ONLY a JSON object, no markdown fences, no commentary:
         dst = m.get("to") if m.get("to") in communities and m.get("to") != src else None
         per_group[src] += 1
         moves.append({"artist": artist, "from": src, "to": dst, "reason": str(m.get("reason") or "")[:120]})
+    names = {src: clean_cluster_name(str(n).strip()) for src, n in raw_names.items()
+             if src in communities and isinstance(n, str) and n.strip()}
     d(f"**Gemini group check:** {len(moves)} artist(s) flagged "
-      f"({sum(1 for m in moves if m['to'])} moved, {sum(1 for m in moves if not m['to'])} left unsorted).")
-    return moves
+      f"({sum(1 for m in moves if m['to'])} moved, {sum(1 for m in moves if not m['to'])} left unsorted); "
+      f"{len(names)} of {len(communities)} group(s) named.")
+    return moves, names
 
 
 def _representative_names(items, is_track, max_names=2):
@@ -1006,8 +1044,8 @@ def _llm_name_fallback_communities(fallback_info, api_key, model=None, timeout=6
         items.append(f'{{"id": "{cid}", "artists": "{artists}", "hint_tags": "{tags}"}}')
 
     prompt = f"""You are naming groups of musical artists that were clustered together by
-real listening/similarity data. The library's tags were too vague to name
-some groups, so use your own knowledge of these artists' actual sound.
+real listening/similarity data. Use your own knowledge of these artists'
+actual sound; the hint tags may be vague or misleading.
 
 Name each group by its GENRE — the most specific genre that fits most of its
 artists, in 1–3 words, e.g. "Folk Metal", "Ska Punk", "Post-Punk",
@@ -1439,6 +1477,7 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
     Gemini move artists that clearly don't fit their group (build["checked"])."""
     d = debug.write if debug else (lambda *a, **k: None)
     checked = []
+    named_by_gemini = 0
 
     if clustering_mode == "sonic":
         # Relational groups by Similar-Artist links and names by genre/style —
@@ -1479,7 +1518,7 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
             lastfm_artists=lastfm_artists, debug=debug
         )
         if gemini_check and api_key and not dry_run:
-            communities, checked = _apply_gemini_check(
+            communities, checked, named_by_gemini = _apply_gemini_check(
                 communities, albums_by_artist, api_key, album_features, lastfm_artists, debug=debug
             )
         for name, artists in communities.items():
@@ -1541,18 +1580,20 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
         "unsorted": unsorted,
         "albums": album_info,
         "checked": checked,
+        "named_by_gemini": named_by_gemini,
         "lastfm": bool(clustering_mode == "sonic" and lastfm.available(lastfm_api_key)),
     }
 
 
 def _apply_gemini_check(communities, albums_by_artist, api_key, album_features, lastfm_artists, debug=None):
     """Runs gemini_check_groups, moves the flagged artists (to their better
-    group, or out of all groups -> unsorted, scored on commit), and re-names
-    the groups whose membership changed. Returns (communities, checked) with
-    checked = [{"artist", "from", "to", "reason"}] (names, for the review)."""
-    moves = gemini_check_groups(communities, albums_by_artist, api_key, lastfm_artists, debug=debug)
-    if not moves:
-        return communities, []
+    group, or out of all groups -> unsorted, scored on commit) and names the
+    groups: Gemini's name where it gave one, else the tag-based name for the
+    group as it now stands. Returns (communities, checked, named_by_gemini)
+    with checked = [{"artist", "from", "to", "reason"}] (final names)."""
+    moves, gem_names = gemini_check_groups(communities, albums_by_artist, api_key, lastfm_artists, debug=debug)
+    if not moves and not gem_names:
+        return communities, [], 0
     groups = {name: list(artists) for name, artists in communities.items()}
     for m in moves:
         groups[m["from"]] = [a for a in groups[m["from"]] if a is not m["artist"]]
@@ -1560,13 +1601,16 @@ def _apply_gemini_check(communities, albums_by_artist, api_key, album_features, 
             groups[m["to"]].append(m["artist"])
     groups = {name: artists for name, artists in groups.items() if artists}
     ids = {i: name for i, name in enumerate(groups)}
-    new_names = genre_first_names(
-        _artist_groups_for_naming({i: groups[n] for i, n in ids.items()}, albums_by_artist, album_features,
-                                  lastfm_artists), api_key=api_key, debug=debug)
-    renamed = {ids[i]: new_names[i] for i in ids}
+    naming = _artist_groups_for_naming({i: groups[n] for i, n in ids.items()}, albums_by_artist, album_features,
+                                       lastfm_artists)
+    missing = [i for i, n in ids.items() if not gem_names.get(n)]
+    tag_names = genre_first_names(naming, api_key=api_key if missing else None, debug=debug)
+    taken = set()
+    renamed = {n: _finalize_community_name(gem_names.get(n) or tag_names[i], taken) for i, n in ids.items()}
     checked = [{"artist": m["artist"].title, "from": renamed.get(m["from"], m["from"]),
                 "to": renamed.get(m["to"], m["to"]) if m["to"] else None, "reason": m["reason"]} for m in moves]
-    return {renamed[n]: artists for n, artists in groups.items()}, checked
+    named = sum(1 for n in ids.values() if gem_names.get(n))
+    return {renamed[n]: artists for n, artists in groups.items()}, checked, named
 
 
 # --- Library scan: how many clusters, and which ----------------------------
@@ -1578,8 +1622,8 @@ PROPOSAL_RESOLUTIONS = (0.3, 0.45, 0.6, 0.8, 1.0, 1.25, 1.5, 2.0)
 def propose_clusters(music_section, max_clusters=PROPOSAL_MAX_CLUSTERS, album_features=None,
                      api_key=None, lastfm_api_key=None, debug=None):
     """Scans the library and proposes a cluster count (3..max_clusters, at
-    most 19) plus genre-first names — no Gemini needed unless some group has
-    no usable genre tags.
+    most 19) plus genre-first names — by Gemini (one call) when a key is
+    given, else from Last.fm / Plex tags.
 
     Louvain runs over the Similar-Artist graph (no sonic lookups, so it's
     quick) at several resolutions. Each run counts its "real" clusters:
@@ -1631,9 +1675,8 @@ def propose_clusters(music_section, max_clusters=PROPOSAL_MAX_CLUSTERS, album_fe
         best = dict(best, groups=best["groups"][:max_clusters], count=min(best["count"], max_clusters))
 
     communities = {i: [artist_by_key[k] for k in g] for i, g in enumerate(best["groups"])}
-    names = genre_first_names(_artist_groups_for_naming(communities, albums_by_artist, album_features,
-                                                        lastfm_artists),
-                              api_key=api_key, debug=debug)
+    naming = _artist_groups_for_naming(communities, albums_by_artist, album_features, lastfm_artists)
+    names, named_by_gemini = gemini_names(naming, genre_first_names(naming, debug=debug), api_key, debug=debug)
     clusters = []
     for i, members in communities.items():
         keys = [str(a.ratingKey) for a in members]
@@ -1646,5 +1689,6 @@ def propose_clusters(music_section, max_clusters=PROPOSAL_MAX_CLUSTERS, album_fe
       f"covering {best['coverage']:.0%} of albums.")
     return {"count": len(clusters), "clusters": clusters, "coverage": best["coverage"],
             "modularity": best["modularity"], "resolution": best["resolution"],
-            "unlinked_artists": graph.number_of_nodes() - len(linked), "lastfm": bool(lastfm_artists)}
+            "unlinked_artists": graph.number_of_nodes() - len(linked), "lastfm": bool(lastfm_artists),
+            "named_by_gemini": named_by_gemini}
 

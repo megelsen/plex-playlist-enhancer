@@ -600,8 +600,22 @@ type the key into the sidebar for the UI only.
 artists only when `LASTFM_API_KEY` is set in the environment. Without it,
 they still use whatever is cached.
 
-**🤖 Gemini group check** (Relational builds, ⚙️ Advanced settings; on by
-default when a Gemini key is set) runs once after grouping and naming:
+**🤖 Gemini check and naming** (Relational builds, ⚙️ Advanced settings; on
+by default when a Gemini key is set) is **one** Gemini call after grouping.
+It checks the groups (below) *and* names every group by genre, e.g. "Folk
+Metal", "Nu Metal", "Post-Punk":
+- **Cleaning:** the names go through the same cleanup as all names (no
+  Modern/Fury/Vibes…), and duplicates are resolved.
+- **Fallback:** a group Gemini doesn't name, or the whole build if the call
+  fails or is switched off, keeps its genre-tag name.
+- **Review:** shows how many names came from Gemini.
+
+The same Gemini naming (one call; tag names as the fallback) is used by
+**🔎 Scan & propose**, by **🧬 → 🏷️ Names → Propose genre names**, and for
+clusters that weekly curation creates or splits off. Without a Gemini key,
+all names come from Last.fm / Plex genre tags (§14).
+
+**The check:**
 - **What Gemini gets:** every group's name and artists (up to 80 per group,
   most albums first), each with its top 3 Last.fm tags.
 - **What it's asked:** to flag only artists that *clearly* don't fit the
@@ -611,7 +625,7 @@ default when a Gemini key is set) runs once after grouping and naming:
   - the target is another existing group (otherwise the artist is left out
     of all groups and scored on commit),
   - and at most 15% of a group's artists are moved (at least 1).
-- **After the moves,** the changed groups are renamed.
+- **After the moves,** the groups are named as described above.
 - **If Gemini fails,** the groups simply stay as they were.
 - **Review:** "4. Review & commit" lists every move with its reason
   ("🤖 Gemini moved N artists").
