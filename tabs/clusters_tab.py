@@ -10,13 +10,14 @@
      membership and caps them at the build's cluster count.
 """
 
+import pandas as pd
 import streamlit as st
 
 import cluster_registry
 import curation
 import lastfm
 from clustering import (
-    apply_merge_plan, artist_cluster_map_from_albums, build_clusters, clear_all_caches,
+    apply_artist_moves, apply_merge_plan, artist_cluster_map_from_albums, undo_artist_moves, build_clusters, clear_all_caches,
     clear_artist_scan_cache, get_all_genre_and_mood_tags, load_build_cache, propose_clusters, save_build_cache,
     suggest_cluster_names,
 )
@@ -355,6 +356,57 @@ def _render_build_step(plex, music_section, gemini_api_key, debug_box, settings,
 
 # --- Review & commit ----------------------------------------------------------
 
+LEAVE_OUT = "— leave out (scored on commit)"
+
+
+def _render_suggestions(raw_build):
+    """Gemini's suggested artist moves: nothing is applied until you tick
+    them. You can also change a suggestion's target before applying."""
+    applied = raw_build.get("applied_moves") or []
+    done = {(m["artist_key"], m["from"]) for m in applied}
+    pending = [m for m in (raw_build.get("suggestions") or []) if (m["artist_key"], m["from"]) not in done]
+    if not pending and not applied:
+        return
+    with st.expander(f"🤖 Gemini suggests moving {len(pending)} artist(s)"
+                     + (f" · {len(applied)} applied" if applied else ""), expanded=bool(pending)):
+        if pending:
+            st.caption("Tick the moves that make sense and press Apply — the rest is simply dropped. You can "
+                       "change where an artist goes. 'Leave out' takes the artist out of every cluster; its "
+                       "albums are then scored on commit and land where they fit best (or in Unclustered).")
+            options = sorted(raw_build["clusters"]) + [LEAVE_OUT]
+            df = pd.DataFrame([{
+                "Apply": False, "Artist": m["artist"], "From": m["from"],
+                "To": m["to"] if m["to"] in raw_build["clusters"] else LEAVE_OUT,
+                "Why": m.get("reason", ""), "id": m["id"],
+            } for m in pending])
+            edited = st.data_editor(
+                df, hide_index=True, use_container_width=True, key=f"suggest_moves_{len(applied)}",
+                disabled=["Artist", "From", "Why"],
+                column_config={"Apply": st.column_config.CheckboxColumn(width="small"),
+                               "To": st.column_config.SelectboxColumn(options=options, width="medium"),
+                               "id": None},
+            )
+            by_id = {m["id"]: m for m in pending}
+            chosen = [dict(by_id[r["id"]], to=None if r["To"] == LEAVE_OUT else r["To"])
+                      for _, r in edited.iterrows() if r["Apply"] and r["To"] != r["From"]]
+            if st.button(f"✅ Apply {len(chosen)} move(s)", type="primary", disabled=not chosen,
+                         key="apply_suggested_moves"):
+                moved = apply_artist_moves(raw_build, chosen)
+                save_build_cache(raw_build, st.session_state['cluster_merge_plan'])
+                st.session_state['moves_msg'] = f"Moved {moved} artist(s)."
+                st.rerun()
+        msg = st.session_state.pop('moves_msg', None)
+        if msg:
+            st.success(msg)
+        if applied:
+            st.write("**Applied:** " + "; ".join(
+                f"{m['artist']} → {m['to'] or 'left out'}" for m in applied))
+            if st.button("↩️ Undo applied moves", key="undo_suggested_moves"):
+                undo_artist_moves(raw_build)
+                save_build_cache(raw_build, st.session_state['cluster_merge_plan'])
+                st.rerun()
+
+
 def _cluster_summary(build, name):
     keys = build["clusters"].get(name, [])
     albums = build["albums"]
@@ -397,13 +449,7 @@ def _render_review(plex, raw_build, gemini_api_key):
         with col2:
             st.caption(", ".join(top))
 
-    checked = raw_build.get("checked") or []
-    if checked:
-        with st.expander(f"🤖 Gemini moved {len(checked)} artist(s) that didn't fit their group"):
-            for m in checked:
-                where = f"→ **{m['to']}**" if m.get("to") else "→ left out (scored on commit)"
-                st.markdown(f"- **{m['artist']}**: {m['from']} {where}"
-                            + (f" — {m['reason']}" if m.get("reason") else ""))
+    _render_suggestions(raw_build)
 
     with st.expander(f"🔗 Combine clusters ({len(raw_build['clusters'])} in the build)"):
         st.caption("Pick two or more clusters to combine into one broader cluster before committing. "

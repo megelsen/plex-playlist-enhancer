@@ -369,8 +369,10 @@ Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
   - **Cost:** two calls per artist, cached for 30 days.
 - **🤖 Gemini check and naming (Relational, optional):** one Gemini call
   after grouping:
-  - **Check:** it flags artists that clearly don't fit their group's genre
-    and moves them (at most 15% per group).
+  - **Check:** it *suggests* moving artists that clearly don't fit their
+    group's genre (at most 15% per group). In the review you tick the moves
+    that make sense, can change their target, and apply them (with undo).
+    The rest is dropped.
   - **Names:** it names every group by genre ("Folk Metal", "Nu Metal").
   - **Elsewhere:** the proposal, 🏷️ Names and new clusters from curation
     use Gemini names too.

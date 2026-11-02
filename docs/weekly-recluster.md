@@ -615,18 +615,32 @@ The same Gemini naming (one call; tag names as the fallback) is used by
 clusters that weekly curation creates or splits off. Without a Gemini key,
 all names come from Last.fm / Plex genre tags (§14).
 
-**The check:**
-- **What Gemini gets:** every group's name and artists (up to 80 per group,
-  most albums first), each with its top 3 Last.fm tags.
-- **What it's asked:** to flag only artists that *clearly* don't fit the
-  group's genre, and to say which other group fits better, or none.
-- **Accepted only if:**
-  - the artist really is in that group,
-  - the target is another existing group (otherwise the artist is left out
-    of all groups and scored on commit),
-  - and at most 15% of a group's artists are moved (at least 1).
-- **After the moves,** the groups are named as described above.
-- **If Gemini fails,** the groups simply stay as they were.
-- **Review:** "4. Review & commit" lists every move with its reason
-  ("🤖 Gemini moved N artists").
+**The check makes suggestions, nothing more.** Gemini flags artists that
+*clearly* don't fit their group's genre and says which other group fits
+better, or none. Nothing is moved during the build.
+
+**What Gemini gets:** every group's name and artists (up to 80 per group,
+most albums first), each with its top 3 Last.fm tags.
+
+**Which suggestions are kept:**
+- the artist really is in that group,
+- the target is another existing group (otherwise the suggestion is "leave
+  out"),
+- and at most 15% of a group's artists are flagged (at least 1).
+
+**Reviewing them:** "4. Review & commit" → **🤖 Gemini suggests moving N
+artists** shows a table with each artist, its group, the suggested target
+and Gemini's reason:
+- **Choose:** tick the moves that make sense. You can **change the target**
+  (any cluster, or "leave out").
+- **✅ Apply:** moves the ticked artists' albums. Unticked suggestions are
+  simply dropped. "Leave out" takes the artist out of every cluster; its
+  albums are scored on commit and land where they fit best, or in
+  Unclustered.
+- **↩️ Undo applied moves** reverses them.
+- **Saved:** applied moves are stored in the saved build, so they survive a
+  page reload.
+
+**If Gemini fails,** there are no suggestions and the build keeps its
+tag-based names.
 

@@ -956,8 +956,8 @@ artist's Last.fm genre tags, where known.
 For each flagged artist, give the group it fits better — exactly one of the
 group names below — or null if none of them fits.
 
-Then NAME every group by its GENRE as it stands after your moves: the most
-specific genre that fits most of its artists, in 1–3 words, e.g. "Folk
+Then NAME every group by its main GENRE: the most specific genre that fits
+most of its artists, in 1–3 words, e.g. "Folk
 Metal", "Nu Metal", "Post-Punk", "Ska Punk", "Metalcore", "Hip Hop",
 "Stoner Rock". Every group needs a different name; add a subgenre or a real
 regional word (e.g. "German Punk") only to tell two groups apart. NEVER use
@@ -1473,10 +1473,12 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
        "albums": {album key: {"title", "artist", "artist_key", "plays"}}}
 
     "plays" is a play count (integer). Relational builds use Last.fm (tags +
-    similar artists) when a key is available, and with gemini_check let
-    Gemini move artists that clearly don't fit their group (build["checked"])."""
+    similar artists) when a key is available, and with gemini_check one Gemini
+    call names the groups and SUGGESTS moving artists that don't fit
+    (build["suggestions"]) — applied only if you accept them in the review
+    (apply_artist_moves)."""
     d = debug.write if debug else (lambda *a, **k: None)
-    checked = []
+    suggestions = []
     named_by_gemini = 0
 
     if clustering_mode == "sonic":
@@ -1518,7 +1520,7 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
             lastfm_artists=lastfm_artists, debug=debug
         )
         if gemini_check and api_key and not dry_run:
-            communities, checked, named_by_gemini = _apply_gemini_check(
+            communities, suggestions, named_by_gemini = _apply_gemini_check(
                 communities, albums_by_artist, api_key, album_features, lastfm_artists, debug=debug
             )
         for name, artists in communities.items():
@@ -1579,38 +1581,79 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
         "clusters": result_clusters,
         "unsorted": unsorted,
         "albums": album_info,
-        "checked": checked,
+        "suggestions": suggestions,
+        "applied_moves": [],
         "named_by_gemini": named_by_gemini,
         "lastfm": bool(clustering_mode == "sonic" and lastfm.available(lastfm_api_key)),
     }
 
 
 def _apply_gemini_check(communities, albums_by_artist, api_key, album_features, lastfm_artists, debug=None):
-    """Runs gemini_check_groups, moves the flagged artists (to their better
-    group, or out of all groups -> unsorted, scored on commit) and names the
-    groups: Gemini's name where it gave one, else the tag-based name for the
-    group as it now stands. Returns (communities, checked, named_by_gemini)
-    with checked = [{"artist", "from", "to", "reason"}] (final names)."""
+    """Runs gemini_check_groups: names the groups (Gemini's name where it gave
+    one, else the tag-based name) and turns the flagged artists into
+    SUGGESTIONS — nothing is moved here. Returns (communities, suggestions,
+    named_by_gemini) with suggestions = [{"id", "artist", "artist_key",
+    "from", "to" (or None = leave out), "reason"}] using the final names."""
     moves, gem_names = gemini_check_groups(communities, albums_by_artist, api_key, lastfm_artists, debug=debug)
     if not moves and not gem_names:
         return communities, [], 0
-    groups = {name: list(artists) for name, artists in communities.items()}
-    for m in moves:
-        groups[m["from"]] = [a for a in groups[m["from"]] if a is not m["artist"]]
-        if m["to"]:
-            groups[m["to"]].append(m["artist"])
-    groups = {name: artists for name, artists in groups.items() if artists}
-    ids = {i: name for i, name in enumerate(groups)}
-    naming = _artist_groups_for_naming({i: groups[n] for i, n in ids.items()}, albums_by_artist, album_features,
-                                       lastfm_artists)
+    ids = {i: name for i, name in enumerate(communities)}
+    naming = _artist_groups_for_naming({i: communities[n] for i, n in ids.items()}, albums_by_artist,
+                                       album_features, lastfm_artists)
     missing = [i for i, n in ids.items() if not gem_names.get(n)]
     tag_names = genre_first_names(naming, api_key=api_key if missing else None, debug=debug)
     taken = set()
     renamed = {n: _finalize_community_name(gem_names.get(n) or tag_names[i], taken) for i, n in ids.items()}
-    checked = [{"artist": m["artist"].title, "from": renamed.get(m["from"], m["from"]),
-                "to": renamed.get(m["to"], m["to"]) if m["to"] else None, "reason": m["reason"]} for m in moves]
+    suggestions = [{"id": i, "artist": m["artist"].title, "artist_key": str(m["artist"].ratingKey),
+                    "from": renamed[m["from"]], "to": renamed[m["to"]] if m["to"] else None,
+                    "reason": m["reason"]} for i, m in enumerate(moves)]
     named = sum(1 for n in ids.values() if gem_names.get(n))
-    return {renamed[n]: artists for n, artists in groups.items()}, checked, named
+    return {renamed[n]: artists for n, artists in communities.items()}, suggestions, named
+
+
+def apply_artist_moves(build, moves):
+    """Applies accepted moves to a build IN PLACE. moves: [{"artist_key",
+    "artist", "from", "to" (cluster name or None = leave out -> unsorted)}].
+    Moves the artist's albums that are in "from"; records each applied move
+    (with its albums) in build["applied_moves"] so undo_artist_moves can
+    reverse it. Returns the number of artists moved."""
+    clusters = build["clusters"]
+    unsorted = set(build.get("unsorted", []))
+    applied = build.setdefault("applied_moves", [])
+    done = 0
+    for m in moves:
+        src, dst = m["from"], m.get("to")
+        if src not in clusters or (dst is not None and dst not in clusters) or dst == src:
+            continue
+        albums = [k for k in clusters[src] if (build["albums"].get(k) or {}).get("artist_key") == m["artist_key"]]
+        if not albums:
+            continue
+        clusters[src] = [k for k in clusters[src] if k not in albums]
+        if dst:
+            clusters[dst] = sorted(set(clusters[dst]) | set(albums))
+        else:
+            unsorted |= set(albums)
+        applied.append({"artist": m.get("artist"), "artist_key": m["artist_key"], "from": src, "to": dst,
+                        "albums": albums})
+        done += 1
+    build["unsorted"] = sorted(unsorted)
+    build["clusters"] = {n: keys for n, keys in clusters.items()}
+    return done
+
+
+def undo_artist_moves(build):
+    """Reverses every move recorded by apply_artist_moves (latest first)."""
+    clusters = build["clusters"]
+    unsorted = set(build.get("unsorted", []))
+    for m in reversed(build.get("applied_moves") or []):
+        albums = set(m["albums"])
+        if m["to"] and m["to"] in clusters:
+            clusters[m["to"]] = [k for k in clusters[m["to"]] if k not in albums]
+        unsorted -= albums
+        if m["from"] in clusters:
+            clusters[m["from"]] = sorted(set(clusters[m["from"]]) | albums)
+    build["unsorted"] = sorted(unsorted)
+    build["applied_moves"] = []
 
 
 # --- Library scan: how many clusters, and which ----------------------------
