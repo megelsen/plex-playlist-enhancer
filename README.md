@@ -350,8 +350,9 @@ Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
   a Live Mix instead.
 - **Placing albums by hand:**
   - **🧬 → Unclustered → 🧩 Assign:** suggested clusters per album, with a
-    reason; apply edits in bulk, accept every suggestion above a fit, make
-    a new cluster, or mark albums "never cluster".
+    reason. Only the rows you tick are applied (a helper ticks every
+    suggestion above a fit for review). You can also make a new cluster or
+    mark albums "never cluster".
   - **💿 Albums in any cluster:** "Move to".
   - Placed albums are pinned (📌): weekly curation and commits keep them
     where you put them. A card view works on phones, and every change can

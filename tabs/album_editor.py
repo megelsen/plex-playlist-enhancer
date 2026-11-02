@@ -200,23 +200,32 @@ def render(plex, plex_url, plex_token, reg, cid, feats, busy):
 
 def _render_table(plex, plex_url, plex_token, reg, cid, members, feats, plays, sugg, names_to_id, options,
                   search, sort, group_by_artist, busy):
+    """Editable album table. Only TICKED rows (✓) are ever changed: the target
+    column is pre-filled with the suggestion as a proposal, nothing more."""
     unclustered = cid == cr.UNCLUSTERED_ID
     prefill = 0.0
+    tick_at = st.session_state.get(f"ae_tick_at_{cid}")  # set by "Tick suggestions with fit ≥ x"
     if unclustered:
-        prefill = st.slider("Pre-fill the suggestion when its fit is at least", 0.0, 1.0, 0.25, 0.05,
+        prefill = st.slider("Show the suggestion as the target when its fit is at least", 0.0, 1.0, 0.25, 0.05,
                             key=f"ae_prefill_{cid}",
-                            help="Fit is the same 0–1 score curation uses. Rows below this stay empty.")
+                            help="Fit is the same 0–1 score curation uses. It only pre-fills 'Assign to' — "
+                                 "nothing changes until you tick the row and press Apply.")
     rows = _sort(_rows(reg, members, feats, plays, sugg, group_by_artist, search, unclustered), sort)
     shown = rows[:TABLE_MAX_ROWS]
     target_col = "Assign to" if unclustered else "Move to"
+
+    def _prefilled(r):
+        return bool(unclustered and r["sugg"] and r["fit"] >= min(prefill, tick_at if tick_at is not None else 1.0))
+
     df = pd.DataFrame([{
-        "✓": False, "Artist": r["artist"], "Album": r["album"], "Plays": r["plays"],
+        "✓": bool(tick_at is not None and r["sugg"] and r["fit"] >= tick_at),
+        "Artist": r["artist"], "Album": r["album"], "Plays": r["plays"],
         **({} if unclustered else {"Fit here": r["fit_here"]}),
         "Suggested": r["sugg"], "Fit": r["fit"], "Why": r["why"],
-        target_col: (r["sugg"] if unclustered and r["sugg"] and r["fit"] >= prefill else None),
+        target_col: r["sugg"] if _prefilled(r) else None,
         "key": r["key"],
     } for r in shown])
-    editor_key = (f"ae_table_{cid}_{reg.get('revision')}_{group_by_artist}_{sort}_{search}_{prefill}")
+    editor_key = (f"ae_table_{cid}_{reg.get('revision')}_{group_by_artist}_{sort}_{search}_{prefill}_{tick_at}")
     edited = st.data_editor(
         df, key=editor_key, hide_index=True, use_container_width=True,
         disabled=[c for c in df.columns if c not in ("✓", target_col)] if not busy else True,
@@ -238,30 +247,39 @@ def _render_table(plex, plex_url, plex_token, reg, cid, members, feats, plays, s
         return cell.split("|")
 
     targets = {}
+    unticked_with_target = 0
     for _, row in edited.iterrows():
         target = row[target_col]
-        if target and isinstance(target, str):
+        if not (target and isinstance(target, str)):
+            continue
+        if row["✓"]:
             targets.setdefault(target, []).extend(_keys(row["key"]))
+        else:
+            unticked_with_target += 1
     checked = [k for _, row in edited.iterrows() if row["✓"] for k in _keys(row["key"])]
 
     n_targets = sum(len(v) for v in targets.values())
-    if st.button(f"✅ Apply {n_targets} change(s)", type="primary", disabled=busy or not n_targets,
+    if st.button(f"✅ Apply {n_targets} ticked change(s)", type="primary", disabled=busy or not n_targets,
                  use_container_width=True, key=f"ae_apply_{cid}"):
         _assign_grouped(targets, names_to_id, "Placed by hand")
+        st.session_state.pop(f"ae_tick_at_{cid}", None)
         st.rerun()
+    st.caption("Only ticked rows (✓) with a target are applied"
+               + (f" — {unticked_with_target} unticked row(s) with a target are left as they are." if unticked_with_target else ".")
+               + " Tick a row without a target to use the actions below.")
 
     if unclustered:
-        threshold = st.slider("Accept every suggestion with fit at least", 0.0, 1.0, 0.35, 0.05,
-                              key=f"ae_accept_{cid}")
-        accept = {}
-        for a in members:
-            s = sugg.get(a) or []
-            if s and s[0][1] >= threshold:
-                accept.setdefault(reg["clusters"][s[0][0]]["name"], []).append(a)
-        n_accept = sum(len(v) for v in accept.values())
-        if st.button(f"🪄 Accept {n_accept} suggestion(s) with fit ≥ {threshold:.2f}", disabled=busy or not n_accept,
-                     use_container_width=True, key=f"ae_accept_btn_{cid}"):
-            _assign_grouped(accept, names_to_id, "Accepted suggestions")
+        c1, c2 = st.columns([3, 2])
+        threshold = c1.slider("Tick every suggestion with fit at least", 0.0, 1.0, 0.35, 0.05,
+                              key=f"ae_tick_threshold_{cid}")
+        n_tick = sum(1 for r in rows if r["sugg"] and r["fit"] >= threshold)
+        if c2.button(f"☑️ Tick {n_tick} row(s)", disabled=busy or not n_tick, use_container_width=True,
+                     key=f"ae_tick_btn_{cid}", help="Only ticks them (with the suggestion as target) — review, "
+                                                     "untick what's wrong, then press Apply."):
+            st.session_state[f"ae_tick_at_{cid}"] = threshold
+            st.rerun()
+        if tick_at is not None and st.button("✕ Clear ticks", key=f"ae_tick_clear_{cid}"):
+            st.session_state.pop(f"ae_tick_at_{cid}", None)
             st.rerun()
 
     _render_checked_actions(plex, plex_url, plex_token, reg, cid, checked, feats, names_to_id, options, busy)

@@ -492,11 +492,13 @@ with **Group by artist**):
   (0–1, the same score curation uses) and why. For example: *sonic 62% ·
   tags 40% · 3 album(s) by this artist there*. Suggestions come from
   `cluster_registry.suggest_clusters`.
-- **Pre-fill:** in Unclustered, a suggestion fills in "Assign to"
-  automatically when its fit is at least 0.25 (adjustable). Clear cases
-  just need **✅ Apply**.
-- **🪄 Accept every suggestion with fit ≥ x:** applies all of them in one
-  click.
+- **Only ticked rows change.** In Unclustered, a suggestion is pre-filled
+  into "Assign to" when its fit is at least 0.25 (adjustable), but that's
+  only a proposal. **✅ Apply** changes only rows that are ticked ✓ and
+  have a target; everything else stays as it is.
+- **☑️ Tick every suggestion with fit ≥ x:** ticks those rows, with the
+  suggestion as target, so you can review them, untick what's wrong and
+  then apply. It doesn't change anything by itself.
 - **Tick ✓** to act on several albums at once: move them, create a **new
   cluster** from them (named genre-first, locked by default), mark them
   **🚫 never cluster** (Unclustered only), unpin them, or listen to the
