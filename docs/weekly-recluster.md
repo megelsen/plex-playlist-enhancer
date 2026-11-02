@@ -637,7 +637,12 @@ and Gemini's reason:
   simply dropped. "Leave out" takes the artist out of every cluster; its
   albums are scored on commit and land where they fit best, or in
   Unclustered.
-- **↩️ Undo applied moves** reverses them.
+- **✋ Move an artist yourself** (same section, always available): pick
+  any artist of the build (type to search). That includes artists whose
+  albums are all *unsorted*, e.g. ones without Similar-Artist links. Then
+  pick a target cluster, or "none: decide on commit".
+- **↩️ Undo applied moves** reverses every applied move, Gemini's and your
+  own.
 - **Saved:** applied moves are stored in the saved build, so they survive a
   page reload.
 

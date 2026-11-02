@@ -356,55 +356,90 @@ def _render_build_step(plex, music_section, gemini_api_key, debug_box, settings,
 
 # --- Review & commit ----------------------------------------------------------
 
-LEAVE_OUT = "— leave out (scored on commit)"
+LEAVE_OUT = "— none: decide on commit (best fit, or Unclustered)"
+UNSORTED = "(unsorted)"
 
 
 def _render_suggestions(raw_build):
-    """Gemini's suggested artist moves: nothing is applied until you tick
-    them. You can also change a suggestion's target before applying."""
+    """🔀 Artist moves: Gemini's suggestions (applied only when ticked, target
+    editable) plus moving any artist yourself — including unsorted ones."""
     applied = raw_build.get("applied_moves") or []
     done = {(m["artist_key"], m["from"]) for m in applied}
     pending = [m for m in (raw_build.get("suggestions") or []) if (m["artist_key"], m["from"]) not in done]
-    if not pending and not applied:
-        return
-    with st.expander(f"🤖 Gemini suggests moving {len(pending)} artist(s)"
-                     + (f" · {len(applied)} applied" if applied else ""), expanded=bool(pending)):
+    title = "🔀 Artist moves"
+    if pending:
+        title += f" — 🤖 Gemini suggests {len(pending)}"
+    if applied:
+        title += f" · {len(applied)} applied"
+    with st.expander(title, expanded=bool(pending)):
+        msg = st.session_state.pop('moves_msg', None)
+        if msg:
+            st.success(msg)
+        options = sorted(raw_build["clusters"]) + [LEAVE_OUT]
         if pending:
-            st.caption("Tick the moves that make sense and press Apply — the rest is simply dropped. You can "
-                       "change where an artist goes. 'Leave out' takes the artist out of every cluster; its "
-                       "albums are then scored on commit and land where they fit best (or in Unclustered).")
-            options = sorted(raw_build["clusters"]) + [LEAVE_OUT]
+            st.caption("Gemini's suggestions: tick the ones that make sense and press Apply — the rest is dropped. "
+                       "Every cell in **Move to ▾** is a dropdown with all clusters, so you can send an artist "
+                       "somewhere else than suggested. '" + LEAVE_OUT + "' takes the artist out of every cluster; "
+                       "its albums are then scored on commit.")
             df = pd.DataFrame([{
                 "Apply": False, "Artist": m["artist"], "From": m["from"],
-                "To": m["to"] if m["to"] in raw_build["clusters"] else LEAVE_OUT,
+                "Move to ▾": m["to"] if m["to"] in raw_build["clusters"] else LEAVE_OUT,
                 "Why": m.get("reason", ""), "id": m["id"],
             } for m in pending])
             edited = st.data_editor(
                 df, hide_index=True, use_container_width=True, key=f"suggest_moves_{len(applied)}",
                 disabled=["Artist", "From", "Why"],
                 column_config={"Apply": st.column_config.CheckboxColumn(width="small"),
-                               "To": st.column_config.SelectboxColumn(options=options, width="medium"),
+                               "Move to ▾": st.column_config.SelectboxColumn(options=options, width="medium"),
                                "id": None},
             )
             by_id = {m["id"]: m for m in pending}
-            chosen = [dict(by_id[r["id"]], to=None if r["To"] == LEAVE_OUT else r["To"])
-                      for _, r in edited.iterrows() if r["Apply"] and r["To"] != r["From"]]
+            chosen = [dict(by_id[r["id"]], to=None if r["Move to ▾"] == LEAVE_OUT else r["Move to ▾"])
+                      for _, r in edited.iterrows() if r["Apply"] and r["Move to ▾"] != r["From"]]
             if st.button(f"✅ Apply {len(chosen)} move(s)", type="primary", disabled=not chosen,
                          key="apply_suggested_moves"):
                 moved = apply_artist_moves(raw_build, chosen)
                 save_build_cache(raw_build, st.session_state['cluster_merge_plan'])
                 st.session_state['moves_msg'] = f"Moved {moved} artist(s)."
                 st.rerun()
-        msg = st.session_state.pop('moves_msg', None)
-        if msg:
-            st.success(msg)
+
+        _render_manual_move(raw_build, options, len(applied))
+
         if applied:
             st.write("**Applied:** " + "; ".join(
-                f"{m['artist']} → {m['to'] or 'left out'}" for m in applied))
+                f"{m['artist']} ({m['from'] or 'unsorted'} → {m['to'] or 'none'})" for m in applied))
             if st.button("↩️ Undo applied moves", key="undo_suggested_moves"):
                 undo_artist_moves(raw_build)
                 save_build_cache(raw_build, st.session_state['cluster_merge_plan'])
                 st.rerun()
+
+
+def _render_manual_move(raw_build, options, n_applied):
+    """Move any artist of the build yourself — also artists whose albums are
+    all unsorted (e.g. no Similar-Artist links)."""
+    where = {}
+    for name, keys in raw_build["clusters"].items():
+        for k in keys:
+            info = raw_build["albums"].get(k) or {}
+            where.setdefault((info.get("artist_key"), info.get("artist") or "?"), name)
+    for k in raw_build.get("unsorted", []):
+        info = raw_build["albums"].get(k) or {}
+        where.setdefault((info.get("artist_key"), info.get("artist") or "?"), None)
+    artists = sorted(where, key=lambda a: a[1].lower())
+    st.write("**✋ Move an artist yourself**")
+    c1, c2 = st.columns(2)
+    artist = c1.selectbox("Artist (type to search)", artists, index=None, key=f"manual_move_artist_{n_applied}",
+                          format_func=lambda a: f"{a[1]} — {where[a] or UNSORTED}", placeholder="Choose an artist")
+    current = where.get(artist) if artist else None
+    targets = [o for o in options if o != current and not (current is None and o == LEAVE_OUT)]
+    target = c2.selectbox("Move to", targets, index=None, key=f"manual_move_target_{n_applied}",
+                          placeholder="Choose a cluster")
+    if st.button("➡️ Move", disabled=not (artist and target), key="manual_move_btn"):
+        moved = apply_artist_moves(raw_build, [{"artist_key": artist[0], "artist": artist[1], "from": current,
+                                                "to": None if target == LEAVE_OUT else target}])
+        save_build_cache(raw_build, st.session_state['cluster_merge_plan'])
+        st.session_state['moves_msg'] = f"Moved {artist[1]} → {target}." if moved else "Nothing to move."
+        st.rerun()
 
 
 def _cluster_summary(build, name):

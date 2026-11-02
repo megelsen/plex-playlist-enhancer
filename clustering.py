@@ -1612,23 +1612,28 @@ def _apply_gemini_check(communities, albums_by_artist, api_key, album_features, 
 
 
 def apply_artist_moves(build, moves):
-    """Applies accepted moves to a build IN PLACE. moves: [{"artist_key",
-    "artist", "from", "to" (cluster name or None = leave out -> unsorted)}].
-    Moves the artist's albums that are in "from"; records each applied move
-    (with its albums) in build["applied_moves"] so undo_artist_moves can
-    reverse it. Returns the number of artists moved."""
+    """Applies moves to a build IN PLACE. moves: [{"artist_key", "artist",
+    "from" (cluster name, or None = the artist's unsorted albums), "to"
+    (cluster name, or None = leave out -> unsorted)}]. Moves the artist's
+    albums that are in "from"; records each applied move (with its albums)
+    in build["applied_moves"] so undo_artist_moves can reverse it. Returns
+    the number of artists moved."""
     clusters = build["clusters"]
     unsorted = set(build.get("unsorted", []))
     applied = build.setdefault("applied_moves", [])
     done = 0
     for m in moves:
         src, dst = m["from"], m.get("to")
-        if src not in clusters or (dst is not None and dst not in clusters) or dst == src:
+        if (src is not None and src not in clusters) or (dst is not None and dst not in clusters) or dst == src:
             continue
-        albums = [k for k in clusters[src] if (build["albums"].get(k) or {}).get("artist_key") == m["artist_key"]]
+        pool = clusters[src] if src is not None else sorted(unsorted)
+        albums = [k for k in pool if (build["albums"].get(k) or {}).get("artist_key") == m["artist_key"]]
         if not albums:
             continue
-        clusters[src] = [k for k in clusters[src] if k not in albums]
+        if src is not None:
+            clusters[src] = [k for k in clusters[src] if k not in albums]
+        else:
+            unsorted -= set(albums)
         if dst:
             clusters[dst] = sorted(set(clusters[dst]) | set(albums))
         else:
@@ -1650,7 +1655,9 @@ def undo_artist_moves(build):
         if m["to"] and m["to"] in clusters:
             clusters[m["to"]] = [k for k in clusters[m["to"]] if k not in albums]
         unsorted -= albums
-        if m["from"] in clusters:
+        if m["from"] is None:
+            unsorted |= albums
+        elif m["from"] in clusters:
             clusters[m["from"]] = sorted(set(clusters[m["from"]]) | albums)
     build["unsorted"] = sorted(unsorted)
     build["applied_moves"] = []
