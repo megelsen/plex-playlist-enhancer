@@ -546,7 +546,19 @@ with **Group by artist**):
   Mix playlists named `[Mix] <cluster>` follow.
 - **⚙️ Manage → Name:** renames one cluster.
 
-**🔎 Scan & propose clusters** (`clustering.propose_clusters`, Build step 1):
+**Build flow** (🛠️ Build clusters): **1. Method → 2. Clusters → 3. Build →
+4. Review & commit**. Only the chosen method's controls are shown.
+
+| | 🔗 Relational (default) | 🏷️ Tags |
+|---|---|---|
+| Groups by | Plex Similar-Artist links (+ optional sonic boost) | Gemini's mapping of your genre/mood tags |
+| 2. Clusters | 🔎 Scan & propose fills the count; adjust it | Max count, 🔍 Suggest names (Gemini), names field, your tag list |
+| Gemini | never needed (only to name a group with no usable genre tags, if a key is set) | needed (or 🧪 Dry run) |
+| Advanced | sonic boost, sampled tracks, profile cache | ask Gemini again, dry run, sonic refinement of untagged tracks |
+
+A Relational build skips the tag scan and the Gemini tag mapping entirely.
+
+**🔎 Scan & propose** (`clustering.propose_clusters`, Relational step 2):
 - **What it suggests:** a cluster count (3 to 19) and names. It's free: no
   Gemini call unless a group has no usable genre tags.
 - **How:** Louvain runs over the Similar-Artist graph at several
@@ -555,7 +567,6 @@ with **Group by artist**):
   albums. The run with the best modularity × coverage (share of all albums
   inside those clusters) wins; ties go to fewer clusters.
 - **Result:** each proposed cluster is shown with its albums, artists and
-  top artists. **Use N as the cluster count** fills the count;
-  **Also use these names as vibes** fills the names, which Tags mode builds
-  exactly and a commit locks.
+  top artists, and the count is filled in directly. The build names the
+  clusters the same genre-first way.
 

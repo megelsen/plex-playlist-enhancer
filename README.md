@@ -356,9 +356,13 @@ Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
 - **Names:** clusters are named genre first from Plex genres and styles
   ("Folk Metal", "Ska Punk"), without era/mood words like "Modern" or
   "Fury". 🧬 → 🏷️ Names re-names existing clusters this way.
-- **🔎 Scan & propose clusters** (Build step 1): proposes a cluster count
-  (at most 19) and names from your library's Similar-Artist structure,
-  without Gemini.
+- **Building clusters:** 1. pick the method → 2. clusters → 3. build → 4.
+  review & commit, showing only the chosen method's controls.
+  - **Relational** (default) needs no Gemini at all. 🔎 Scan & propose
+    fills in a cluster count (at most 19) from your library's Similar-Artist
+    structure.
+  - **Tags** uses Gemini to sort your genre/mood tags, with optional
+    suggested names.
 - **A Live Mix for every cluster:** 🧬 → 🎧 Live Mixes for all clusters →
   **🔄 Create & update all** creates the missing mixes and applies the same
   settings to the existing ones, in one go. With **🔁 Keep it that way** on, new

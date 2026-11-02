@@ -1281,20 +1281,24 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
     "plays" is a play count (integer)."""
     d = debug.write if debug else (lambda *a, **k: None)
 
-    genre_tags, mood_tags = get_all_genre_and_mood_tags(music_section)
-    d(f"**Found {len(genre_tags)} genre tags and {len(mood_tags)} mood tags in library.**")
-
-    if dry_run:
-        d("**Dry run mode — using offline keyword mapper, no Gemini call.**")
-        clusters, tag_mapping = build_dry_run_mapping(genre_tags, mood_tags, locked_clusters, total_clusters)
-    elif preloaded_mapping is not None:
-        d("**Reusing mapping from Suggest Clusters — no additional Gemini call.**")
-        clusters, tag_mapping = preloaded_mapping
+    if clustering_mode == "sonic":
+        # Relational groups by Similar-Artist links and names by genre/style —
+        # no tag scan, no Gemini mapping needed.
+        clusters, tag_mapping = [], {}
     else:
-        clusters, tag_mapping = get_tag_cluster_mapping(
-            genre_tags, mood_tags, locked_clusters, total_clusters, api_key, force_remap=force_remap
-        )
-    d(f"**Final clusters:** {clusters}")
+        genre_tags, mood_tags = get_all_genre_and_mood_tags(music_section)
+        d(f"**Found {len(genre_tags)} genre tags and {len(mood_tags)} mood tags in library.**")
+        if dry_run:
+            d("**Dry run mode — using offline keyword mapper, no Gemini call.**")
+            clusters, tag_mapping = build_dry_run_mapping(genre_tags, mood_tags, locked_clusters, total_clusters)
+        elif preloaded_mapping is not None:
+            d("**Reusing mapping from Suggest Clusters — no additional Gemini call.**")
+            clusters, tag_mapping = preloaded_mapping
+        else:
+            clusters, tag_mapping = get_tag_cluster_mapping(
+                genre_tags, mood_tags, locked_clusters, total_clusters, api_key, force_remap=force_remap
+            )
+        d(f"**Final clusters:** {clusters}")
 
     albums_by_artist = _albums_by_artist(music_section, debug=debug)
     album_info = {str(a.ratingKey): _album_info(a) for albs in albums_by_artist.values() for a in albs}
