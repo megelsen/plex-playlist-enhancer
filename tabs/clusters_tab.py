@@ -14,6 +14,7 @@ import streamlit as st
 
 import cluster_registry
 import curation
+import lastfm
 from clustering import (
     apply_merge_plan, artist_cluster_map_from_albums, build_clusters, clear_all_caches,
     clear_artist_scan_cache, get_all_genre_and_mood_tags, load_build_cache, propose_clusters, save_build_cache,
@@ -59,7 +60,7 @@ def _sync_galaxy_state(build):
         st.session_state['cluster_tag_mapping'] = build.get('tag_mapping')
 
 
-def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
+def render(plex, plex_url, plex_token, debug_box, gemini_api_key, lastfm_api_key=None):
     st.title("🗂️ Library Clusters")
     st.caption(
         "Your whole library, grouped into album clusters. Make playlists and Live Mixes from any "
@@ -89,10 +90,10 @@ def render(plex, plex_url, plex_token, debug_box, gemini_api_key):
     )
     mode = _render_method()
     if mode == "sonic":
-        settings = _render_relational_clusters(music_section, gemini_api_key)
+        settings = _render_relational_clusters(music_section, gemini_api_key, lastfm_api_key)
     else:
         settings = _render_tags_clusters(music_section, gemini_api_key)
-    _render_build_step(plex, music_section, gemini_api_key, debug_box, settings)
+    _render_build_step(plex, music_section, gemini_api_key, debug_box, settings, lastfm_api_key)
 
     raw_build = st.session_state['cluster_build']
     if raw_build:
@@ -126,8 +127,15 @@ def _render_method():
 
 # --- 2. Clusters --------------------------------------------------------------
 
-def _render_relational_clusters(music_section, gemini_api_key):
+def _render_relational_clusters(music_section, gemini_api_key, lastfm_api_key=None):
     st.subheader("2. Clusters")
+    if lastfm.available(lastfm_api_key):
+        cached = len(lastfm.load_cache()["artists"])
+        st.caption(f"🎵 Last.fm on — genre tags and similar artists shape the groups and their names "
+                   f"({cached} artist(s) cached; new ones are fetched on the next scan or build).")
+    else:
+        st.caption("🎵 Last.fm off — add a Last.fm API key (sidebar, or LASTFM_API_KEY) for genre-aware groups "
+                   "and better names.")
     if st.button("🔎 Scan & propose", type="primary",
                  help="Tries several cluster counts on your artists' similarity links and picks the one with the "
                       "most clearly separated groups (at most 19). Free."):
@@ -135,7 +143,7 @@ def _render_relational_clusters(music_section, gemini_api_key):
             try:
                 proposal = propose_clusters(
                     music_section, album_features=cluster_registry.load_album_features()["albums"],
-                    api_key=gemini_api_key,
+                    api_key=gemini_api_key, lastfm_api_key=lastfm_api_key,
                 )
                 st.session_state['cluster_proposal'] = proposal
                 st.session_state['cluster_total'] = proposal['count']
@@ -154,12 +162,20 @@ def _render_relational_clusters(music_section, gemini_api_key):
                                      "It never creates a link on its own — 0 = pure Similar-Artist topology.")
         sample_size = st.slider("Sampled tracks per artist", 3, 10, 6, 1, key="sonic_artist_sample_size")
         use_cache = st.checkbox("Reuse cached artist profiles", value=True, key="sonic_use_cache")
+        gemini_check = st.checkbox(
+            "🤖 Let Gemini check the groups", value=bool(gemini_api_key), disabled=not gemini_api_key,
+            key="gemini_check",
+            help="One Gemini call after grouping: artists that clearly don't fit their group's genre (e.g. a "
+                 "post-punk band in a rap group) move to a better group, or are left for scoring on commit. "
+                 "At most 15% of a group's artists. Needs a Gemini key.",
+        )
         _render_rescan_option()
     return {
         "clustering_mode": "sonic", "total_clusters": total_clusters, "locked_clusters": [],
         "sonic_boost": sonic_boost, "sonic_artist_sample_size": sample_size, "sonic_use_cache": use_cache,
         "refine_unsorted": False, "sonic_weight": 0.0, "reassign_tagged_via_sonic": False,
         "sonic_propagation_rounds": 2, "dry_run": False, "remap": False,
+        "gemini_check": bool(gemini_check and gemini_api_key),
         "force_rescan": st.session_state.get("force_rescan_artists", False),
     }
 
@@ -217,7 +233,7 @@ def _render_tags_clusters(music_section, gemini_api_key):
         "clustering_mode": "tags", "total_clusters": total_clusters, "locked_clusters": locked_clusters,
         "sonic_boost": 0.5, "sonic_artist_sample_size": 6, "sonic_use_cache": True,
         "refine_unsorted": refine, "sonic_weight": sonic_weight, "reassign_tagged_via_sonic": reassign,
-        "sonic_propagation_rounds": rounds, "dry_run": dry_run, "remap": remap,
+        "sonic_propagation_rounds": rounds, "dry_run": dry_run, "remap": remap, "gemini_check": False,
         "force_rescan": st.session_state.get("force_rescan_artists", False),
     }
 
@@ -282,7 +298,7 @@ def _render_suggest(music_section, total_clusters, gemini_api_key):
 
 # --- 3. Build -----------------------------------------------------------------
 
-def _render_build_step(plex, music_section, gemini_api_key, debug_box, settings):
+def _render_build_step(plex, music_section, gemini_api_key, debug_box, settings, lastfm_api_key=None):
     st.subheader("3. Build")
     tags_mode = settings["clustering_mode"] == "tags"
     if tags_mode and not gemini_api_key and not settings["dry_run"]:
@@ -323,6 +339,7 @@ def _render_build_step(plex, music_section, gemini_api_key, debug_box, settings)
                 sonic_artist_sample_size=int(settings["sonic_artist_sample_size"]),
                 sonic_boost=float(settings["sonic_boost"]), sonic_use_cache=bool(settings["sonic_use_cache"]),
                 album_features=cluster_registry.load_album_features()["albums"],
+                lastfm_api_key=lastfm_api_key, gemini_check=settings["gemini_check"],
             )
             st.session_state['cluster_build'] = build
             st.session_state['cluster_merge_plan'] = []
@@ -355,6 +372,8 @@ def _render_review(plex, raw_build, gemini_api_key):
     total_albums = len(build["albums"])
     claimed = sum(len(v) for v in build["clusters"].values())
     mode = "Relational" if build.get("mode") == "sonic" else "Tags"
+    if build.get("lastfm"):
+        mode += " + Last.fm"
     st.caption(
         f"{mode} build from {build.get('built_at')}: **{len(build['clusters'])} clusters** covering "
         f"{claimed} of {total_albums} albums ({len(build.get('unsorted', []))} unsorted). Unsorted albums "
@@ -371,6 +390,14 @@ def _render_review(plex, raw_build, gemini_api_key):
                                                      f"{plays} plays")
         with col2:
             st.caption(", ".join(top))
+
+    checked = raw_build.get("checked") or []
+    if checked:
+        with st.expander(f"🤖 Gemini moved {len(checked)} artist(s) that didn't fit their group"):
+            for m in checked:
+                where = f"→ **{m['to']}**" if m.get("to") else "→ left out (scored on commit)"
+                st.markdown(f"- **{m['artist']}**: {m['from']} {where}"
+                            + (f" — {m['reason']}" if m.get("reason") else ""))
 
     with st.expander(f"🔗 Combine clusters ({len(raw_build['clusters'])} in the build)"):
         st.caption("Pick two or more clusters to combine into one broader cluster before committing. "

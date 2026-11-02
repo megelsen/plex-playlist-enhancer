@@ -570,3 +570,49 @@ A Relational build skips the tag scan and the Gemini tag mapping entirely.
   top artists, and the count is filled in directly. The build names the
   clusters the same genre-first way.
 
+## 15. Last.fm and the Gemini group check
+
+**Last.fm** (`lastfm.py`) is optional: set `LASTFM_API_KEY` in `.env`, or
+type the key into the sidebar for the UI only.
+
+**Fetching and caching:**
+- **Calls:** per artist, `artist.getTopTags` (community genre tags,
+  weight 0–100) and `artist.getSimilar` (similar artists, match 0–1),
+  looked up by name with autocorrect.
+- **Rate:** at most about 5 calls per second.
+- **Cache:** stored in `LASTFM_CACHE_PATH` and refreshed after 30 days, so
+  after the first run only new artists cost calls. The first run takes
+  about (artists × 2 × 0.22 s): roughly 3 minutes for 400 artists.
+- **Tag filter:** tags that aren't genres are dropped: "seen live",
+  favourites, vocalist tags, years and decades, nationalities and countries.
+- **Unknown artists** (Last.fm error 6) keep using Plex data only.
+
+**Where Last.fm data is used:**
+
+| Where | How |
+|---|---|
+| Relational graph | Last.fm similar artists with match ≥ 0.2 add a link, or strengthen an existing Plex link. Every link is then multiplied by `0.2 + 0.8 × tag overlap` (cosine of the two artists' tag weights), so artists that share no genre tags keep only 20% of the link. |
+| Names | Counted **per artist** (each artist once, whatever its album count): a tag "carries" an artist at weight ≥ 25. This kicks in when at least half of a cluster's artists have Last.fm tags; otherwise the album tags are used (§14). |
+| Album fit (curation, suggestions) | Each album's tag vector also gets its artist's Last.fm tags at 0.8 × weight / 100. |
+| Proposal | Same graph and naming as the build. |
+
+**The background jobs** (commit, daily sync, weekly curation) fetch new
+artists only when `LASTFM_API_KEY` is set in the environment. Without it,
+they still use whatever is cached.
+
+**🤖 Gemini group check** (Relational builds, ⚙️ Advanced settings; on by
+default when a Gemini key is set) runs once after grouping and naming:
+- **What Gemini gets:** every group's name and artists (up to 80 per group,
+  most albums first), each with its top 3 Last.fm tags.
+- **What it's asked:** to flag only artists that *clearly* don't fit the
+  group's genre, and to say which other group fits better, or none.
+- **Accepted only if:**
+  - the artist really is in that group,
+  - the target is another existing group (otherwise the artist is left out
+    of all groups and scored on commit),
+  - and at most 15% of a group's artists are moved (at least 1).
+- **After the moves,** the changed groups are renamed.
+- **If Gemini fails,** the groups simply stay as they were.
+- **Review:** "4. Review & commit" lists every move with its reason
+  ("🤖 Gemini moved N artists").
+

@@ -32,6 +32,8 @@ from collections import defaultdict
 import requests
 import streamlit as st
 
+import lastfm
+
 try:
     import networkx as nx
     import community as community_louvain  # python-louvain
@@ -834,13 +836,46 @@ def _album_genre_tags(album, artist=None):
     return tags
 
 
-def _artist_groups_for_naming(communities, albums_by_artist, album_features=None):
-    """{group_id: [artist objects]} -> genre_first_names input, counting each
-    album's genres/styles (from the album feature cache when available —
-    those include styles from a full reload — else from the Plex objects)."""
+LASTFM_STRONG_TAG = 25          # a Last.fm tag "carries" an artist at this weight (0–100) or more
+LASTFM_NAMING_MIN_COVERAGE = 0.5  # share of a group's artists that need Last.fm tags to name by them
+
+
+def lastfm_naming_group(artist_names, lastfm_artists, weights=None):
+    """genre_first_names input from Last.fm tags, counted per ARTIST (each
+    artist counts once, however many albums it has), or None if too few of
+    the artists have Last.fm tags."""
+    if not lastfm_artists or not artist_names:
+        return None
+    tags = defaultdict(int)
+    tagged = 0
+    for name in artist_names:
+        artist_tags = lastfm.artist_tags(lastfm_artists, name)
+        if not artist_tags:
+            continue
+        tagged += 1
+        for t, w in artist_tags.items():
+            if w >= LASTFM_STRONG_TAG:
+                tags[t] += 1
+    if tagged < max(1, LASTFM_NAMING_MIN_COVERAGE * len(artist_names)):
+        return None
+    order = sorted(artist_names, key=lambda n: (weights or {}).get(n, 0), reverse=True)
+    return {"tags": dict(tags), "size": tagged, "artists": order}
+
+
+def _artist_groups_for_naming(communities, albums_by_artist, album_features=None, lastfm_artists=None):
+    """{group_id: [artist objects]} -> genre_first_names input: Last.fm tags
+    per artist when available, else each album's genres/styles (from the
+    album feature cache when available — those include styles from a full
+    reload — else from the Plex objects)."""
     feats = album_features or {}
     groups = {}
     for gid, artists in communities.items():
+        weights = {getattr(a, "title", "?"): len(albums_by_artist.get(str(getattr(a, "ratingKey", "")), []))
+                   for a in artists}
+        group = lastfm_naming_group([getattr(a, "title", "?") for a in artists], lastfm_artists, weights)
+        if group:
+            groups[gid] = group
+            continue
         tags = defaultdict(int)
         size = 0
         weight = {}
@@ -856,6 +891,86 @@ def _artist_groups_for_naming(communities, albums_by_artist, album_features=None
         groups[gid] = {"tags": dict(tags), "size": size,
                        "artists": [a for a, _ in sorted(weight.items(), key=lambda kv: kv[1], reverse=True)]}
     return groups
+
+
+# --- Gemini membership check (Relational builds) -------------------------------
+
+GEMINI_CHECK_MAX_ARTISTS = 80       # artists per group sent to Gemini (most albums first)
+GEMINI_CHECK_MAX_SHARE = 0.15       # at most this share of a group's artists can be flagged
+
+
+def gemini_check_groups(communities, albums_by_artist, api_key, lastfm_artists=None, model=None,
+                        timeout=GEMINI_TIMEOUT_SECONDS, debug=None):
+    """Asks Gemini which artists clearly don't belong to their group's genre
+    (e.g. a post-punk band in a rap group) and where they fit better.
+
+    communities: {group name: [artist objects]}. Returns a list of
+    {"artist": artist object, "from": name, "to": name or None, "reason": str}
+    — only artists that really are in "from", "to" only if it's another
+    group, at most GEMINI_CHECK_MAX_SHARE of a group's artists (at least 1).
+    Returns [] if Gemini fails; the build then simply keeps its groups."""
+    d = debug.write if debug else (lambda *a, **k: None)
+    if not api_key or len(communities) < 2:
+        return []
+    lines = []
+    by_name = {}
+    for name, artists in communities.items():
+        ranked = sorted(artists, key=lambda a: len(albums_by_artist.get(str(a.ratingKey), [])), reverse=True)
+        entries = []
+        for a in ranked[:GEMINI_CHECK_MAX_ARTISTS]:
+            by_name[(name, a.title.lower())] = a
+            tags = list(lastfm.artist_tags(lastfm_artists or {}, a.title))[:3]
+            entries.append(f"{a.title} [{', '.join(tags)}]" if tags else a.title)
+        lines.append(f"- {json.dumps(name)}: " + "; ".join(entries))
+
+    prompt = f"""These groups of music artists were made by listening similarity, and each
+group is named after its main genre. Check each group and list ONLY the
+artists that clearly do NOT belong to that group's genre — for example a
+post-punk band in a rap group, or a pop artist in a death metal group.
+Be conservative: if an artist plausibly fits the group, leave it alone, and
+never flag more than a few artists per group. Square brackets hold the
+artist's Last.fm genre tags, where known.
+
+For each flagged artist, give the group it fits better — exactly one of the
+group names below — or null if none of them fits.
+
+Groups:
+{chr(10).join(lines)}
+
+Respond with ONLY a JSON object, no markdown fences, no commentary:
+{{"moves": [{{"artist": "IDLES", "from": "Rap", "to": "Post-Punk", "reason": "post-punk band"}}]}}"""
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model or DEFAULT_GEMINI_MODEL}"
+            f":generateContent?key={api_key}",
+            json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=timeout,
+        )
+        resp.raise_for_status()
+        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        raw_moves = json.loads(text.strip()).get("moves") or []
+    except Exception as e:
+        d(f"⚠️ Gemini group check failed ({e}) — keeping the groups as they are.")
+        return []
+
+    moves, per_group = [], defaultdict(int)
+    for m in raw_moves:
+        src, artist_name = m.get("from"), str(m.get("artist") or "").lower()
+        artist = by_name.get((src, artist_name))
+        if artist is None:
+            continue
+        limit = max(1, int(len(communities[src]) * GEMINI_CHECK_MAX_SHARE))
+        if per_group[src] >= limit:
+            continue
+        dst = m.get("to") if m.get("to") in communities and m.get("to") != src else None
+        per_group[src] += 1
+        moves.append({"artist": artist, "from": src, "to": dst, "reason": str(m.get("reason") or "")[:120]})
+    d(f"**Gemini group check:** {len(moves)} artist(s) flagged "
+      f"({sum(1 for m in moves if m['to'])} moved, {sum(1 for m in moves if not m['to'])} left unsorted).")
+    return moves
 
 
 def _representative_names(items, is_track, max_names=2):
@@ -1051,9 +1166,18 @@ def _build_plex_similar_edges(all_artists, debug=None):
     return edges
 
 
+# Last.fm in the Relational graph: its similar-artist matches (0..1) add links
+# Plex doesn't have, and every link is scaled by how much the two artists'
+# Last.fm genre tags overlap, so a link between a post-punk band and a rapper
+# stays weak even if both are "similar" to the same artist.
+LASTFM_LINK_MIN_MATCH = 0.2
+LASTFM_LINK_WEIGHT = 1.0
+GENRE_LINK_FLOOR = 0.2          # a link between artists with no tags in common keeps 20% of its weight
+
+
 def build_relational_graph(all_artists, sample_size=ARTIST_SONIC_SAMPLE_SIZE,
                             neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
-                            sonic_boost=0.5, use_cache=True, debug=None):
+                            sonic_boost=0.5, use_cache=True, lastfm_artists=None, debug=None):
     d = debug.write if debug else (lambda *a, **k: None)
 
     if not HAS_SONIC_GRAPH_DEPS:
@@ -1092,12 +1216,42 @@ def build_relational_graph(all_artists, sample_size=ARTIST_SONIC_SAMPLE_SIZE,
             graph.add_edge(key, neighbor_key, weight=weight)
             edges_added += 1
 
+    if lastfm_artists:
+        _apply_lastfm_to_graph(graph, artist_by_key, lastfm_artists, debug=debug)
+
     isolated = sum(1 for n in graph.nodes() if graph.degree(n) == 0)
-    d(f"**Relational graph built:** {len(artist_by_key)} artists, {edges_added} Similar-Artist links "
-      f"({'sonic boost applied where available' if sonic_boost > 0 else 'sonic boost off'}), "
-      f"{isolated} artists with no Similar-Artist data (isolated).")
+    d(f"**Relational graph built:** {len(artist_by_key)} artists, {graph.number_of_edges()} links "
+      f"({edges_added} from Plex Similar Artist; "
+      f"{'sonic boost applied where available' if sonic_boost > 0 else 'sonic boost off'}), "
+      f"{isolated} artists without any link (isolated).")
 
     return graph, artist_by_key, cache
+
+
+def _apply_lastfm_to_graph(graph, artist_by_key, lastfm_artists, debug=None):
+    d = debug.write if debug else (lambda *a, **k: None)
+    key_by_name = {lastfm.normalize_name(a.title): k for k, a in artist_by_key.items() if getattr(a, "title", None)}
+    added = strengthened = 0
+    for key, artist in artist_by_key.items():
+        for other_name, match in lastfm.artist_similar(lastfm_artists, artist.title).items():
+            other = key_by_name.get(other_name)
+            if not other or other == key or match < LASTFM_LINK_MIN_MATCH:
+                continue
+            if graph.has_edge(key, other):
+                graph[key][other]["weight"] += LASTFM_LINK_WEIGHT * match / 2  # both directions report it
+                strengthened += 1
+            else:
+                graph.add_edge(key, other, weight=LASTFM_LINK_WEIGHT * match)
+                added += 1
+    weighted = 0
+    for x, y, data in graph.edges(data=True):
+        tags_x = lastfm.artist_tags(lastfm_artists, artist_by_key[x].title)
+        tags_y = lastfm.artist_tags(lastfm_artists, artist_by_key[y].title)
+        if tags_x and tags_y:
+            data["weight"] *= GENRE_LINK_FLOOR + (1 - GENRE_LINK_FLOOR) * lastfm.tag_similarity(tags_x, tags_y)
+            weighted += 1
+    d(f"└ Last.fm: {added} similar-artist link(s) added, {strengthened} strengthened; "
+      f"{weighted} link(s) weighted by genre-tag overlap.")
 
 
 def _rebalance_communities(graph, partition, min_size=2, max_size=60, debug=None):
@@ -1199,7 +1353,7 @@ def _score_and_select_communities(graph, communities, target_count, album_counts
 def build_artist_sonic_clusters(music_section, albums_by_artist, tag_mapping=None,
                                  sample_size=ARTIST_SONIC_SAMPLE_SIZE, neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
                                  sonic_boost=0.5, target_count=10, use_cache=True, api_key=None,
-                                 album_features=None, debug=None):
+                                 album_features=None, lastfm_artists=None, debug=None):
     """Relational mode: Louvain over the Similar-Artist graph. Returns
     ({cluster_name: [artist objects]}, {}) — names are genre first
     (genre_first_names)."""
@@ -1209,7 +1363,7 @@ def build_artist_sonic_clusters(music_section, albums_by_artist, tag_mapping=Non
 
     graph, artist_by_key, cache = build_relational_graph(
         all_artists, sample_size=sample_size, neighbor_limit=neighbor_limit,
-        sonic_boost=sonic_boost, use_cache=use_cache, debug=debug
+        sonic_boost=sonic_boost, use_cache=use_cache, lastfm_artists=lastfm_artists, debug=debug
     )
     if use_cache:
         _save_artist_profile_cache(cache)
@@ -1228,7 +1382,8 @@ def build_artist_sonic_clusters(music_section, albums_by_artist, tag_mapping=Non
     communities = {cid: [artist_by_key[k] for k in keys] for cid, keys in selected_by_key.items()}
 
     names = genre_first_names(
-        _artist_groups_for_naming(communities, albums_by_artist, album_features), api_key=api_key, debug=debug
+        _artist_groups_for_naming(communities, albums_by_artist, album_features, lastfm_artists),
+        api_key=api_key, debug=debug
     )
     results = {}
     for community_id, artists in communities.items():
@@ -1268,7 +1423,8 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
                    sonic_propagation_rounds=2, clustering_mode="tags",
                    sonic_neighbor_limit=SONIC_GRAPH_NEIGHBOR_LIMIT,
                    sonic_artist_sample_size=ARTIST_SONIC_SAMPLE_SIZE,
-                   sonic_boost=0.5, sonic_use_cache=True, album_features=None):
+                   sonic_boost=0.5, sonic_use_cache=True, album_features=None,
+                   lastfm_api_key=None, gemini_check=False):
     """Builds clusters over the WHOLE library and returns their full album
     membership:
 
@@ -1278,8 +1434,11 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
        "unsorted": [album keys no cluster claimed],
        "albums": {album key: {"title", "artist", "artist_key", "plays"}}}
 
-    "plays" is a play count (integer)."""
+    "plays" is a play count (integer). Relational builds use Last.fm (tags +
+    similar artists) when a key is available, and with gemini_check let
+    Gemini move artists that clearly don't fit their group (build["checked"])."""
     d = debug.write if debug else (lambda *a, **k: None)
+    checked = []
 
     if clustering_mode == "sonic":
         # Relational groups by Similar-Artist links and names by genre/style —
@@ -1309,12 +1468,20 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
           f"Plex's own Similar-Artist graph (sonic_boost={sonic_boost:g}); tags only name the "
           f"result. Keeping the top {total_clusters} communities by connection strength \u00d7 size; "
           "each community's artists bring ALL their albums.")
+        lastfm_artists = lastfm.ensure_artists(
+            [a.title for a in get_cached_artists(music_section, debug=debug)], api_key=lastfm_api_key, debug=debug,
+        ) if lastfm.available(lastfm_api_key) else None
         communities, _tag_votes = build_artist_sonic_clusters(
             music_section, albums_by_artist, tag_mapping=tag_mapping,
             sample_size=sonic_artist_sample_size, neighbor_limit=sonic_neighbor_limit,
             sonic_boost=sonic_boost, target_count=total_clusters, use_cache=sonic_use_cache,
-            api_key=(None if dry_run else api_key), album_features=album_features, debug=debug
+            api_key=(None if dry_run else api_key), album_features=album_features,
+            lastfm_artists=lastfm_artists, debug=debug
         )
+        if gemini_check and api_key and not dry_run:
+            communities, checked = _apply_gemini_check(
+                communities, albums_by_artist, api_key, album_features, lastfm_artists, debug=debug
+            )
         for name, artists in communities.items():
             for artist in artists:
                 for album in albums_by_artist.get(str(artist.ratingKey), []):
@@ -1373,7 +1540,33 @@ def build_clusters(music_section, plex, locked_clusters, total_clusters, api_key
         "clusters": result_clusters,
         "unsorted": unsorted,
         "albums": album_info,
+        "checked": checked,
+        "lastfm": bool(clustering_mode == "sonic" and lastfm.available(lastfm_api_key)),
     }
+
+
+def _apply_gemini_check(communities, albums_by_artist, api_key, album_features, lastfm_artists, debug=None):
+    """Runs gemini_check_groups, moves the flagged artists (to their better
+    group, or out of all groups -> unsorted, scored on commit), and re-names
+    the groups whose membership changed. Returns (communities, checked) with
+    checked = [{"artist", "from", "to", "reason"}] (names, for the review)."""
+    moves = gemini_check_groups(communities, albums_by_artist, api_key, lastfm_artists, debug=debug)
+    if not moves:
+        return communities, []
+    groups = {name: list(artists) for name, artists in communities.items()}
+    for m in moves:
+        groups[m["from"]] = [a for a in groups[m["from"]] if a is not m["artist"]]
+        if m["to"]:
+            groups[m["to"]].append(m["artist"])
+    groups = {name: artists for name, artists in groups.items() if artists}
+    ids = {i: name for i, name in enumerate(groups)}
+    new_names = genre_first_names(
+        _artist_groups_for_naming({i: groups[n] for i, n in ids.items()}, albums_by_artist, album_features,
+                                  lastfm_artists), api_key=api_key, debug=debug)
+    renamed = {ids[i]: new_names[i] for i in ids}
+    checked = [{"artist": m["artist"].title, "from": renamed.get(m["from"], m["from"]),
+                "to": renamed.get(m["to"], m["to"]) if m["to"] else None, "reason": m["reason"]} for m in moves]
+    return {renamed[n]: artists for n, artists in groups.items()}, checked
 
 
 # --- Library scan: how many clusters, and which ----------------------------
@@ -1383,7 +1576,7 @@ PROPOSAL_RESOLUTIONS = (0.3, 0.45, 0.6, 0.8, 1.0, 1.25, 1.5, 2.0)
 
 
 def propose_clusters(music_section, max_clusters=PROPOSAL_MAX_CLUSTERS, album_features=None,
-                     api_key=None, debug=None):
+                     api_key=None, lastfm_api_key=None, debug=None):
     """Scans the library and proposes a cluster count (3..max_clusters, at
     most 19) plus genre-first names — no Gemini needed unless some group has
     no usable genre tags.
@@ -1403,7 +1596,10 @@ def propose_clusters(music_section, max_clusters=PROPOSAL_MAX_CLUSTERS, album_fe
     artists = get_cached_artists(music_section, debug=debug)
     albums_by_artist = _albums_by_artist(music_section, debug=debug)
     total_albums = sum(len(v) for v in albums_by_artist.values()) or 1
-    graph, artist_by_key, _cache = build_relational_graph(artists, sonic_boost=0, use_cache=False, debug=debug)
+    lastfm_artists = lastfm.ensure_artists([a.title for a in artists], api_key=lastfm_api_key, debug=debug) \
+        if lastfm.available(lastfm_api_key) else None
+    graph, artist_by_key, _cache = build_relational_graph(artists, sonic_boost=0, use_cache=False,
+                                                          lastfm_artists=lastfm_artists, debug=debug)
     linked = sorted(n for n in graph.nodes() if graph.degree(n) > 0)
     sub = graph.subgraph(linked)
     if sub.number_of_edges() == 0:
@@ -1435,7 +1631,8 @@ def propose_clusters(music_section, max_clusters=PROPOSAL_MAX_CLUSTERS, album_fe
         best = dict(best, groups=best["groups"][:max_clusters], count=min(best["count"], max_clusters))
 
     communities = {i: [artist_by_key[k] for k in g] for i, g in enumerate(best["groups"])}
-    names = genre_first_names(_artist_groups_for_naming(communities, albums_by_artist, album_features),
+    names = genre_first_names(_artist_groups_for_naming(communities, albums_by_artist, album_features,
+                                                        lastfm_artists),
                               api_key=api_key, debug=debug)
     clusters = []
     for i, members in communities.items():
@@ -1449,5 +1646,5 @@ def propose_clusters(music_section, max_clusters=PROPOSAL_MAX_CLUSTERS, album_fe
       f"covering {best['coverage']:.0%} of albums.")
     return {"count": len(clusters), "clusters": clusters, "coverage": best["coverage"],
             "modularity": best["modularity"], "resolution": best["resolution"],
-            "unlinked_artists": graph.number_of_nodes() - len(linked)}
+            "unlinked_artists": graph.number_of_nodes() - len(linked), "lastfm": bool(lastfm_artists)}
 

@@ -23,6 +23,10 @@ PLEX_TOKEN = st.sidebar.text_input("Plex Token", value=DEFAULT_TOKEN, type="pass
 # budget-tier model (gemini-2.5-flash) is plenty and cheap for this.
 DEFAULT_GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_API_KEY = st.sidebar.text_input("Gemini API Key", value=DEFAULT_GEMINI_KEY, type="password")
+# Optional: Last.fm genre tags + similar artists for Library Clusters. The
+# weekly/daily jobs read LASTFM_API_KEY from the environment.
+DEFAULT_LASTFM_KEY = os.environ.get("LASTFM_API_KEY", "")
+LASTFM_API_KEY = st.sidebar.text_input("Last.fm API Key", value=DEFAULT_LASTFM_KEY, type="password")
 
 
 @st.cache_resource
@@ -106,7 +110,7 @@ if active == "🎧 Playlist Enhancer":
 elif active == "🎨 Artist Mix":
     mix_tab.render(plex, PLEX_URL, PLEX_TOKEN, debug_box)
 elif active == "🗂️ Library Clusters":
-    clusters_tab.render(plex, PLEX_URL, PLEX_TOKEN, debug_box, GEMINI_API_KEY)
+    clusters_tab.render(plex, PLEX_URL, PLEX_TOKEN, debug_box, GEMINI_API_KEY, LASTFM_API_KEY)
 elif active == "🌌 Library Galaxy":
     galaxy_tab.render(plex, debug_box)
 elif active == "🔴 Live Playlists":

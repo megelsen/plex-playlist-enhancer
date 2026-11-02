@@ -38,9 +38,10 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 
+import lastfm
 from clustering import (
     HAS_SONIC_GRAPH_DEPS, _build_plex_similar_edges, _finalize_community_name, _is_always_generic_tag,
-    build_artist_cluster_map, genre_first_names, get_cached_artists,
+    build_artist_cluster_map, genre_first_names, get_cached_artists, lastfm_naming_group,
 )
 from plex_helpers import get_sonic_match_percent
 
@@ -70,6 +71,7 @@ SAME_ARTIST_EDGE_WEIGHT = 0.3
 TAG_WEIGHT_GENRE = 1.0
 TAG_WEIGHT_MOOD = 0.6
 TAG_WEIGHT_ARTIST_GENRE = 0.4
+TAG_WEIGHT_LASTFM = 0.8         # × the artist's Last.fm tag weight / 100
 
 UNCLUSTERED_ID = "c_unclustered"
 UNCLUSTERED_NAME = "Unclustered"
@@ -430,7 +432,8 @@ def suggest_clusters(reg, album_keys, top=3):
     store = load_album_features()
     feats = store["albums"]
     labels = {a: e.get("cluster") for a, e in reg["albums"].items() if a in feats}
-    scorer = _Scorer(labels, list(reg["clusters"]), feats, store.get("artist_similar"), reg["params"])
+    scorer = _Scorer(labels, list(reg["clusters"]), feats, store.get("artist_similar"), reg["params"],
+                     lastfm_tags=store.get("lastfm_tags"))
     out = {}
     for a in album_keys:
         if a not in feats:
@@ -457,11 +460,13 @@ def _reason(why):
 def propose_genre_names(reg, api_key=None):
     """{cluster_id: new genre-first name} for every cluster except locked ones
     (their names are yours) and Unclustered; unchanged names are omitted."""
-    feats = load_album_features()["albums"]
+    store = load_album_features()
+    feats = store["albums"]
     targets = [cid for cid, c in reg["clusters"].items() if cid != UNCLUSTERED_ID and not c.get("locked")]
     keep = [c.get("name") for cid, c in reg["clusters"].items() if cid not in targets and c.get("name")]
     members = {cid: cluster_album_keys(reg, cid) for cid in targets}
-    names = genre_first_names(_album_groups_for_naming(feats, members), used_names=keep, api_key=api_key)
+    names = genre_first_names(_album_groups_for_naming(feats, members, lastfm_tags=store.get("lastfm_tags")),
+                              used_names=keep, api_key=api_key)
     return {cid: n for cid, n in names.items() if n != reg["clusters"][cid].get("name")}
 
 
@@ -579,6 +584,11 @@ def scan_library(music_section, store, debug=None):
 
     edges = _build_plex_similar_edges(artists, debug=debug)
     store["artist_similar"] = {k: sorted(v) for k, v in edges.items()}
+    # Fetches new/stale artists when LASTFM_API_KEY is set; otherwise uses
+    # whatever is cached (e.g. fetched by a build with the sidebar key).
+    lf = lastfm.ensure_artists([a.title for a in artists], debug=debug)
+    store["lastfm_tags"] = {str(a.ratingKey): lastfm.artist_tags(lf, a.title) for a in artists
+                            if lastfm.artist_tags(lf, a.title)}
 
     d(f"└ {len(new)} new, {len(changed)} changed, {len(removed)} removed album(s).")
     return {"library": library, "new": new, "changed": changed, "removed": removed}
@@ -600,7 +610,8 @@ class _Scorer:
     Centroids are weighted by an anchor weight of 1 + ln(1 + plays).
     """
 
-    def __init__(self, labels, cluster_ids, feats, artist_similar, params, plays=None, penalties=None):
+    def __init__(self, labels, cluster_ids, feats, artist_similar, params, plays=None, penalties=None,
+                 lastfm_tags=None):
         self.labels = labels
         self.cluster_ids = [c for c in cluster_ids if c != UNCLUSTERED_ID]
         self.feats = feats
@@ -609,10 +620,12 @@ class _Scorer:
         self.plays = plays or {}
         self.penalties = penalties or {}
 
+        lastfm_tags = lastfm_tags or {}
         n = max(len(feats), 1)
         df = defaultdict(int)
         for f in feats.values():
-            for t in set(f["genres"]) | set(f["moods"]) | set(f["artist_genres"]):
+            lf = lastfm_tags.get(f["artist_key"], {})
+            for t in set(f["genres"]) | set(f["moods"]) | set(f["artist_genres"]) | set(lf):
                 df[t] += 1
         idf = {t: math.log(1 + n / c) for t, c in df.items()}
 
@@ -623,6 +636,8 @@ class _Scorer:
                 vec[t] = TAG_WEIGHT_ARTIST_GENRE
             for t in f["moods"]:
                 vec[t] = max(vec.get(t, 0), TAG_WEIGHT_MOOD)
+            for t, w in lastfm_tags.get(f["artist_key"], {}).items():
+                vec[t] = max(vec.get(t, 0), TAG_WEIGHT_LASTFM * w / 100.0)
             for t in f["genres"]:
                 vec[t] = TAG_WEIGHT_GENRE
             vec = {t: w * idf.get(t, 1.0) for t, w in vec.items() if not _is_always_generic_tag(t)}
@@ -904,11 +919,25 @@ def _louvain_groups(graph, resolution=1.0):
 
 # --- Naming ---------------------------------------------------------------
 
-def _album_groups_for_naming(feats, members, plays=None):
-    """{cid: [album keys]} -> genre_first_names input from the album features."""
+def _album_groups_for_naming(feats, members, plays=None, lastfm_tags=None):
+    """{cid: [album keys]} -> genre_first_names input: Last.fm tags per artist
+    when enough of the cluster's artists have them, else the albums' tags."""
     plays = plays or {}
+    by_name = {}
+    for f in feats.values():
+        tags = (lastfm_tags or {}).get(f.get("artist_key"))
+        if tags and f.get("artist_title"):
+            by_name[lastfm.normalize_name(f["artist_title"])] = {"tags": tags}
     groups = {}
     for cid, albs in members.items():
+        artist_albums = defaultdict(int)
+        for a in albs:
+            if (feats.get(a) or {}).get("artist_title"):
+                artist_albums[feats[a]["artist_title"]] += 1 + plays.get(a, 0)
+        group = lastfm_naming_group(list(artist_albums), by_name, artist_albums)
+        if group:
+            groups[cid] = group
+            continue
         tags = defaultdict(int)
         artist_weight = defaultdict(float)
         for a in albs:
@@ -922,7 +951,7 @@ def _album_groups_for_naming(feats, members, plays=None):
     return groups
 
 
-def _name_clusters(reg, feats, cids, labels, plays, api_key=None, debug=None):
+def _name_clusters(reg, feats, cids, labels, plays, api_key=None, lastfm_tags=None, debug=None):
     """Names freshly created clusters genre first (genre_first_names), keeping
     clear of every other cluster's name."""
     if not cids:
@@ -932,7 +961,8 @@ def _name_clusters(reg, feats, cids, labels, plays, api_key=None, debug=None):
         if cid in cids:
             members[cid].append(a)
     used = [c.get("name") for cid, c in reg["clusters"].items() if cid not in cids and c.get("name")]
-    names = genre_first_names(_album_groups_for_naming(feats, {c: members.get(c, []) for c in cids}, plays),
+    names = genre_first_names(_album_groups_for_naming(feats, {c: members.get(c, []) for c in cids}, plays,
+                                                       lastfm_tags),
                               used_names=used, api_key=api_key, debug=debug)
     for cid in cids:
         reg["clusters"][cid]["name"] = names[cid]
@@ -1011,7 +1041,8 @@ def curate(reg, store, mode, plays=None, recent_plays=None, penalties=None, only
             else:
                 stats["assigned"] += 1
 
-    scorer = _Scorer(labels, list(clusters), feats, store.get("artist_similar"), p, plays, penalties)
+    scorer = _Scorer(labels, list(clusters), feats, store.get("artist_similar"), p, plays, penalties,
+                     lastfm_tags=store.get("lastfm_tags"))
 
     # 1. Assignment / moves
     if mode == "daily":
@@ -1196,7 +1227,8 @@ def curate(reg, store, mode, plays=None, recent_plays=None, penalties=None, only
                                 only_unassigned=True))
         scorer.rebuild()
 
-        _name_clusters(reg, feats, set(created), labels, plays, api_key=api_key, debug=debug)
+        _name_clusters(reg, feats, set(created), labels, plays, api_key=api_key,
+                       lastfm_tags=store.get("lastfm_tags"), debug=debug)
         for ev in events:
             if ev["type"] == "spawned":
                 ev["name"] = clusters[ev["cluster_id"]]["name"]

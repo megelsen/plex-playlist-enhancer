@@ -200,6 +200,7 @@ services:
       - PLEX_URL=${PLEX_URL}
       - PLEX_TOKEN=${PLEX_TOKEN}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - LASTFM_API_KEY=${LASTFM_API_KEY}
       - CLUSTER_CACHE_PATH=/app/data/cluster_mapping.json
       - ARTIST_PROFILE_CACHE_PATH=/app/data/artist_sonic_profiles.json
       - LIVE_PLAYLISTS_PATH=/app/data/live_playlists.json
@@ -238,7 +239,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py styles.py plex_helpers.py ui_components.py recommendations.py artist_mix.py clustering.py galaxy.py live_playlists.py cluster_registry.py curation.py ./
+COPY app.py styles.py plex_helpers.py ui_components.py recommendations.py artist_mix.py clustering.py galaxy.py live_playlists.py cluster_registry.py curation.py lastfm.py ./
 COPY tabs/ ./tabs/
 
 EXPOSE 8502
@@ -271,6 +272,8 @@ The app will then be available at `http://<host>:8502`.
 | `PLEX_URL`            | Base URL of your Plex server                          | `http://localhost:32400`  |
 | `PLEX_TOKEN`          | Your Plex authentication token                        | *(none — required)*       |
 | `GEMINI_API_KEY`      | Google Gemini API key, used only by Library Clusters  | *(none — optional)*       |
+| `LASTFM_API_KEY`      | Last.fm API key: genre tags + similar artists for Library Clusters (also used by the weekly/daily jobs) | *(none — optional)* |
+| `LASTFM_CACHE_PATH`   | Cached Last.fm artist data (refreshed after 30 days)   | `/app/data/lastfm_artists.json` |
 | `CLUSTER_CACHE_PATH`  | Disk path for the cached tag → cluster mapping         | `/app/data/cluster_mapping.json` |
 | `ARTIST_PROFILE_CACHE_PATH` | Disk path for cached per-artist sonic profiles (Hybrid/Sonic-artist clustering) | `/app/data/artist_sonic_profiles.json` |
 | `LIVE_PLAYLISTS_PATH` | Disk path for Live Playlists subscriptions               | `/app/data/live_playlists.json` |
@@ -356,6 +359,17 @@ Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
 - **Names:** clusters are named genre first from Plex genres and styles
   ("Folk Metal", "Ska Punk"), without era/mood words like "Modern" or
   "Fury". 🧬 → 🏷️ Names re-names existing clusters this way.
+- **Last.fm (optional, `LASTFM_API_KEY`):**
+  - **Groups:** Last.fm's genre tags ("folk metal", "nu metal", "post-punk")
+    and similar-artist matches make Relational groups genre-aware, so a
+    post-punk band no longer lands with rappers.
+  - **Names:** clusters are named from Last.fm tags rather than Plex's
+    AllMusic styles ("British Metal", "Pop/Rock").
+  - **Album fit:** weekly curation uses the tags too when scoring albums.
+  - **Cost:** two calls per artist, cached for 30 days.
+- **🤖 Gemini group check (Relational, optional):** after grouping, Gemini
+  flags artists that clearly don't fit their group's genre and moves them
+  (at most 15% per group). The review lists every move and its reason.
 - **Building clusters:** 1. pick the method → 2. clusters → 3. build → 4.
   review & commit, showing only the chosen method's controls.
   - **Relational** (default) needs no Gemini at all. 🔎 Scan & propose
