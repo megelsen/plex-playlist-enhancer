@@ -45,7 +45,7 @@ git status
 
 ```bash
 git fetch origin
-git checkout ccr-58ab723e-pblgmn
+git checkout for-you-playlist
 git pull
 ls scripts
 ```
