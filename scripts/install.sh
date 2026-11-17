@@ -3,7 +3,14 @@
 # in your docker compose stack — steps 1-7 of docs/playlist-scripts-setup.md.
 #
 # Run it from the folder that holds docker-compose.yml (and the
-# plex-playlist-enhancer checkout):
+# plex-playlist-enhancer checkout). First time, take it straight from the
+# branch, so --undo can later switch the checkout back to where it was:
+#
+#   git -C plex-playlist-enhancer fetch origin for-you-playlist
+#   git -C plex-playlist-enhancer show origin/for-you-playlist:scripts/install.sh > install-playlists.sh
+#   bash install-playlists.sh
+#
+# Later runs can use the copy in the checkout:
 #
 #   bash plex-playlist-enhancer/scripts/install.sh              # interactive
 #   bash plex-playlist-enhancer/scripts/install.sh --backtest   # also run the backtest
@@ -32,7 +39,7 @@ while [ $# -gt 0 ]; do
     --no-start) NO_START=1 ;;
     --compose) COMPOSE="$2"; shift ;;
     --repo) REPO="$2"; shift ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1 (see --help)"; exit 2 ;;
   esac
   shift
@@ -56,7 +63,13 @@ fi
 [ -n "$COMPOSE" ] && [ -f "$COMPOSE" ] || die "No docker-compose.yml here. Run this from the folder with your compose file, or pass --compose FILE."
 if [ -z "$REPO" ]; then
   SELF_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  REPO="$SELF_REPO"
+  if [ -f "$SELF_REPO/scripts/install.sh" ] && [ -d "$SELF_REPO/.git" ]; then
+    REPO="$SELF_REPO"                       # run from inside the checkout
+  elif [ -d "$ROOT/plex-playlist-enhancer" ]; then
+    REPO="$ROOT/plex-playlist-enhancer"     # run as a downloaded copy next to the compose file
+  else
+    die "Can't find the plex-playlist-enhancer checkout; pass --repo DIR."
+  fi
 fi
 REPO="$(cd "$REPO" && pwd)"
 case "$REPO/" in "$ROOT"/*) ;; *) die "The checkout ($REPO) must be inside $ROOT (next to the compose file).";; esac
