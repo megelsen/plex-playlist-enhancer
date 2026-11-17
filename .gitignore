@@ -12,3 +12,6 @@ venv/
 
 # OS
 .DS_Store
+
+# Discover Weekly runtime state
+state.json

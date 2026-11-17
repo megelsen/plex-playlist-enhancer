@@ -1,315 +1,267 @@
-# Plan: "For You" recommended mix
+# Plan: "For You" recommended playlist
 
-Status: **plan only, nothing implemented yet.** Builds on the
-`weekly-recluster` branch: album registry, album features, Last.fm cache,
-Live Mix rotation, DJ order.
+Status: **plan only, nothing implemented yet.**
 
-The goal is one playlist, refreshed automatically, that mixes three kinds of
-tracks from your own library:
-
-| Bucket | What it is | Default share |
-|---|---|---|
-| **New to you** (U) | tracks you have never played | 40% |
-| **Rare gems** (R) | tracks with only a few plays, none recently | 30% |
-| **Classics** (C) | your most played tracks that you haven't heard for a while | 30% |
-
-Every pick is ranked by **sonic similarity**, **relatedness** (same or
-similar artists), **cluster fit** and **popularity**, all based on what you
-actually listen to.
-
-> **Discover Weekly / On Repeat:** I couldn't find either one in this repo
-> (no branch, commit, file or identifier) or in `plexamp-widget`. If they live
-> somewhere uncommitted, they can share the same engine. "Discover" is the U
-> bucket at 100%, and "On Repeat" is the C bucket at 100% with no cooldown
-> (§4). §9 has presets for both.
+This plan builds on three existing pieces:
+- `scripts/discover-weekly/script.py` and `scripts/on-repeat/script.py`
+  (the `playlist-factory` branch)
+- the Streamlit app's album cluster registry and Live Mixes (the
+  `weekly-recluster` branch)
 
 ---
 
-## 1. What we already have (reused, not rebuilt)
+## 1. Where it fits
 
-| Need | Existing code | Units |
-|---|---|---|
-| Play history | `curation.listening_stats` → `plex.history(mindate=…)` (single account) | integer plays, `viewedAt` datetime |
-| Sonic neighbours, track level | `Track.sonicallySimilar(limit, maxDistance)` + `plex_helpers.get_sonic_match_percent` | match % 0–100 (÷100 → 0–1); `maxDistance` 0–1, server default 0.25 |
-| Sonic neighbours, album level | `album_features.json` → `sonic: {album: weight}` | 0–1 (Plex match % ÷ 100; 0.5 if Plex gives no score) |
-| Plex similar artists | `album_features.json` → `artist_similar` | link only, no weight |
-| Last.fm similar artists and tags | `lastfm.py` cache (`similar` match 0–1, tag weight 0–100) | as listed |
-| Cluster per album | `cluster_registry` (`cluster_album_keys`, `artist_cluster_map`) | stable `cluster_id` |
-| Weighted pick + artist cap | `live_playlists._pick_tracks`, `_artist_cap` | weight = plays + 1 |
-| Daily rotation | `live_playlists._rotate_pool` (age, then fewest plays) | runs (days) in mix |
-| Running order | `live_playlists.dj_order` | sonic match 0–1 (+1 when direct) |
-| Feedback ("shown but never played") | `live_playlists._update_fit_stats` pattern | exposures, `viewCount` delta |
-| Scheduling | APScheduler daily 04:00 + weekly Mon 03:00, `JOB_LOCK` | `SCHEDULER_TZ` |
+| Playlist | What it answers | Familiarity | Refresh |
+|---|---|---|---|
+| **On Repeat** | what am I playing a lot *right now* | 100% played, recent | weekly |
+| **Discover Weekly** | what haven't I heard that I'd like | about 87% unplayed and 13% Rediscover (≥ 3 plays, ≥ 180 d quiet) | weekly |
+| **Cluster Mixes** (app) | music of one style | popular / random split | daily, 20% rotation |
+| **For You** (new) | a balanced mix across all my taste: new, half-known and beloved | about **40% unheard / 35% rarely played / 25% classics** | **daily, about 25% rotation** |
 
-Per-track fields Plex already returns (checked in `plexapi/audio.py`), all
-read in one bulk `section.searchTracks()` call:
+What For You adds that nothing covers today:
+- **Rarely played:** tracks with 1 to a few plays. Discover Weekly only takes
+  tracks with 0 plays, or 3 or more plays after 180 days of silence. The
+  1–2 play middle ground is never surfaced.
+- **Classics as anchors.** Familiar tracks woven between unfamiliar ones
+  make the new ones easier to take in.
+- **Daily change** without reshuffling everything.
+- **Cluster awareness:** fit to the clusters you play most, plus a spread
+  over them.
 
-| Field | Meaning | Units |
-|---|---|---|
-| `viewCount` | all-time plays (counted at ~90% completion) | integer |
-| `lastViewedAt` | last play | datetime |
-| `skipCount` | all-time skips | integer |
-| `userRating` | star rating | **0.0–10.0 = 0–5 stars** |
-| `ratingCount` | **global popularity: Last.fm listeners who scrobbled the track** | integer listeners |
-| `addedAt` | added to library | datetime |
-| `duration` | length | **milliseconds** |
-| `parentRatingKey` / `grandparentRatingKey` | album / artist | key |
-
-So global popularity costs no extra Last.fm calls: `ratingCount` is already
-on every track. `Artist.popularTracks()` sorts by the same field.
+**No overlap rule:**
+- For You never contains a track that is currently in **On Repeat** or
+  **Discover Weekly**.
+- It never contains a track Discover Weekly picked in the last
+  `HISTORY_WEEKS`.
+- Discover Weekly already excludes On Repeat.
 
 ---
 
-## 2. Unit conventions (traced end to end)
+## 2. Architecture
 
-- **Every score is a unitless 0–1 number.** Each raw input is converted once,
-  at the point where it is read, and the conversion is named in code:
-  - `match_pct / 100`
-  - `userRating / 10`
-  - `lastfm_tag_weight / 100`
-  - `log1p(ratingCount) / log1p(max_ratingCount)`
-- **Time is always days.** Ages are computed as
-  `(now − viewedAt).total_seconds() / 86400`. Never mix in Plex `duration`,
-  which is in milliseconds. Use `duration / 60000` only for minute-based
-  length limits.
-- **Decay constants τ are in days**, and their names say so:
-  `TAU_SHORT_DAYS`, `TAU_LONG_DAYS`.
-- **Two kinds of play count, kept apart.** `viewCount` is all-time.
-  History-window counts only cover `history_days`, so a track can have
-  `viewCount = 40` and 0 plays in the window (it was played before the
-  window, or imported). The bucket rules below say which count they use.
-- **Bug to check first: tz-aware vs naive datetimes.** `curation.py` already
-  calls `viewedAt.replace(tzinfo=None)`. The new code should use one helper
-  `_age_days(dt)` everywhere.
+**Recommendation:** follow the script pattern, not the Streamlit app. For You
+needs the same inputs as Discover Weekly:
+- the Tautulli history, which has real listen seconds, so 30-second skips
+  can be filtered out
+- the bulk library snapshot
+- the taste profile
+- sonic seeds
+- feedback
+- the DJ order
 
----
-
-## 3. Taste profile (`taste_profile.py`, new)
-
-Built once a day by the 04:00 job and cached to
-`/app/data/taste_profile.json`.
-
-**Input:**
-- `plex.history(mindate=now − 365 d)`, one entry per play
-- bulk track attributes (§1)
-- the registry
-- the Last.fm cache
-
-**Decayed affinity**, per track / album / artist / cluster *x*:
+Discover Weekly already has about 500 lines of exactly that. A third copy
+would drift, so step 0 is to share it:
 
 ```
-A_τ(x) = Σ over plays e of x:  exp(−age_days(e) / τ)          # "effective plays"
-a_τ(x) = A_τ(x) / (A_τ(x) + K_τ)                              # saturate to 0–1
-         K_τ = median A_τ over entities with A_τ > 0           # library-relative
+scripts/
+  common/                 # NEW: extracted from discover-weekly, no behaviour change
+    tautulli.py           # tautulli_get, fetch_history(after_ts=None), is_qualifying_play
+    library.py            # load_library, song_key, norm, to_ts
+    taste.py              # build_taste, sonic_scores, similar_artist_scores
+    feedback.py           # compute_feedback (now over ALL playlists' state)
+    select.py             # weighted_order, select(take with caps), interleave
+    dj.py                 # sonic_links, dj_order, dj_stretches
+    plexio.py             # find playlist (by stored ratingKey, else title), replace items, summary
+    state.py              # load/save state.json (atomic)
+    clusters.py           # optional: read the app's cluster_registry.json
+  discover-weekly/script.py   # thin: config + buckets + main loop
+  on-repeat/script.py         # thin: unchanged scoring, shared tautulli/plexio
+  for-you/script.py           # NEW
+  for-you/.env.example
 ```
 
-- **Short term:** `TAU_SHORT_DAYS = 14`, what you're into now.
-- **Long term:** `TAU_LONG_DAYS = 120`, what you always come back to.
-- **Tracks with all-time plays but no history in the window** get a long-term
-  floor of `0.5 · pct_viewCount(t)`, so old favourites still count.
-
-**Explicit and negative signals:**
-
-| Signal | Rule |
-|---|---|
-| `userRating ≥ 8` (4–5★) | +0.2 to the track's long-term affinity (capped at 1) |
-| `userRating ≤ 4` (≤ 2★) | **excluded** from all buckets; the artist gets a −0.1 relatedness penalty |
-| skips | `skip_ratio = skipCount / (skipCount + viewCount)`; if `skipCount ≥ 3` and ratio > 0.5 → ×0.5 |
-| recommended, never played | ×`0.6^n` for *n* exposures with no play (§7) |
-
-**Derived:**
-- `cluster_profile_long` / `cluster_profile_short`: affinity share per
-  cluster, summing to 1.
-- **Seeds:** the top 20 tracks by short-term affinity plus the top 20 by
-  long-term affinity, at most 2 per artist. These are the "what you like"
-  anchors for the sonic search.
+**Deployment:**
+- Each script keeps its own container and `.env`, as in the README compose
+  example.
+- The only change is the volume: mount `./plex-playlist-enhancer/scripts`
+  as `/app` and run `python for-you/script.py`, with `PYTHONPATH=/app` so
+  `common` imports.
+- Each script keeps its own `STATE_FILE` (for example
+  `/app/for-you/state.json`).
+- **Optional:** mount the app's data volume read-only, for example
+  `/appdata/cluster_registry.json`, and set `CLUSTER_REGISTRY_PATH` to use
+  clusters. Without it, For You falls back to Discover Weekly's style tags.
 
 ---
 
-## 4. Buckets (candidate sets)
+## 3. Units (traced: Tautulli / Plex → script)
 
-All thresholds are relative to the library, so they work on small and large
-libraries alike. `P_k` is the k-th percentile of `viewCount` over tracks with
-`viewCount ≥ 1`.
+| Quantity | Source | Unit at source | In script |
+|---|---|---|---|
+| play time | Tautulli `date`, `started`, `stopped` | **unix seconds** | `days_ago = (now_ts − date) / 86400` → days |
+| listen time | `stopped − started − paused_counter` | **seconds** | compared with `MIN_LISTEN_SECONDS` (s) |
+| last played | Plex `lastViewedAt` | datetime | `to_ts()` → unix s → days via /86400 |
+| track length | Plex `duration` | **milliseconds** | `/1000` → s (Discover Weekly already does this; keep it) |
+| lifetime plays | Plex `viewCount` | integer, counted at about 90% completion | plays |
+| qualifying plays | Tautulli rows passing `is_qualifying_play` | integer, ≥ 30 s listened | plays |
+| skips | Plex `skipCount` | integer | skips |
+| rating | Plex `userRating` | **0–10 (= 0–5★)** | ≤ 4 → ≤ 2★ (ban); ≥ 8 → ≥ 4★ |
+| global popularity | Plex `ratingCount` | **Last.fm listeners** (integer) | `log1p(x) / log1p(max)` → 0–1, or within-artist percentile |
+| sonic match | `sonicallySimilar` result `.distance` | 0–1, 0 = identical | `1 − distance` → 0–1; seed score uses rank `1 − rank/SONIC_LIMIT` |
+| half-lives | env `*_HALF_LIFE_DAYS` | **days** | `0.5 ** (days_ago / half_life)` |
 
-| Bucket | Rule |
-|---|---|
-| **U — New to you** | `viewCount == 0` and no history entry. Two sub-pools: **U-album** (the whole album is unplayed: really new) and **U-deep** (an unplayed track on an album you know). Default split 60/40. |
-| **R — Rare gems** | `1 ≤ viewCount ≤ max(2, P40)` and `days_since_last ≥ 30` |
-| **C — Classics** | `viewCount ≥ max(5, P85)` and `days_since_last ≥ COOLDOWN_DAYS` (21). "Forgotten favourites" rather than "on repeat". |
+All scores are unitless 0–1 before weighting.
+
+**Issues found in the existing scripts** (fix in step 0, each one small):
+
+1. **Double-counted plays.** Discover Weekly's `build_taste` adds
+   `0.1 × viewCount` to artist and style affinity "for plays before
+   Tautulli". But `viewCount` is lifetime and *includes* the Tautulli-era
+   plays, so those are counted twice. Fix: add only the pre-Tautulli
+   remainder, `max(0, viewCount − tautulli_plays(track))`.
+2. **Two definitions of a play.** Tautulli counts at ≥ 30 s; Plex
+   `viewCount` counts at about 90% completion. The two are mixed in the
+   feedback (`views > pick.views`) and in the taste profile. Keep both, but
+   name them: `plays_tautulli` (≥ 30 s) for taste, `views_plex` (completed)
+   for "accepted". Say so in comments so nobody compares them directly.
+3. **On Repeat reads history twice.** It fetches 30 days, then 3650 days;
+   the second includes the first. Do one fetch and split it by `date`.
+4. **Discover Weekly fetches the entire history every run.** It has no
+   `after=` filter. That's fine for now, but `common.tautulli.fetch_history`
+   should take `after_ts` (unix s), as On Repeat does.
+5. **Playlists are found by title.** If you rename "Discover Weekly" in
+   Plex, a second playlist gets created. Store the playlist's `ratingKey`
+   in `state.json` and look it up by key first (the app's
+   `_upsert_playlist` does this).
+
+---
+
+## 4. For You: buckets
+
+All thresholds are relative to the library. `views` is the song-level sum
+over copies (Discover Weekly's `song_key` already merges live, remaster and
+compilation copies). `P_k` is the k-th percentile of `views` over songs with
+`views ≥ 1`.
+
+| Bucket | Rule | Default (of 50) |
+|---|---|---|
+| **Unheard** | `views == 0`, not in Discover Weekly's current list or recent picks | 20 |
+| **Rarely played** | `1 ≤ views ≤ max(2, P40)` and last play ≥ `RARE_MIN_DAYS` (30) ago, and skip ratio `skips/(skips+views) < 0.5` | 18 |
+| **Classics** | `views ≥ max(5, P85)` and last play ≥ `CLASSIC_MIN_DAYS` (21) ago, not in On Repeat | 12 |
 
 Always excluded:
 - ≤ 2★ tracks
-- non-music items (`type != "track"`)
-- tracks played in the last 7 days
-- tracks recommended in the last `RECO_COOLDOWN_RUNS` runs (§7)
-- duplicate versions: at most one per normalised `(artist, title)`, so
-  live, remaster and compilation copies don't double up. Prefer the copy with
-  the highest `viewCount`, then the highest `ratingCount`.
-- compilations: the "artist > 40 albums" rule from the registry
-  (`SAME_ARTIST_MAX_ALBUMS`) means "Various Artists" never counts as a
-  related artist.
+- banned artists (from the feedback)
+- tracks under `MIN_TRACK_SECONDS`
+- anything in On Repeat or Discover Weekly right now
 
 ---
 
-## 5. Signals per candidate (all 0–1)
+## 5. For You: scoring
 
-**Recall.** This step only touches cached data and about 40 sonic calls.
+Signals, all 0–1. Most come straight from `common.taste`:
 
-| Signal | How | Plex calls |
-|---|---|---|
-| `sonic` | For each seed *s*: `s.sonicallySimilar(limit=30, maxDistance=0.30)`. `sonic(t) = max_s [match(t,s) · a(s)]`. Covers tracks the seeds point to directly. | ~40 |
-| `album_sonic` | From `album_features.sonic`: `Σ_A a_long(A) · w(A→album(t)) / Σ a_long`. Reaches every track on neighbour albums with no calls. | 0 |
-| `related` | `max(a_long(artist(t))` (same artist), `max_L a_long(L) · sim(L, artist(t)))`. `sim` is the Last.fm match (0–1); a Plex similar-artist link counts as 0.6. | 0 |
-| `cluster` | `cluster_profile(cluster(album(t))) / max(cluster_profile)` | 0 |
-| `pop_global` | `log1p(ratingCount) / log1p(max ratingCount in library)` | 0 |
-| `pop_album` | the track's popularity rank within its own album by `ratingCount` (1 = the album's hit) — the best way into an unheard album | 0 |
-| `pop_personal` | percentile of `viewCount` among played tracks | 0 |
-| `forgotten` | `1 − exp(−days_since_last / 60)` | 0 |
+| Signal | Source |
+|---|---|
+| `sonic` | `sonic_scores(seeds)`: closeness to recent and all-time seed tracks |
+| `sonic_now` | the same, but with the **recent seeds only** ("fits what I'm into this month") |
+| `artist` | `max(artist_aff, similar_artist_link)` |
+| `style` | album style/genre vs the taste profile (Discover Weekly's `album_style`) |
+| `cluster` | (optional) `cluster_profile[cluster(album)] / max`; `cluster_profile` = decayed plays per registry cluster |
+| `pop` | `log1p(ratingCount) / log1p(max ratingCount)`; for Unheard, `0.5·pop + 0.5·within-album rank` (the album's best-known song as a way in) |
+| `track_aff` | `log1p(views) / log1p(max views)` |
+| `forgotten` | `1 − exp(−days_since_last / 60)` |
 
-Combined sonic: `sonic_c = max(sonic, 0.8 · album_sonic)`. As in
-`_album_similarity`, a track-level match is worth more than an album-level one.
+Weights per bucket (relative). With no registry, `cluster` is dropped and
+the rest renormalised:
 
-U candidates with every signal at 0 are dropped. That keeps the pool to
-"things connected to your taste" rather than the whole library.
-
----
-
-## 6. Scoring and selection
-
-**Per-bucket weights** (relative; normalised over the components that have
-data, like the registry affinity):
-
-| Component | U | R | C |
+| | Unheard | Rarely played | Classics |
 |---|---|---|---|
-| `sonic_c` | 0.35 | 0.35 | 0.20 *(to **short-term** seeds = fits current mood)* |
-| `related` | 0.25 | 0.20 | — |
-| `cluster` | 0.15 | 0.15 | 0.20 *(short-term profile)* |
-| popularity | 0.25 `(0.5 pop_global + 0.5 pop_album)` | 0.15 `pop_global` | — |
-| affinity | — | 0.15 `a_long(artist)` | 0.40 `a_long(track)` |
+| `sonic` | 0.35 | 0.30 | — |
+| `sonic_now` | — | — | 0.30 |
+| `artist` | 0.25 | 0.25 | — |
+| `style` | 0.10 | 0.10 | — |
+| `cluster` | 0.10 | 0.10 | 0.15 |
+| `pop` | 0.20 | 0.25 | — |
+| `track_aff` | — | — | 0.35 |
 | `forgotten` | — | — | 0.20 |
 
-`score = weighted_sum × penalties` (§3), giving 0–1.
-
-**Selection** (new `_pick_recommended`, built on `_pick_tracks`):
-
-1. **Quotas.** `round(size × share)` per bucket. If a bucket can't fill its
-   quota, the gap goes to the others in proportion.
-2. **Ranking.** Within a bucket, weighted random sampling without replacement
-   (Efraimidis–Spirakis, the same as `_pick_tracks`) with weight `score^γ`,
-   γ = 3. Good tracks dominate, but each run differs.
-3. **Diversity** (shared across buckets):
-   - artist cap `_artist_cap(size, 0.10)`
-   - at most 2 tracks per album
-   - at most 35% from one cluster
-   - an MMR-style −0.15 for a candidate that is a direct sonic neighbour of an
-     already-picked track in the same bucket, so 5 near-identical tracks don't
-     all win
-4. **Label.** `recommendation_type` shows the reason, like the existing
-   Popular/Discovery labels. Examples:
-   - `New · sounds like "<seed>" (82%)`
-   - `Rare gem · fans of <artist> also like this`
-   - `Classic · 47 plays, last heard 5 months ago`
-
-**Order:** `dj_order` gets one optional new rule, `max_unfamiliar_run=2`: no
-more than 2 U tracks in a row, and the playlist opens with a C track.
-Familiar anchors make the new material easier to take in. The same eligible
-plus look-ahead mechanism as the no-doubling rule applies.
+After that, the feedback multipliers apply: `compute_feedback` ×0.8 to ×1.5,
+and banned artists are dropped. The feedback now reads **every** script's
+`state.json`, so a skip in Discover Weekly also counts for For You.
 
 ---
 
-## 7. Live subscription and feedback
+## 6. Selection, order, rotation
 
-**New subscription kind:** `recommended_mixes` in `live_playlists.json`, next
-to the artist and cluster mixes. It shows in the 🔴 Live Playlists overview.
+1. **Selection.** `common.select.weighted_order` (top pool × `POOL_FACTOR`,
+   temperature) plus `take()` with caps:
+   - `MAX_PER_ARTIST` 2 (Unheard: 1 per artist, as in Discover Weekly)
+   - `MAX_PER_ALBUM` 1
+   - one per `song_key`
+   - **at most 35% from one cluster** (new; only with a registry)
 
-**Refresh modes:**
-- `weekly` (default): a full regeneration on Monday at the 04:00 daily run,
-  after the 03:00 curation, so it sees the new clusters. Tuesday to Sunday it
-  only records feedback.
-- `daily`: per-bucket rotation via `_rotate_pool` at `rotation_percent` (20).
+   Short buckets backfill in the order Rarely played → Unheard → Classics.
+2. **Order.** `interleave` gets bucket rules:
+   - open with a Classic
+   - never more than 2 Unheard in a row
+   - a Classic about every 4–5 tracks
 
-**Feedback state** (`recommendation_stats` on the subscription, the same
-idea as `fit_stats`), per shown track:
-`{first_shown, last_shown, exposures, plays_since_shown}`.
-- **Played** (`viewCount` went up): `accepted`. The next profile counts the
-  play anyway; the track then moves from U to R naturally.
-- **Shown, not played:** exposures increase. The fatigue penalty `0.6^n`
-  applies only if *other* tracks in the same mix were played in that period,
-  the same guard as the mix-fit penalty, so a week of no listening at all
-  penalises nothing.
-- **Cooldown:** a track that rotated out isn't shown again for
-  `RECO_COOLDOWN_RUNS` (4 weekly runs or 28 daily runs).
-- **Acceptance rate per bucket** (plays ÷ exposures) shows in the UI. It is
-  the main health metric for tuning the weights.
+   Then `dj_stretches` (20-track stretches) as in Discover Weekly.
+3. **Daily rotation** (`ROTATION_PERCENT`, 25):
+   - Remove, in this order:
+     1. tracks played since yesterday (`views` went up: you got it; it now
+        counts as positive feedback)
+     2. tracks skipped since yesterday
+     3. the oldest by days-in-list
+   - Refill each bucket back to its quota.
+   - Tracks removed get a `COOLDOWN_DAYS` (14) cooldown.
+   - The kept tracks stay in place, and new picks are slotted in with the
+     DJ similarity, so the list doesn't reshuffle.
+   - Weekly full rebuild (Monday after Discover Weekly runs), or never; this
+     is a config setting.
+4. **State** (`for-you/state.json`):
+   - `playlist_rating_key`
+   - `current: [{rk, bucket, added_ts, views, skips}]`
+   - `cooldown: {rk: until_ts}`
+   - `runs: [...]`, kept `HISTORY_WEEKS`, in the same format as Discover
+     Weekly so the shared feedback reads it
 
----
-
-## 8. Files to add or change
-
-| File | Change |
-|---|---|
-| `taste_profile.py` (new) | history → decayed affinities, seeds, cluster profiles, cache |
-| `recommender.py` (new; the current file only does playlist vibe) | buckets, recall, signals, scoring, `_pick_recommended`, labels. Kept separate from `recommendations.py`, which stays as is. |
-| `live_playlists.py` | `recommended_mixes` CRUD, `run_recommended_subscription`, feedback update, wiring into `run_all_subscriptions` and the daily job; `dj_order(max_unfamiliar_run=…)` |
-| `tabs/foryou_tab.py` (new) | a "✨ For You" section: bucket share sliders, size, cadence, a preview table with the reason column and per-bucket counts, ▶ play preview, 💾 save / "keep updated" |
-| `app.py` | add the section |
-| `docs/recommended-mix.md` | the final reference in the same style as `weekly-recluster.md` (replaces this plan) |
-
-**Cost per run:**
-- 1 bulk `searchTracks`
-- 1 paged `history` call
-- about 40 `sonicallySimilar` calls for seeds
-- about 50 for `dj_order`
-- Last.fm only for artists not cached yet (2 calls each, already throttled
-  in `lastfm.py`)
+**Plex calls per daily run:**
+- bulk library search (3 calls)
+- Tautulli history since the last run
+- about 25 `sonicallySimilar` calls for seeds
+- about 13 for the DJ links of new tracks; links between kept tracks are
+  cached in state
 
 ---
 
-## 9. Presets (one engine, several playlists)
+## 7. Steps
 
-| Preset | U / R / C | Notes |
-|---|---|---|
-| **For You** (default) | 40 / 30 / 30 | weekly |
-| **Discover** | 100 / 0 / 0 | U-album 80%, weekly |
-| **Deep cuts** | 50 (U-deep only) / 50 / 0 | |
-| **Rediscover** | 0 / 40 / 60 | daily, forgotten-favourite heavy |
-| **On Repeat** | 0 / 0 / 100 | `COOLDOWN_DAYS = 0`, uses the short-term affinity instead of `forgotten` |
-| **Per cluster** | 40 / 30 / 30 | candidates limited to one `cluster_id`, so "For You: Post-Rock" |
+0. **Extract `scripts/common/`** from Discover Weekly and fix §3 issues 1–5.
+   Check: `DRY_RUN=true` with `random.seed(0)` produces the same Discover
+   Weekly list before and after (except where issue 1 intentionally
+   changes scores; check that with the fix toggled off).
+1. **For You, `DRY_RUN` only.** Implement buckets and scoring, and print
+   bucket sizes, the P40/P85 thresholds and each pick with its score
+   breakdown. Tune on your real library.
+2. **Writes and rotation.** Create/update the playlist, daily rotation,
+   state, cooldown, exclusions against On Repeat and Discover Weekly.
+3. **Clusters (optional).** Read `cluster_registry.json`, add the cluster
+   signal and the 35% cap.
+4. **Backtest** (offline, `DRY_RUN`). Build the taste profile from history
+   up to 14 days ago, then measure:
+   - how many first-time plays in those 14 days rank in the top 200
+     Unheard/Rarely-played candidates
+   - the same for random and popularity-only
 
----
-
-## 10. Build order
-
-1. **Profile and buckets, read only.** Build `taste_profile.py` plus a debug
-   view of the bucket sizes, the P40/P85 thresholds, the top seeds and the
-   cluster profile. Check the numbers against your real library before any
-   scoring.
-2. **Scoring and preview.** Add `recommender.py` and the For You tab with
-   preview and reasons. No Plex writes except the explicit 💾.
-3. **Offline backtest.** Hide the last 14 days of history, build the profile
-   from the rest, and measure:
-   - how many of the tracks and artists you first played in those 14 days
-     land in the top 200 U/R candidates (recall@200)
-   - the same against two baselines: random, and popularity-only
-
-   Tune the weights in §6 with a small grid until the engine clearly beats
-   both baselines.
-4. **Live mix and feedback.** Subscription, weekly/daily modes, acceptance
-   stats, fatigue, cooldown.
-5. **Presets and the DJ rule.** §9, `max_unfamiliar_run`, per-cluster
-   variants.
-6. **Docs.** Write `docs/recommended-mix.md`.
+   Adjust the §5 weights until the engine clearly beats both.
+5. **Docs.** Write `scripts/for-you/README` and add a compose snippet to the
+   main README.
+6. **Later (optional).** A read-only "🏭 Playlist Factory" tab in the
+   Streamlit app showing the three scripts' last run, next run and current
+   lists from their `state.json`.
 
 ---
 
-## 11. Open decisions
+## 8. Open decisions
 
-1. **Default mix.** 40/30/30 and 50 tracks? Or lean more towards
-   discovery?
-2. **Cadence.** Weekly fresh list (Discover-style) or daily 20% rotation?
-3. **Overlap with Cluster Mixes.** Should For You avoid tracks currently in
-   other Live Mixes? This is cheap: their `current_*_keys` are already
-   stored.
-4. **Classics cooldown.** Is 21 days right, or should "On Repeat" territory
-   be excluded more aggressively?
+1. **Split and size.** 40 / 35 / 25 of 50?
+2. **Refresh.** Daily 25% rotation, or one fresh list a week (offset from
+   Discover Weekly, for example Thursday)?
+3. **Clusters.** Use the app's cluster registry (mount it read-only), or keep
+   the scripts fully independent of the app?
+4. **Shared code.** Is it fine to refactor Discover Weekly and On Repeat onto
+   `scripts/common/` (same behaviour, plus the §3 fixes)? The alternative is
+   leaving them untouched and duplicating the code in For You.

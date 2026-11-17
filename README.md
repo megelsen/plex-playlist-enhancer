@@ -102,6 +102,9 @@ plex-playlist-enhancer/
 │   ├── registry_panel.py      # 🧬 album clusters panel (inside Library Clusters)
 │   ├── galaxy_tab.py          # 🌌 Library Galaxy UI
 │   └── live_tab.py            # 🔴 Live Playlists UI
+├── scripts/                   # standalone companion containers (see below)
+│   ├── on-repeat/             # "On Repeat" playlist from Tautulli history
+│   └── discover-weekly/       # "Discover Weekly" playlist of unplayed picks
 ├── requirements.txt
 └── Dockerfile
 ```
@@ -405,6 +408,60 @@ Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
   ever uses the playlist ratingKey the app created.
 - **Rollback:** every run is snapshotted and can be rolled back from the 🧬
   panel, which also recreates deleted playlists.
+
+## Companion scripts: On Repeat & Discover Weekly
+
+`scripts/` holds two standalone Spotify-style playlist generators. They don't
+use the Streamlit app; each is a single `script.py` that reads listening
+history from **Tautulli**, writes a playlist to Plex, and then loops forever
+(re-running every `RUN_INTERVAL_DAYS`, default 7), so it can run as a plain
+long-lived container with no cron.
+
+- **On Repeat** (`scripts/on-repeat/`): your most-played tracks of the last
+  `DAYS` (30), weighted by recency (`HALF_LIFE_DAYS`), plus a few all-time
+  favourites. Default size is 25 tracks.
+- **Discover Weekly** (`scripts/discover-weekly/`): about 60 tracks you
+  haven't played, in four buckets: *New to You*, *Missed Hits*,
+  *Hidden Gems* and *Rediscover*. They are scored on sonic similarity to
+  your recent seeds, artist affinity and style, then DJ-ordered. Past picks
+  and their play/skip results are kept in `state.json` so tracks don't repeat
+  for `HISTORY_WEEKS`, and the list only rebuilds when the last build is
+  older than `RUN_INTERVAL_DAYS`, so restarting the container doesn't
+  reshuffle it. Set `DRY_RUN=true` to print the list without touching Plex.
+
+Copy each folder's `.env.example` to `.env` and fill in the Tautulli and Plex
+values; every other setting is optional and listed with its default.
+
+```yaml
+  plex-on-repeat:
+    image: python:3.11-slim
+    container_name: plex-on-repeat
+    restart: unless-stopped
+    volumes:
+      - ./plex-playlist-enhancer/scripts/on-repeat:/app
+    working_dir: /app
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && python script.py"
+    environment:
+      - TZ=Europe/Amsterdam
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - ./plex-playlist-enhancer/scripts/on-repeat/.env
+
+  plex-discover-weekly:            # same pattern; state.json is written to /app
+    image: python:3.11-slim
+    container_name: plex-discover-weekly
+    restart: unless-stopped
+    volumes:
+      - ./plex-playlist-enhancer/scripts/discover-weekly:/app
+    working_dir: /app
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && python script.py"
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - ./plex-playlist-enhancer/scripts/discover-weekly/.env
+```
+
+`.env` and `state.json` are git-ignored.
 
 ## Notes
 
