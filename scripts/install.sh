@@ -158,7 +158,7 @@ done
 
 # --- 3. Compose file ------------------------------------------------------------
 bold "3. docker-compose: new layout"
-cp -p "$COMPOSE" "$COMPOSE.bak-$TS"; BACKUPS="$BACKUPS $ROOT/$COMPOSE.bak-$TS"
+cp -p "$COMPOSE" "$COMPOSE.bak-$TS"
 ok "backup: $COMPOSE.bak-$TS"
 OUT="$(docker run --rm "${HELPER_FLAGS[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp \
         -v "$ROOT:/work" -w /work python:3.11-slim sh -c \
@@ -173,7 +173,9 @@ SVC_FY="$(field 'd["services"]["for-you"]')"
 CHANGES="$(field '"\n".join(d["changes"])')"
 if [ -n "$CHANGES" ]; then
   printf '%s\n' "$CHANGES" | sed 's/^/  - /'
+  BACKUPS="$BACKUPS $ROOT/$COMPOSE.bak-$TS"
 else
+  rm -f "$COMPOSE.bak-$TS"
   ok "already in the new layout, nothing changed"
 fi
 DATA="$(field 'd["data"] or ""')"
@@ -187,7 +189,9 @@ fi
 rm -f /tmp/compose-err.$$
 ok "services: $SVC_OR, $SVC_DW, $SVC_FY — config valid"
 
-# Remember what to undo.
+# Remember what to undo, but only when this run changed something: a second
+# run must not replace the record of the original files with converted ones.
+if [ -n "${BACKUPS// /}" ] || [ ! -f "$STATE" ]; then
 cat > "$STATE" <<EOF
 INSTALL_TS="$TS"
 PREV_BRANCH="$PREV_BRANCH"
@@ -196,6 +200,7 @@ SVC_OR="$SVC_OR"
 SVC_DW="$SVC_DW"
 SVC_FY="$SVC_FY"
 EOF
+fi
 
 # --- 4. Stop the old containers -----------------------------------------------
 bold "4. Stop the old script containers"

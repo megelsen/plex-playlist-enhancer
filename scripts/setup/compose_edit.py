@@ -94,6 +94,7 @@ def main(compose_path, example_path, default_scripts):
     yaml = YAML()
     yaml.preserve_quotes = True
     yaml.indent(mapping=2, sequence=4, offset=2)
+    yaml.width = 4096          # never wrap long lines such as command: sh -c "..."
     with open(compose_path) as f:
         doc = yaml.load(f)
     with open(example_path) as f:
