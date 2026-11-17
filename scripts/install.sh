@@ -329,7 +329,8 @@ wait_for "$SVC_DW" "Next build at"
 ok "$SVC_DW: $("${DC[@]}" logs --no-log-prefix "$SVC_DW" | grep -E "updated with|Next build" | tail -n 1)"
 "${DC[@]}" up -d "$SVC_FY" >/dev/null
 wait_for "$SVC_FY" "Next build at"
-ok "$SVC_FY: $("${DC[@]}" logs --no-log-prefix "$SVC_FY" | grep -E "updated with" | tail -n 1)"
+UPD="$("${DC[@]}" logs --no-log-prefix "$SVC_FY" | grep -E "updated with" | tail -n 1)"
+[ -n "$UPD" ] && ok "$SVC_FY: $UPD" || ok "$SVC_FY: already built today, kept as is"
 ok "$SVC_FY: $("${DC[@]}" logs --no-log-prefix "$SVC_FY" | grep -E "Next build" | tail -n 1)"
 
 bold "Done"
