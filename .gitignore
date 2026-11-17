@@ -16,3 +16,6 @@ venv/
 # Discover Weekly runtime state
 state.json
 state.json.tmp
+
+# install.sh bookkeeping
+scripts/setup/.last-install
