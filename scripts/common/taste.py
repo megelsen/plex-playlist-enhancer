@@ -45,12 +45,18 @@ def build_taste(tracks, albums, history, now_ts, *, min_listen_seconds, taste_ha
         if days_ago <= seed_days:
             recent[rk] += 0.5 ** (days_ago / seed_half_life_days)
 
-    # Plex lifetime counts cover plays from before Tautulli existed.
+    # Plex lifetime counts (views_plex) also cover plays from before Tautulli
+    # existed. They include every Tautulli-era play too, so only the part
+    # Tautulli doesn't know about is added (0.1 per play, undecayed), or those
+    # plays would count twice. Tautulli counts a play at >= 30 s and Plex at
+    # ~90%, so plays_tautulli is usually >= the Plex count for the same period
+    # and the remainder is a lower bound for the pre-Tautulli plays.
     for t in tracks.values():
-        if t["views"]:
-            artist_aff[t["artist_key"]] += 0.1 * t["views"]
+        pre_tautulli = max(0, t["views"] - plays_tautulli.get(t["rk"], 0))
+        if pre_tautulli:
+            artist_aff[t["artist_key"]] += 0.1 * pre_tautulli
             for tag in albums.get(t["album_key"], {}).get("tags", ()):
-                style[tag] += 0.1 * t["views"]
+                style[tag] += 0.1 * pre_tautulli
 
     seeds = {}
     recent_norm = normalize(recent)
