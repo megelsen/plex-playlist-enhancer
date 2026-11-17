@@ -46,9 +46,9 @@ from plexapi.server import PlexServer  # noqa: E402
 
 from common.dj import sonic_links, dj_stretches  # noqa: E402
 from common.feedback import compute_feedback  # noqa: E402
-from common.library import (load_library, normalize, aggregate_songs,  # noqa: E402
+from common.library import (load_library, aggregate_songs,  # noqa: E402
                             artist_song_percentiles, album_style_scores)
-from common.plexio import find_playlist, playlist_keys, replace_playlist, set_summary  # noqa: E402
+from common.plexio import playlist_keys, replace_playlist, set_summary  # noqa: E402
 from common.select import Selector, interleave, weighted_order  # noqa: E402
 from common.state import load_state as _load_state, save_state as _save_state, read_runs  # noqa: E402
 from common.tautulli import Tautulli  # noqa: E402

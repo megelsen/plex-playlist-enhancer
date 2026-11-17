@@ -13,12 +13,14 @@ DJ_RECENT_ARTIST_WINDOW = 3     # songs back that count as "just heard this arti
 DJ_RECENT_ARTIST_PENALTY = 0.4
 
 
-def sonic_links(items, neighbor_limit, max_distance, direct=None, log=print):
+def sonic_links(items, neighbor_limit, max_distance, direct=None, among=None, log=print):
     """Pairwise Plex sonic match (0..1) between playlist tracks: one
     sonicallySimilar call per item, kept only where the neighbour is also
-    in `items`. Pass an existing `direct` to add links for new items to
-    cached ones (it is updated in place and returned)."""
-    keys = {str(i.ratingKey) for i in items}
+    in the playlist (`among`, a set of ratingKey strings; default: `items`).
+    To add new tracks to a playlist whose links are cached, pass only the
+    new items, the cached links as `direct` and all playlist keys as `among`
+    (`direct` is updated in place and returned)."""
+    keys = set(among) if among is not None else {str(i.ratingKey) for i in items}
     direct = direct if direct is not None else defaultdict(dict)
     for item in items:
         a = str(item.ratingKey)
@@ -99,13 +101,35 @@ def dj_order(tracks, direct, albums, prev=None, recent=(), run_limits=None, buck
                 out.append(t)
         return out
 
-    def within_runs(pool, ordered):
+    def within_runs(pool, ordered, remaining):
+        """Candidates that keep every limited bucket's runs within its limit,
+        now and (lookahead) for the tracks left after them: a bucket with u
+        tracks left needs u <= limit x (other tracks left + 1)."""
         if not run_limits:
             return pool
-        ok = [t for t in pool
-              if bucket_of.get(t["rk"]) not in run_limits
-              or _run_length(ordered, bucket_of, bucket_of[t["rk"]]) < run_limits[bucket_of[t["rk"]]]]
-        return ok or pool
+        left = defaultdict(int)
+        for t in remaining:
+            left[bucket_of.get(t["rk"])] += 1
+        n_left = len(remaining)
+
+        def ok(t):
+            b = bucket_of.get(t["rk"])
+            if b in run_limits and _run_length(ordered, bucket_of, b) >= run_limits[b]:
+                return False
+            for lb, limit in run_limits.items():
+                u = left[lb] - (1 if b == lb else 0)
+                others = n_left - 1 - u
+                run = _run_length(ordered, bucket_of, lb) + 1 if b == lb else 0
+                if u > limit * (others + 1) - run:
+                    return False
+            return True
+
+        good = [t for t in pool if ok(t)]
+        if good:
+            return good
+        now_ok = [t for t in pool if bucket_of.get(t["rk"]) not in run_limits
+                  or _run_length(ordered, bucket_of, bucket_of[t["rk"]]) < run_limits[bucket_of[t["rk"]]]]
+        return now_ok or pool
 
     ordered = list(recent)
     current = prev
@@ -116,7 +140,7 @@ def dj_order(tracks, direct, albums, prev=None, recent=(), run_limits=None, buck
         pool = (eligible(remaining, last_artist)
                 or [t for t in remaining if t["artist_key"] != last_artist]
                 or remaining)
-        pool = within_runs(pool, ordered)
+        pool = within_runs(pool, ordered, remaining)
         if current is None:
             nxt = pool[0]
         else:

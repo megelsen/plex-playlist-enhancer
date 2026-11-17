@@ -103,8 +103,11 @@ plex-playlist-enhancer/
 │   ├── galaxy_tab.py          # 🌌 Library Galaxy UI
 │   └── live_tab.py            # 🔴 Live Playlists UI
 ├── scripts/                   # standalone companion containers (see below)
+│   ├── common/                # code shared by the three scripts
 │   ├── on-repeat/             # "On Repeat" playlist from Tautulli history
-│   └── discover-weekly/       # "Discover Weekly" playlist of unplayed picks
+│   ├── discover-weekly/       # "Discover Weekly" playlist of unplayed picks
+│   ├── for-you/               # "For You": unheard, rarely played and classics, daily
+│   └── tests/                 # fake Plex/Tautulli + end-to-end checks
 ├── requirements.txt
 └── Dockerfile
 ```
@@ -409,17 +412,18 @@ Full reference: [docs/weekly-recluster.md](./docs/weekly-recluster.md).
 - **Rollback:** every run is snapshotted and can be rolled back from the 🧬
   panel, which also recreates deleted playlists.
 
-## Companion scripts: On Repeat & Discover Weekly
+## Companion scripts: On Repeat, Discover Weekly & For You
 
-`scripts/` holds two standalone Spotify-style playlist generators. They don't
-use the Streamlit app; each is a single `script.py` that reads listening
-history from **Tautulli**, writes a playlist to Plex, and then loops forever
-(re-running every `RUN_INTERVAL_DAYS`, default 7), so it can run as a plain
-long-lived container with no cron.
+`scripts/` holds three standalone Spotify-style playlist generators. They
+don't use the Streamlit app; each is a `script.py` that reads listening
+history from **Tautulli**, writes a playlist to Plex, and then loops forever,
+so it runs as a plain long-lived container with no cron. Shared code
+(Tautulli, library snapshot, taste profile, feedback, selection, DJ order)
+lives in `scripts/common/`.
 
 - **On Repeat** (`scripts/on-repeat/`): your most-played tracks of the last
   `DAYS` (30), weighted by recency (`HALF_LIFE_DAYS`), plus a few all-time
-  favourites. Default size is 25 tracks.
+  favourites. Default size is 25 tracks. Weekly.
 - **Discover Weekly** (`scripts/discover-weekly/`): about 60 tracks you
   haven't played, in four buckets: *New to You*, *Missed Hits*,
   *Hidden Gems* and *Rediscover*. They are scored on sonic similarity to
@@ -427,10 +431,23 @@ long-lived container with no cron.
   and their play/skip results are kept in `state.json` so tracks don't repeat
   for `HISTORY_WEEKS`, and the list only rebuilds when the last build is
   older than `RUN_INTERVAL_DAYS`, so restarting the container doesn't
-  reshuffle it. Set `DRY_RUN=true` to print the list without touching Plex.
+  reshuffle it.
+- **For You** (`scripts/for-you/`): a balanced daily mix of 50 tracks:
+  20 *Unheard*, 18 *Rarely played* (1 to a few plays, none in 30 days) and
+  12 *Classics* (your most-played songs not heard for 3+ weeks), scored on
+  sonic similarity, artist and similar-artist affinity, style, popularity and,
+  optionally, the app's album clusters. It never repeats what is in On
+  Repeat or Discover Weekly. Each day the tracks you played or skipped, then
+  the oldest, are swapped out until a quarter of the list is new; the rest
+  stays in place. Reference: [docs/for-you.md](./docs/for-you.md).
 
-Copy each folder's `.env.example` to `.env` and fill in the Tautulli and Plex
-values; every other setting is optional and listed with its default.
+`DRY_RUN=true` prints a list without touching Plex. Copy each folder's
+`.env.example` to `.env` and fill in the Tautulli and Plex values; every
+other setting is optional and listed with its default.
+
+All three containers mount the **whole `scripts/` folder** (so `common/` can
+be imported) and start in their own subfolder. Each `state.json` stays in its
+own subfolder, the same file on the host as before.
 
 ```yaml
   plex-on-repeat:
@@ -438,8 +455,8 @@ values; every other setting is optional and listed with its default.
     container_name: plex-on-repeat
     restart: unless-stopped
     volumes:
-      - ./plex-playlist-enhancer/scripts/on-repeat:/app
-    working_dir: /app
+      - ./plex-playlist-enhancer/scripts:/scripts
+    working_dir: /scripts/on-repeat
     command: sh -c "pip install --no-cache-dir -r requirements.txt && python script.py"
     environment:
       - TZ=Europe/Amsterdam
@@ -447,19 +464,45 @@ values; every other setting is optional and listed with its default.
     env_file:
       - ./plex-playlist-enhancer/scripts/on-repeat/.env
 
-  plex-discover-weekly:            # same pattern; state.json is written to /app
+  plex-discover-weekly:            # same pattern
     image: python:3.11-slim
     container_name: plex-discover-weekly
     restart: unless-stopped
     volumes:
-      - ./plex-playlist-enhancer/scripts/discover-weekly:/app
-    working_dir: /app
+      - ./plex-playlist-enhancer/scripts:/scripts
+    working_dir: /scripts/discover-weekly
     command: sh -c "pip install --no-cache-dir -r requirements.txt && python script.py"
     environment:
+      - TZ=Europe/Amsterdam
       - PYTHONUNBUFFERED=1
     env_file:
       - ./plex-playlist-enhancer/scripts/discover-weekly/.env
+
+  plex-for-you:
+    image: python:3.11-slim
+    container_name: plex-for-you
+    restart: unless-stopped
+    volumes:
+      - ./plex-playlist-enhancer/scripts:/scripts
+      # optional: use the app's album clusters
+      - ./data/cluster_registry.json:/appdata/cluster_registry.json:ro
+    working_dir: /scripts/for-you
+    command: sh -c "pip install --no-cache-dir -r requirements.txt && python script.py"
+    environment:
+      - TZ=Europe/Amsterdam          # RUN_HOUR / RUN_MINUTE are local time
+      - PYTHONUNBUFFERED=1
+      - CLUSTER_REGISTRY_PATH=/appdata/cluster_registry.json
+    env_file:
+      - ./plex-playlist-enhancer/scripts/for-you/.env
 ```
+
+**Upgrading from the one-folder layout** (`scripts/on-repeat:/app`): change
+the volume and `working_dir` as above. If a `.env` sets
+`STATE_FILE=/app/state.json`, remove that line (the default is now
+`state.json` next to the script, the same host file).
+
+Tests against a fake Plex/Tautulli (no server needed):
+`python scripts/tests/test_scripts.py`.
 
 `.env` and `state.json` are git-ignored.
 
