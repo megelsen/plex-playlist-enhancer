@@ -226,7 +226,7 @@ ok "stopped $SVC_OR and $SVC_DW (their playlists stay in Plex)"
 
 # --- 5. Dry run ----------------------------------------------------------------
 bold "5. For You dry run (writes nothing)"
-DRY="$("${DC[@]}" run --rm -e DRY_RUN=true "$SVC_FY" 2>&1 || true)"
+DRY="$("${DC[@]}" run --rm -T -e DRY_RUN=true "$SVC_FY" </dev/null 2>&1 || true)"
 if ! printf '%s' "$DRY" | grep -q "DRY_RUN set"; then
   printf '%s\n' "$DRY" | grep -v -i "pip\|^$" | tail -n 25
   die "The dry run failed (output above). See Troubleshooting in docs/playlist-scripts-setup.md. Nothing was started; --undo puts the files back."
@@ -240,7 +240,7 @@ ok "dry run ok: $(printf '%s\n' "$DRY" | grep -cE '^ +[0-9]+\.[+ ]') tracks ($(p
 # --- 6. Backtest (optional) ----------------------------------------------------
 if [ "$BACKTEST" = 1 ]; then
   bold "6. Backtest (writes nothing)"
-  "${DC[@]}" run --rm -e BACKTEST_DAYS=14 "$SVC_FY" 2>&1 | grep -v -i "pip\|^$\|Container " || true
+  "${DC[@]}" run --rm -T -e BACKTEST_DAYS=14 "$SVC_FY" </dev/null 2>&1 | grep -v -i "pip\|^$\|Container " || true
 fi
 
 [ "$NO_START" = 1 ] && { echo; echo "Stopped before starting (--no-start)."; exit 0; }
