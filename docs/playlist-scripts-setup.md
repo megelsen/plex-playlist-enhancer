@@ -14,7 +14,71 @@ What changes compared to what you run today:
 - **Renamed playlists.** All three find their playlist by its Plex ID, so
   renaming a playlist in Plex no longer creates a duplicate.
 
-Time needed: about 20 minutes.
+Time needed: about 5 minutes with the installer, about 20 by hand.
+
+---
+
+## Quick install (does steps 1–7 for you)
+
+On the server, in the folder that holds `docker-compose.yml` and the
+`plex-playlist-enhancer` folder:
+
+```bash
+git -C plex-playlist-enhancer fetch origin for-you-playlist
+git -C plex-playlist-enhancer show origin/for-you-playlist:scripts/install.sh > install-playlists.sh
+bash install-playlists.sh --backtest
+```
+
+**What it does, in order:**
+1. **Code.** It checks out `for-you-playlist`. It stops if you have
+   uncommitted changes in the checkout.
+2. **`.env` files.**
+   - It removes `STATE_FILE=/app/state.json` from the old `.env` files (with
+     a backup).
+   - It creates `for-you/.env` with the Tautulli/Plex settings of
+     `discover-weekly/.env`.
+3. **`docker-compose.yml`.** It makes a backup
+   (`docker-compose.yml.bak-<time>`), then:
+   - **The two script services** get the new mount and `working_dir`.
+   - **`plex-for-you` is added.** It gets your `TZ`, plus the Streamlit app's
+     data folder for clusters when the app is in the same compose file.
+   - **Kept as they were:** comments and every other service.
+   - **Safety check:** if `docker compose config` doesn't accept the result,
+     the backup goes back.
+4. **Old containers.** It stops the two old script containers.
+5. **Dry run.** It does a For You dry run that writes nothing, and shows the
+   key lines.
+6. **Backtest.** It runs the backtest (only with `--backtest`).
+7. **Start.** It asks, then starts On Repeat and Discover Weekly, waits for
+   them, then starts For You and waits for its first playlist.
+
+It ends with:
+
+```
+== Done
+  Open Plexamp → Playlists → "For You" (you can rename or pin it).
+```
+
+**Options:**
+- `--yes`: no questions.
+- `--no-start`: stop after the dry run.
+- `--skip-git`: leave the checkout alone.
+- `--compose FILE` / `--repo DIR`: other locations than the defaults.
+
+**Running it again** is safe: it changes nothing that is already converted.
+
+**Undo everything:** `bash plex-playlist-enhancer/scripts/install.sh --undo`.
+- It restores the compose and `.env` backups.
+- It switches the checkout back to the branch you were on.
+- It removes the For You container and restarts the two others in their old
+  layout.
+
+**If a step fails,** the installer stops with the reason. Nothing after
+that step has happened. See Troubleshooting below, fix it, and run it
+again.
+
+Check the results as described in steps 5, 6 and 8 below. Everything after
+"Quick install" is the same process by hand.
 
 ---
 

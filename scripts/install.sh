@@ -101,7 +101,11 @@ if [ "$UNDO" = 1 ]; then
   if [ -n "${PREV_BRANCH:-}" ] && [ "$PREV_BRANCH" != "$BRANCH" ]; then
     git -C "$REPO" checkout -q "$PREV_BRANCH" && ok "checkout back to $PREV_BRANCH"
   fi
-  "${DC[@]}" up -d $SVC_OR $SVC_DW && ok "restarted $SVC_OR and $SVC_DW in the old layout"
+  if "${DC[@]}" up -d "$SVC_OR" "$SVC_DW"; then
+    ok "restarted $SVC_OR and $SVC_DW in the old layout"
+  else
+    warn "couldn't restart them; run: docker compose up -d $SVC_OR $SVC_DW"
+  fi
   echo; echo "Done. The For You playlist stays in Plex until you delete it."
   exit 0
 fi
@@ -228,9 +232,10 @@ if ! printf '%s' "$DRY" | grep -q "DRY_RUN set"; then
   die "The dry run failed (output above). See Troubleshooting in docs/playlist-scripts-setup.md. Nothing was started; --undo puts the files back."
 fi
 printf '%s\n' "$DRY" | grep -E "^  (library|thresholds|candidates|recency|[0-9]+ recent)" || true
-printf '%s\n' "$DRY" | grep -E "^ +[0-9]+\.\+" | head -n 8
+printf '%s\n' "$DRY" | grep -E "^  (full rebuild|rotation)" || true
+printf '%s\n' "$DRY" | grep -E "^ +[0-9]+\.[+ ]" | head -n 8
 echo "   …"
-ok "dry run ok: $(printf '%s\n' "$DRY" | grep -cE '^ +[0-9]+\.\+') tracks"
+ok "dry run ok: $(printf '%s\n' "$DRY" | grep -cE '^ +[0-9]+\.[+ ]') tracks ($(printf '%s\n' "$DRY" | grep -cE '^ +[0-9]+\.\+') new)"
 
 # --- 6. Backtest (optional) ----------------------------------------------------
 if [ "$BACKTEST" = 1 ]; then
