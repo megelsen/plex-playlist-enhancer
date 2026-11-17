@@ -2,22 +2,35 @@
 """
 On Repeat playlist generator (Spotify-style), looping container version.
 
+Your most-played tracks of the last DAYS, weighted by recency
+(0.5 ** (days_ago / HALF_LIFE_DAYS) per qualifying Tautulli play), with the
+top ALLTIME_TOP all-time tracks pinned first. Tracks that sit in one of your
+other audio playlists get a SAVE_BOOST_MULTIPLIER boost.
+
 Runs once immediately, then re-runs every RUN_INTERVAL_DAYS forever, so it
 fits the same long-running-container pattern as your other docker apps
 instead of needing a separate cron/systemd timer.
 
-See prior chat for the full rationale behind the scoring approach.
+Units: Tautulli `date` is unix seconds; DAYS / HALF_LIFE_DAYS / ALLTIME_DAYS
+are days; MIN_LISTEN_SECONDS is seconds actually listened.
+
+Shared code lives in ../common (mount the whole scripts/ folder; see README).
 """
 
-import math
 import os
 import sys
 import time
 import traceback
 from collections import defaultdict
 
-import requests
-from plexapi.server import PlexServer
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from plexapi.server import PlexServer  # noqa: E402
+
+from common.plexio import replace_playlist  # noqa: E402
+from common.state import load_state, save_state  # noqa: E402
+from common.tautulli import Tautulli, is_qualifying_play  # noqa: E402
 
 TAUTULLI_URL = os.environ["TAUTULLI_URL"].rstrip("/")
 TAUTULLI_APIKEY = os.environ["TAUTULLI_APIKEY"]
@@ -35,71 +48,8 @@ ALLTIME_DAYS = int(os.environ.get("ALLTIME_DAYS", 3650))
 SAVE_BOOST_MULTIPLIER = float(os.environ.get("SAVE_BOOST_MULTIPLIER", 1.3))
 USER_ID = os.environ.get("USER_ID")  # optional
 RUN_INTERVAL_DAYS = float(os.environ.get("RUN_INTERVAL_DAYS", 7))
-
-TAUTULLI_API = f"{TAUTULLI_URL}/api/v2"
-
-
-def tautulli_get(cmd, **params):
-    params.update({"apikey": TAUTULLI_APIKEY, "cmd": cmd})
-    r = requests.get(TAUTULLI_API, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("response", {}).get("result") != "success":
-        raise RuntimeError(f"Tautulli API error on {cmd}: {data}")
-    return data["response"]["data"]
-
-
-def fetch_raw_history(days, section_id, user_id=None):
-    start_ts = int(time.time()) - days * 86400
-    rows = []
-    start = 0
-    length = 250
-
-    while True:
-        params = dict(
-            section_id=section_id,
-            media_type="track",
-            grouping=0,
-            order_column="date",
-            order_dir="desc",
-            start=start,
-            length=length,
-            after=time.strftime("%Y-%m-%d", time.localtime(start_ts)),
-        )
-        if user_id:
-            params["user_id"] = user_id
-
-        data = tautulli_get("get_history", **params)
-        page = data.get("data", [])
-        if not page:
-            break
-
-        rows.extend(page)
-
-        if len(page) < length:
-            break
-        start += length
-
-    return [row for row in rows if int(row.get("date", 0)) >= start_ts]
-
-
-def qualifying_listen_seconds(row):
-    try:
-        started = int(row.get("started", 0))
-        stopped = int(row.get("stopped", 0))
-        paused = int(row.get("paused_counter", 0))
-        if started and stopped and stopped > started:
-            return max(0, (stopped - started) - paused)
-    except (TypeError, ValueError):
-        pass
-    return None
-
-
-def is_qualifying_play(row):
-    listened = qualifying_listen_seconds(row)
-    if listened is not None:
-        return listened >= MIN_LISTEN_SECONDS
-    return int(row.get("watched_status", 0)) == 1
+# Only remembers the playlist's ratingKey, so a renamed playlist is still found.
+STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "state.json"))
 
 
 def track_title(row):
@@ -112,7 +62,7 @@ def score_recent(rows, now_ts, half_life_days):
     titles = {}
 
     for row in rows:
-        if not is_qualifying_play(row):
+        if not is_qualifying_play(row, MIN_LISTEN_SECONDS):
             continue
         rk = row.get("rating_key")
         if rk is None:
@@ -132,7 +82,7 @@ def count_alltime(rows):
     counts = defaultdict(int)
     titles = {}
     for row in rows:
-        if not is_qualifying_play(row):
+        if not is_qualifying_play(row, MIN_LISTEN_SECONDS):
             continue
         rk = row.get("rating_key")
         if rk is None:
@@ -142,11 +92,11 @@ def count_alltime(rows):
     return counts, titles
 
 
-def collect_boost_keys(plex):
+def collect_boost_keys(plex, own_rating_key=None):
     boosted = set()
     try:
         for pl in plex.playlists():
-            if pl.title == PLAYLIST_TITLE:
+            if pl.title == PLAYLIST_TITLE or (own_rating_key and pl.ratingKey == own_rating_key):
                 continue
             if getattr(pl, "playlistType", None) not in (None, "audio"):
                 continue
@@ -161,9 +111,9 @@ def collect_boost_keys(plex):
 
 
 def build_playlist(recent_scores, recent_plays, recent_titles,
-                    alltime_counts, alltime_titles, plex):
+                   alltime_counts, alltime_titles, plex, state):
     titles = {**alltime_titles, **recent_titles}
-    boosted_keys = collect_boost_keys(plex)
+    boosted_keys = collect_boost_keys(plex, state.get("playlist_rating_key"))
 
     scored = []
     for rk, score in recent_scores.items():
@@ -195,12 +145,8 @@ def build_playlist(recent_scores, recent_plays, recent_titles,
         print("Resolved zero tracks from Plex; nothing to build.")
         return
 
-    existing = next((p for p in plex.playlists() if p.title == PLAYLIST_TITLE), None)
-    if existing:
-        existing.removeItems(existing.items())
-        existing.addItems(tracks)
-    else:
-        plex.createPlaylist(PLAYLIST_TITLE, items=tracks)
+    playlist = replace_playlist(plex, PLAYLIST_TITLE, tracks, state.get("playlist_rating_key"))
+    state["playlist_rating_key"] = getattr(playlist, "ratingKey", None)
 
     print(f"'{PLAYLIST_TITLE}' updated with {len(tracks)} tracks "
           f"(top {ALLTIME_TOP} all-time pinned, rest recency-weighted over "
@@ -215,16 +161,24 @@ def build_playlist(recent_scores, recent_plays, recent_titles,
 
 def run_once():
     now_ts = int(time.time())
+    state = load_state(STATE_FILE, {})
 
-    recent_rows = fetch_raw_history(DAYS, MUSIC_SECTION_ID, USER_ID)
+    # One fetch covers both windows (the recent one is a subset).
+    alltime_rows = Tautulli(TAUTULLI_URL, TAUTULLI_APIKEY).history(
+        MUSIC_SECTION_ID, USER_ID, after_ts=now_ts - ALLTIME_DAYS * 86400, page_size=250)
+    recent_cutoff = now_ts - DAYS * 86400
+    recent_rows = [row for row in alltime_rows if int(row.get("date", 0)) >= recent_cutoff]
+
     recent_scores, recent_plays, recent_titles = score_recent(recent_rows, now_ts, HALF_LIFE_DAYS)
-
-    alltime_rows = fetch_raw_history(ALLTIME_DAYS, MUSIC_SECTION_ID, USER_ID)
     alltime_counts, alltime_titles = count_alltime(alltime_rows)
 
     plex = PlexServer(PLEX_URL, PLEX_TOKEN)
     build_playlist(recent_scores, recent_plays, recent_titles,
-                    alltime_counts, alltime_titles, plex)
+                   alltime_counts, alltime_titles, plex, state)
+    try:
+        save_state(STATE_FILE, state)
+    except OSError as e:
+        print(f"  warning: couldn't save {STATE_FILE}: {e}")
 
 
 def main():

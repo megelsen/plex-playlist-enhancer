@@ -15,3 +15,4 @@ venv/
 
 # Discover Weekly runtime state
 state.json
+state.json.tmp
