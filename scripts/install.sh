@@ -21,6 +21,9 @@
 #          --repo DIR       the plex-playlist-enhancer checkout (default: found next to the compose file)
 #          --skip-git       don't fetch/checkout the branch
 #          --no-start       stop after the dry run
+#          --ignore-local-script-changes
+#                           migrate even if a standalone script folder holds a
+#                           script.py that isn't in git (its edits stay only there)
 #
 # Safe by design: backups of every file it changes (*.bak-<time>), a dry run
 # that writes nothing to Plex before anything starts, a question before
@@ -29,7 +32,7 @@
 set -euo pipefail
 
 BRANCH="for-you-playlist"
-YES=0; BACKTEST=0; UNDO=0; SKIP_GIT=0; NO_START=0; COMPOSE=""; REPO=""
+YES=0; BACKTEST=0; UNDO=0; SKIP_GIT=0; NO_START=0; KEEP_LOCAL=0; COMPOSE=""; REPO=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --yes|-y) YES=1 ;;
@@ -37,6 +40,7 @@ while [ $# -gt 0 ]; do
     --undo) UNDO=1 ;;
     --skip-git) SKIP_GIT=1 ;;
     --no-start) NO_START=1 ;;
+    --ignore-local-script-changes) KEEP_LOCAL=1 ;;
     --compose) COMPOSE="$2"; shift ;;
     --repo) REPO="$2"; shift ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
@@ -85,6 +89,16 @@ esac
 # Optional extra 'docker run' flags for the YAML helper (only needed behind a proxy).
 read -r -a HELPER_FLAGS <<< "${INSTALL_DOCKER_FLAGS:-}"
 
+compose_helper() {  # [--dry] -> JSON line on stdout
+  docker run --rm "${HELPER_FLAGS[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp \
+    -v "$ROOT:/work" -w /work python:3.11-slim sh -c \
+    "pip install -q --user --disable-pip-version-check ruamel.yaml >/dev/null 2>&1 && \
+     python '$REPO_REL/scripts/setup/compose_edit.py' '$COMPOSE' '$REPO_REL/scripts/docker-compose.example.yml' '$REPO_REL/scripts' $*" \
+    | tail -n 1
+}
+jget() { printf '%s' "$1" | python3 -c "import json,sys; d=json.load(sys.stdin); print($2)"; }
+abs_path() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$ROOT/${1#./}" ;; esac; }
+
 # --- Undo ----------------------------------------------------------------------
 if [ "$UNDO" = 1 ]; then
   [ -f "$STATE" ] || die "Nothing to undo (no $STATE)."
@@ -97,6 +111,9 @@ if [ "$UNDO" = 1 ]; then
   for b in $BACKUPS; do
     orig="${b%.bak-$INSTALL_TS}"
     cp -p "$b" "$orig" && ok "restored $orig"
+  done
+  for c in ${COPIED:-}; do
+    rm -f "$c" && ok "removed the copy $c (the original is still in the old folder)"
   done
   if [ -n "${PREV_BRANCH:-}" ] && [ "$PREV_BRANCH" != "$BRANCH" ]; then
     git -C "$REPO" checkout -q "$PREV_BRANCH" && ok "checkout back to $PREV_BRANCH"
@@ -131,10 +148,49 @@ else
 fi
 [ -f "$REPO/scripts/for-you/script.py" ] || die "scripts/for-you is missing in $REPO."
 
-BACKUPS=""
-# --- 2. .env files (before the compose check: compose needs for-you/.env) ---
-bold "2. Environment files"
+BACKUPS=""; COPIED=""
 SCRIPTS="$REPO/scripts"
+PLAN="$(compose_helper --dry)" || die "Couldn't read $COMPOSE."
+[ -n "$PLAN" ] || die "Couldn't read $COMPOSE (the YAML helper printed nothing)."
+
+# --- 2. Standalone script folders -> the repo ------------------------------------
+OLD_OR="$(jget "$PLAN" 'd["old_dirs"].get("on-repeat", "")')"
+OLD_DW="$(jget "$PLAN" 'd["old_dirs"].get("discover-weekly", "")')"
+if [ -n "$OLD_OR$OLD_DW" ]; then
+  bold "2a. Move the standalone script folders into the repo"
+  for pair in "on-repeat:$OLD_OR" "discover-weekly:$OLD_DW"; do
+    s="${pair%%:*}"; old="${pair#*:}"
+    [ -z "$old" ] && continue
+    old_abs="$(abs_path "$old")"
+    [ -d "$old_abs" ] || die "$old_abs (mounted by the $s service) doesn't exist."
+    if [ -f "$old_abs/script.py" ]; then
+      blob="$(git -C "$REPO" hash-object "$old_abs/script.py")"
+      if [ -z "$(git -C "$REPO" log --all --format=%h --find-object="$blob" 2>/dev/null | head -n 1)" ]; then
+        if [ "$KEEP_LOCAL" = 1 ]; then
+          warn "$old/script.py isn't in git; continuing (--ignore-local-script-changes). Its edits stay only in $old."
+        else
+          echo "  Your $old/script.py differs from every version in git. Changes compared to the pushed one:"
+          git -C "$REPO" diff --no-index --stat "$REPO/scripts/$s/script.py" "$old_abs/script.py" | sed 's/^/    /' || true
+          die "Push those edits first (or rerun with --ignore-local-script-changes to leave them behind in $old)."
+        fi
+      else
+        ok "$old/script.py matches a version in git"
+      fi
+    fi
+    for f in .env state.json; do
+      if [ -f "$old_abs/$f" ] && [ ! -f "$SCRIPTS/$s/$f" ]; then
+        cp -p "$old_abs/$f" "$SCRIPTS/$s/$f"; COPIED="$COPIED $SCRIPTS/$s/$f"
+        ok "copied $old/$f -> ${SCRIPTS#"$ROOT"/}/$s/$f"
+      elif [ -f "$old_abs/$f" ]; then
+        ok "${SCRIPTS#"$ROOT"/}/$s/$f already exists, left as is"
+      fi
+    done
+  done
+  ok "the old folders are left untouched (--undo goes back to them)"
+fi
+
+# --- 2b. .env files (before the compose check: compose needs for-you/.env) ---
+bold "2b. Environment files"
 for s in on-repeat discover-weekly; do
   f="$SCRIPTS/$s/.env"
   [ -f "$f" ] || die "$f is missing. Create it from $s/.env.example first."
@@ -177,19 +233,23 @@ done
 bold "3. docker-compose: new layout"
 cp -p "$COMPOSE" "$COMPOSE.bak-$TS"
 ok "backup: $COMPOSE.bak-$TS"
-OUT="$(docker run --rm "${HELPER_FLAGS[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp \
-        -v "$ROOT:/work" -w /work python:3.11-slim sh -c \
-        "pip install -q --user --disable-pip-version-check ruamel.yaml >/dev/null 2>&1 && \
-         python '$REPO_REL/scripts/setup/compose_edit.py' '$COMPOSE' '$REPO_REL/scripts/docker-compose.example.yml' '$REPO_REL/scripts'")" \
+JSON="$(compose_helper)" && [ -n "$JSON" ] \
   || { cp -p "$COMPOSE.bak-$TS" "$COMPOSE"; die "Couldn't rewrite $COMPOSE (restored the backup). Edit it by hand: docs/playlist-scripts-setup.md step 3."; }
-JSON="$(printf '%s\n' "$OUT" | tail -n 1)"
-field() { printf '%s' "$JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
+field() { jget "$JSON" "$1"; }
 SVC_OR="$(field 'd["services"]["on-repeat"]')"
 SVC_DW="$(field 'd["services"]["discover-weekly"]')"
 SVC_FY="$(field 'd["services"]["for-you"]')"
 CHANGES="$(field '"\n".join(d["changes"])')"
 if [ -n "$CHANGES" ]; then
   printf '%s\n' "$CHANGES" | sed 's/^/  - /'
+  echo "  Full change to $COMPOSE (- old, + new):"
+  diff -u "$COMPOSE.bak-$TS" "$COMPOSE" | tail -n +3 | sed 's/^/    /' || true
+  if ! ask "Keep this change to $COMPOSE?"; then
+    cp -p "$COMPOSE.bak-$TS" "$COMPOSE"; rm -f "$COMPOSE.bak-$TS"
+    for b in $BACKUPS; do cp -p "$b" "${b%.bak-$TS}"; done
+    for c in $COPIED; do rm -f "$c"; done
+    die "Left $COMPOSE and the .env files as they were; nothing was changed."
+  fi
   BACKUPS="$BACKUPS $ROOT/$COMPOSE.bak-$TS"
 else
   rm -f "$COMPOSE.bak-$TS"
@@ -208,11 +268,12 @@ ok "services: $SVC_OR, $SVC_DW, $SVC_FY — config valid"
 
 # Remember what to undo, but only when this run changed something: a second
 # run must not replace the record of the original files with converted ones.
-if [ -n "${BACKUPS// /}" ] || [ ! -f "$STATE" ]; then
+if [ -n "${BACKUPS// /}${COPIED// /}" ] || [ ! -f "$STATE" ]; then
 cat > "$STATE" <<EOF
 INSTALL_TS="$TS"
 PREV_BRANCH="$PREV_BRANCH"
 BACKUPS="$BACKUPS"
+COPIED="$COPIED"
 SVC_OR="$SVC_OR"
 SVC_DW="$SVC_DW"
 SVC_FY="$SVC_FY"
