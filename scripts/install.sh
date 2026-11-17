@@ -114,40 +114,9 @@ else
 fi
 [ -f "$REPO/scripts/for-you/script.py" ] || die "scripts/for-you is missing in $REPO."
 
-# --- 3. Compose file -----------------------------------------------------------
-bold "3. docker-compose: new layout"
 BACKUPS=""
-cp -p "$COMPOSE" "$COMPOSE.bak-$TS"; BACKUPS="$BACKUPS $ROOT/$COMPOSE.bak-$TS"
-ok "backup: $COMPOSE.bak-$TS"
-OUT="$(docker run --rm "${HELPER_FLAGS[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp \
-        -v "$ROOT:/work" -w /work python:3.11-slim sh -c \
-        "pip install -q --user --disable-pip-version-check ruamel.yaml >/dev/null 2>&1 && \
-         python '$REPO_REL/scripts/setup/compose_edit.py' '$COMPOSE' '$REPO_REL/scripts/docker-compose.example.yml' '$REPO_REL/scripts'")" \
-  || { cp -p "$COMPOSE.bak-$TS" "$COMPOSE"; die "Couldn't rewrite $COMPOSE (restored the backup). Edit it by hand: docs/playlist-scripts-setup.md step 3."; }
-JSON="$(printf '%s\n' "$OUT" | tail -n 1)"
-field() { printf '%s' "$JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
-SVC_OR="$(field 'd["services"]["on-repeat"]')"
-SVC_DW="$(field 'd["services"]["discover-weekly"]')"
-SVC_FY="$(field 'd["services"]["for-you"]')"
-CHANGES="$(field '"\n".join(d["changes"])')"
-if [ -n "$CHANGES" ]; then
-  printf '%s\n' "$CHANGES" | sed 's/^/  - /'
-else
-  ok "already in the new layout, nothing changed"
-fi
-DATA="$(field 'd["data"] or ""')"
-[ -n "$DATA" ] && ok "For You will read clusters from $DATA/cluster_registry.json" \
-               || warn "no Streamlit app data folder found in $COMPOSE: For You runs without clusters"
-if ! "${DC[@]}" config -q 2>/tmp/compose-err.$$; then
-  cat /tmp/compose-err.$$; rm -f /tmp/compose-err.$$
-  cp -p "$COMPOSE.bak-$TS" "$COMPOSE"
-  die "The new $COMPOSE didn't validate (restored the backup)."
-fi
-rm -f /tmp/compose-err.$$
-ok "services: $SVC_OR, $SVC_DW, $SVC_FY — config valid"
-
-# --- 4. .env files -------------------------------------------------------------
-bold "4. Environment files"
+# --- 2. .env files (before the compose check: compose needs for-you/.env) ---
+bold "2. Environment files"
 SCRIPTS="$REPO/scripts"
 for s in on-repeat discover-weekly; do
   f="$SCRIPTS/$s/.env"
@@ -187,6 +156,37 @@ for k in TAUTULLI_URL TAUTULLI_APIKEY PLEX_URL PLEX_TOKEN MUSIC_SECTION_ID; do
   grep -qE "^$k=." "$FY_ENV" || die "for-you/.env has no $k. Fill it in and run again."
 done
 
+# --- 3. Compose file ------------------------------------------------------------
+bold "3. docker-compose: new layout"
+cp -p "$COMPOSE" "$COMPOSE.bak-$TS"; BACKUPS="$BACKUPS $ROOT/$COMPOSE.bak-$TS"
+ok "backup: $COMPOSE.bak-$TS"
+OUT="$(docker run --rm "${HELPER_FLAGS[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp \
+        -v "$ROOT:/work" -w /work python:3.11-slim sh -c \
+        "pip install -q --user --disable-pip-version-check ruamel.yaml >/dev/null 2>&1 && \
+         python '$REPO_REL/scripts/setup/compose_edit.py' '$COMPOSE' '$REPO_REL/scripts/docker-compose.example.yml' '$REPO_REL/scripts'")" \
+  || { cp -p "$COMPOSE.bak-$TS" "$COMPOSE"; die "Couldn't rewrite $COMPOSE (restored the backup). Edit it by hand: docs/playlist-scripts-setup.md step 3."; }
+JSON="$(printf '%s\n' "$OUT" | tail -n 1)"
+field() { printf '%s' "$JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
+SVC_OR="$(field 'd["services"]["on-repeat"]')"
+SVC_DW="$(field 'd["services"]["discover-weekly"]')"
+SVC_FY="$(field 'd["services"]["for-you"]')"
+CHANGES="$(field '"\n".join(d["changes"])')"
+if [ -n "$CHANGES" ]; then
+  printf '%s\n' "$CHANGES" | sed 's/^/  - /'
+else
+  ok "already in the new layout, nothing changed"
+fi
+DATA="$(field 'd["data"] or ""')"
+[ -n "$DATA" ] && ok "For You will read clusters from $DATA/cluster_registry.json" \
+               || warn "no Streamlit app data folder found in $COMPOSE: For You runs without clusters"
+if ! "${DC[@]}" config -q 2>/tmp/compose-err.$$; then
+  cat /tmp/compose-err.$$; rm -f /tmp/compose-err.$$
+  cp -p "$COMPOSE.bak-$TS" "$COMPOSE"
+  die "The new $COMPOSE didn't validate (restored the backup)."
+fi
+rm -f /tmp/compose-err.$$
+ok "services: $SVC_OR, $SVC_DW, $SVC_FY — config valid"
+
 # Remember what to undo.
 cat > "$STATE" <<EOF
 INSTALL_TS="$TS"
@@ -197,8 +197,8 @@ SVC_DW="$SVC_DW"
 SVC_FY="$SVC_FY"
 EOF
 
-# --- 2. Stop the old containers ------------------------------------------------
-bold "2. Stop the old script containers"
+# --- 4. Stop the old containers -----------------------------------------------
+bold "4. Stop the old script containers"
 "${DC[@]}" stop "$SVC_OR" "$SVC_DW" >/dev/null 2>&1 || true
 ok "stopped $SVC_OR and $SVC_DW (their playlists stay in Plex)"
 
