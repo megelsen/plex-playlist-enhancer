@@ -484,8 +484,9 @@ own subfolder, the same file on the host as before.
     restart: unless-stopped
     volumes:
       - ./plex-playlist-enhancer/scripts:/scripts
-      # optional: use the app's album clusters
-      - ./data/cluster_registry.json:/appdata/cluster_registry.json:ro
+      # optional: use the app's album clusters (mount the folder, not the
+      # file: the app replaces the file on every save)
+      - ./data:/appdata:ro
     working_dir: /scripts/for-you
     command: sh -c "pip install --no-cache-dir -r requirements.txt && python script.py"
     environment:
@@ -500,6 +501,8 @@ own subfolder, the same file on the host as before.
 the volume and `working_dir` as above. If a `.env` sets
 `STATE_FILE=/app/state.json`, remove that line (the default is now
 `state.json` next to the script, the same host file).
+
+**Step-by-step setup:** [docs/playlist-scripts-setup.md](./docs/playlist-scripts-setup.md). A ready-to-copy compose file: `scripts/docker-compose.example.yml`.
 
 Tests against a fake Plex/Tautulli (no server needed):
 `python scripts/tests/test_scripts.py`.

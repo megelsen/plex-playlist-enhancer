@@ -1,0 +1,57 @@
+# The three playlist scripts as long-running containers.
+#
+# Paths assume this file's services are pasted into the docker-compose.yml
+# that sits NEXT TO the plex-playlist-enhancer folder (the same place as
+# the README examples), and that the Streamlit app's data folder is ./data.
+# See docs/playlist-scripts-setup.md for the full step-by-step guide.
+#
+# Every container mounts the WHOLE scripts/ folder (so scripts/common can be
+# imported) and starts in its own subfolder; each state.json is written next
+# to its script.py.
+
+services:
+  plex-on-repeat:
+    image: python:3.11-slim
+    container_name: plex-on-repeat
+    restart: unless-stopped
+    volumes:
+      - ./plex-playlist-enhancer/scripts:/scripts
+    working_dir: /scripts/on-repeat
+    command: sh -c "pip install --no-cache-dir -q -r requirements.txt && python script.py"
+    environment:
+      - TZ=Europe/Amsterdam
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - ./plex-playlist-enhancer/scripts/on-repeat/.env
+
+  plex-discover-weekly:
+    image: python:3.11-slim
+    container_name: plex-discover-weekly
+    restart: unless-stopped
+    volumes:
+      - ./plex-playlist-enhancer/scripts:/scripts
+    working_dir: /scripts/discover-weekly
+    command: sh -c "pip install --no-cache-dir -q -r requirements.txt && python script.py"
+    environment:
+      - TZ=Europe/Amsterdam
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - ./plex-playlist-enhancer/scripts/discover-weekly/.env
+
+  plex-for-you:
+    image: python:3.11-slim
+    container_name: plex-for-you
+    restart: unless-stopped
+    volumes:
+      - ./plex-playlist-enhancer/scripts:/scripts
+      # Optional: the Streamlit app's album clusters (read-only). Remove this
+      # line and CLUSTER_REGISTRY_PATH below if you don't use the app.
+      - ./data:/appdata:ro
+    working_dir: /scripts/for-you
+    command: sh -c "pip install --no-cache-dir -q -r requirements.txt && python script.py"
+    environment:
+      - TZ=Europe/Amsterdam              # RUN_HOUR / RUN_MINUTE are in this time zone
+      - PYTHONUNBUFFERED=1
+      - CLUSTER_REGISTRY_PATH=/appdata/cluster_registry.json
+    env_file:
+      - ./plex-playlist-enhancer/scripts/for-you/.env
