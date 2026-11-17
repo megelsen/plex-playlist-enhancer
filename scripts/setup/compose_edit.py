@@ -158,7 +158,9 @@ def main(compose_path, example_path, scripts_host, dry=False):
         if siblings:
             for key in COPY_FROM_SIBLING:
                 if key in siblings[0]:
-                    svc[key] = copy.deepcopy(siblings[0][key])
+                    # plain values: a deep copy would also carry the sibling's
+                    # trailing comments/blank lines into the middle of this service
+                    svc[key] = json.loads(json.dumps(siblings[0][key]))
         if script == "for-you":
             if data_host:
                 svc["volumes"] = [v if not v.startswith("./data:") else f"{data_host}:/appdata:ro"
