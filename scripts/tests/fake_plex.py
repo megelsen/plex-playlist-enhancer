@@ -171,10 +171,13 @@ class FakePlex:
         return p
 
 
-def build_library(seed=7, now_ts=1_763_000_000, n_artists=40):
+def build_library(seed=7, now_ts=1_763_000_000, n_artists=40, taste_shift=False):
     """A synthetic library: artists in 5 style 'scenes' with sonic vectors
     near their scene centre, a few similar-artist links, play counts and a
-    matching Tautulli history. Returns (plex, history_rows)."""
+    matching Tautulli history. Returns (plex, history_rows).
+
+    taste_shift=True: scenes 0-1 were played only 150-400 days ago and
+    scenes 3-4 only in the last 90 days (taste moved on)."""
     rng = random.Random(seed)
     plex = FakePlex()
     scenes = [("doom metal", "metal"), ("post-punk", "rock"), ("dub", "reggae"),
@@ -212,6 +215,10 @@ def build_library(seed=7, now_ts=1_763_000_000, n_artists=40):
                 last = None
                 for _ in range(plays):
                     ts = now_ts - int(rng.expovariate(1 / 120) * 86400) - rng.randint(0, 86400)
+                    if taste_shift and scene in (0, 1):
+                        ts = now_ts - rng.randint(150, 400) * 86400
+                    elif taste_shift and scene in (3, 4):
+                        ts = now_ts - rng.randint(1, 90) * 86400 - rng.randint(0, 86400)
                     listened = rng.choice([dur // 1000, dur // 1000, 20])
                     history.append({
                         "rating_key": t.ratingKey, "date": ts, "started": ts,

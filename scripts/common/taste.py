@@ -10,23 +10,33 @@ from collections import defaultdict, namedtuple
 from .library import normalize
 from .tautulli import is_qualifying_play
 
-Taste = namedtuple("Taste", "artist_aff style seeds recent album_aff plays_tautulli")
+Taste = namedtuple("Taste", "artist_aff style seeds recent album_aff plays_tautulli "
+                           "artist_recent style_recent album_recent")
 # artist_aff     {artist_key: 0..1}  decayed plays (half-life taste_half_life_days), sqrt-flattened
 # style          {tag: weight}       decayed plays per album style/genre tag (unnormalised)
 # seeds          {rk: 0..1}          recent seeds (normalised) + all-time favourites (0.6)
 # recent         {rk: 0..1}          recent seeds only
 # album_aff      {album_key: w}      decayed plays per album (half-life taste_half_life_days)
 # plays_tautulli {rk: int}           qualifying Tautulli plays per track, whole history read
+# artist_recent  {artist_key: 0..1}  like artist_aff, half-life recent_half_life_days, no pre-Tautulli plays
+# style_recent   {tag: weight}       like style, half-life recent_half_life_days
+# album_recent   {album_key: w}      like album_aff, half-life recent_half_life_days
 
 
 def build_taste(tracks, albums, history, now_ts, *, min_listen_seconds, taste_half_life_days,
-                seed_days, seed_half_life_days, seed_recent, seed_alltime):
-    """Artist affinity, style profile and seed tracks from listening history."""
+                seed_days, seed_half_life_days, seed_recent, seed_alltime, recent_half_life_days=None):
+    """Artist affinity, style profile and seed tracks from listening history,
+    long-term (taste_half_life_days) and recent (recent_half_life_days,
+    default seed_half_life_days). Half-lives in days."""
+    recent_half_life_days = recent_half_life_days or seed_half_life_days
     artist_aff = defaultdict(float)
     style = defaultdict(float)
     recent = defaultdict(float)
     album_aff = defaultdict(float)
     plays_tautulli = defaultdict(int)
+    artist_recent = defaultdict(float)
+    style_recent = defaultdict(float)
+    album_recent = defaultdict(float)
 
     for row in history:
         if not is_qualifying_play(row, min_listen_seconds):
@@ -42,6 +52,11 @@ def build_taste(tracks, albums, history, now_ts, *, min_listen_seconds, taste_ha
         album_aff[t["album_key"]] += w
         for tag in albums.get(t["album_key"], {}).get("tags", ()):
             style[tag] += w
+        wr = 0.5 ** (days_ago / recent_half_life_days)
+        artist_recent[t["artist_key"]] += wr
+        album_recent[t["album_key"]] += wr
+        for tag in albums.get(t["album_key"], {}).get("tags", ()):
+            style_recent[tag] += wr
         if days_ago <= seed_days:
             recent[rk] += 0.5 ** (days_ago / seed_half_life_days)
 
@@ -69,7 +84,8 @@ def build_taste(tracks, albums, history, now_ts, *, min_listen_seconds, taste_ha
         seeds[t["rk"]] = 0.6
 
     return Taste(normalize(artist_aff, flatten=True), style, seeds, recent_seeds,
-                 dict(album_aff), dict(plays_tautulli))
+                 dict(album_aff), dict(plays_tautulli),
+                 normalize(artist_recent, flatten=True), dict(style_recent), dict(album_recent))
 
 
 def sonic_neighbours(plex, seed_keys, limit, log=print):
@@ -96,6 +112,18 @@ def sonic_scores(neighbours, seeds, limit):
             scores[key] = max(scores[key], weight * (1 - rank / limit))
             hits[key] += 1
     return {k: min(1.0, s + 0.1 * (hits[k] - 1)) for k, s in scores.items()}
+
+
+def closest_seed(neighbours, seeds, limit):
+    """{rk: seed rk} — the seed that gives each neighbour its sonic score
+    (seed weight x (1 - rank / limit)), to explain a pick."""
+    best = {}
+    for rk, weight in seeds.items():
+        for rank, key in enumerate(neighbours.get(rk, ())):
+            score = weight * (1 - rank / limit)
+            if key not in best or score > best[key][0]:
+                best[key] = (score, rk)
+    return {k: v[1] for k, v in best.items()}
 
 
 def similar_artist_scores(similar, artist_aff, seed_artists):

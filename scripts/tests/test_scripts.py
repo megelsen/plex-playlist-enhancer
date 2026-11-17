@@ -182,8 +182,33 @@ def test_backtest(lib_seed=23):
     fy = load("for-you", env, paths["fy"], BACKTEST_DAYS="14")
     _, out = quiet(fy.backtest, 14)
     print("    " + out.replace("\n", "\n    ").rstrip())
-    check("recall@50" in out, "backtest reports recall for both buckets")
+    check("engine, bias 0.6 *" in out and "@50" in out, "backtest compares recency biases")
     os.environ.pop("BACKTEST_DAYS", None)
+    print()
+
+
+def test_recency_bias(lib_seed=23):
+    print(f"For You: recency bias on a library whose taste moved on (library {lib_seed})")
+    clock = [harness.NOW_TS]
+    time.time = lambda: clock[0]
+    random.seed(0)
+    plex, history = fake_plex.build_library(seed=lib_seed, now_ts=harness.NOW_TS, taste_shift=True)
+    fake_plex.install(plex, history)
+    fy = load("for-you", dict(harness.BASE_ENV), os.path.join(tempfile.mkdtemp(), "fy.json"))
+    tracks, albums, similar, hist = quiet(fy.gather, plex, harness.NOW_TS, {})[0]
+    p = quiet(fy.Profile, plex, tracks, albums, similar, hist, harness.NOW_TS, [])[0]
+    scene = {a.title: int(a.title[-2:]) % 5 for a in plex._artists.values()}
+
+    def old_style(bias, bucket):
+        """Top-20 picks from the styles played only 150-400 days ago."""
+        buckets, _ = fy.build_candidates(p, set(), set(), bias)
+        top = sorted(buckets[bucket], key=lambda x: x[0], reverse=True)[:20]
+        return sum(scene[t["artist"]] in (0, 1) for _, t in top)
+
+    u0, u6 = old_style(0.0, "unheard"), old_style(0.6, "unheard")
+    r0, r9 = old_style(0.0, "rare"), old_style(0.9, "rare")
+    check(u0 > u6, f"Unheard: old-style picks drop with the bias (bias 0: {u0}/20, bias 0.6: {u6}/20)")
+    check(r0 > r9, f"Rarely played: old-style picks drop with the bias (bias 0: {r0}/20, bias 0.9: {r9}/20)")
     print()
 
 
@@ -202,6 +227,7 @@ if __name__ == "__main__":
     test_for_you_rotation(7)
     test_for_you_rotation(23)
     test_for_you_clusters(11)
+    test_recency_bias(23)
     test_dry_run_writes_nothing(31)
     test_backtest(23)
     print("All checks passed.")

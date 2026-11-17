@@ -52,14 +52,56 @@ renormalised.
 
 | Signal | Meaning | Unheard | Rarely | Classic |
 |---|---|---|---|---|
-| `sonic` | Plex sonic closeness to your seed tracks (20 recent + 5 all-time) | 0.35 | 0.30 | |
-| `sonic_now` | the same, recent seeds only | | | 0.30 |
+| `sonic` | Plex sonic closeness to your seed tracks (see recency below) | 0.35 | 0.30 | |
+| `sonic_now` | closeness to the recent seeds only | | | 0.30 |
 | `artist` | your affinity for the artist, or its similar-artist link to artists you play | 0.25 | 0.25 | |
 | `style` | album styles/genres vs. your taste profile | 0.10 | 0.10 | |
 | `cluster` | how much you play the album's cluster (app registry, optional) | 0.10 | 0.10 | 0.15 |
 | `pop` | Last.fm listeners, `log1p(ratingCount) / log1p(max)`; Unheard: average with the song's rank within its album | 0.20 | 0.25 | |
 | `track_aff` | `log1p(plays) / log1p(max plays)` | | | 0.35 |
 | `forgotten` | `1 − exp(−days since last play / 60)` | | | 0.20 |
+
+**Sonic closeness.** For each seed, Plex returns its `SONIC_LIMIT` (40)
+nearest tracks.
+- A neighbour at rank *r* scores `seed weight × (1 − r / 40)`, and it keeps
+  its best seed.
+- It gets +0.1 for every other seed it is also near.
+- So a song scores high when it is very close to one of your most-played
+  seeds, or close to several of them.
+
+### Recency bias
+
+`sonic`, `artist`, `style` and `cluster` each exist twice:
+- **recent** — what you've played lately
+- **long-term** — your whole history
+
+The score uses
+
+    signal = RECENCY_BIAS × recent + (1 − RECENCY_BIAS) × long-term
+
+| | Recent | Long-term |
+|---|---|---|
+| sonic seeds | your 20 most-played tracks of the last 30 days, each play weighted `0.5^(days/14)` | your 20 most-played songs of all time (Plex plays, at most 2 per artist), weighted `log1p(plays)` |
+| artist, style, cluster | Tautulli plays weighted `0.5^(days / RECENT_HALF_LIFE_DAYS)` (14) | weighted `0.5^(days / TASTE_HALF_LIFE_DAYS)` (180), plus plays from before Tautulli |
+| similar artists | linked to the artists you play lately | linked to the artists you play overall |
+
+**What the bias values mean:**
+- **`RECENCY_BIAS = 0.6`** (default): Unheard and Rarely played mostly follow
+  your recent hits, with your long-term taste still contributing. The
+  reasons in the run log say which, for example
+  `sounds like Artist – Song (recent)` versus `sounds like Artist – Song` (an
+  all-time favourite).
+- **`0`**: your whole history counts as much as last month.
+- **`1`**: only recent listening counts.
+- **Classics** always use the recent seeds for `sonic_now` (a favourite that
+  fits your current mood). Their cluster signal follows the bias too.
+
+**How much difference it makes:**
+- If your taste hasn't changed, the two sides agree and the bias does little.
+- If it has changed, the bias matters. In a test library where two styles
+  were only played 150–400 days ago, those styles took 16 of the top 20
+  Unheard picks at bias 0, and 0 at bias 0.6.
+- The backtest (§7) compares several bias values on your own history.
 
 **Feedback:** past picks of **both** Discover Weekly and For You re-weight
 artists. Discover Weekly reads For You's picks too.
@@ -132,7 +174,8 @@ The script runs at `RUN_HOUR:RUN_MINUTE` (05:30, container `TZ`).
 **Cost per daily run:**
 - 3 bulk library searches
 - the Tautulli history
-- 25 `sonicallySimilar` calls for the seeds
+- up to 40 `sonicallySimilar` calls for the seeds (20 recent + 20 all-time,
+  fewer when they overlap)
 - about 13 for the new tracks' links (50 on a full build)
 
 ---
@@ -182,7 +225,8 @@ marked "never cluster" have no cluster.
 - It builds the taste profile from the history before that.
 - It ranks the Unheard and Rarely played candidates.
 
-**What it reports:** recall@50 and recall@200. That is the share of songs
+**What it reports:** recall@50 and recall@200, for `RECENCY_BIAS` 0,
+0.3, 0.6, 0.9 and your setting. That is the share of songs
 you then played (first play for Unheard, a replay for Rarely played) that
 ranked in the top k. Two baselines are shown:
 - popularity-only ranking
@@ -213,6 +257,8 @@ It checks:
   - removed tracks cool down
   - a renamed playlist is reused rather than duplicated
 - **Clusters:** the cluster cap holds.
+- **Recency bias:** on a library whose taste moved on, the bias pulls
+  Unheard and Rarely played picks toward the recent styles.
 - **Dry run:** writes nothing.
 - **Backtest:** runs.
 - **Discover Weekly:** still runs on the shared feedback a week later.

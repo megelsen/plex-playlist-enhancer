@@ -78,7 +78,8 @@ from common.plexio import playlist_keys, replace_playlist, set_summary  # noqa: 
 from common.select import Selector, interleave, weighted_order  # noqa: E402
 from common.state import load_state as _load_state, save_state as _save_state, read_runs  # noqa: E402
 from common.tautulli import Tautulli, is_qualifying_play  # noqa: E402
-from common.taste import build_taste, sonic_neighbours, sonic_scores, similar_artist_scores  # noqa: E402
+from common.taste import (build_taste, sonic_neighbours, sonic_scores,  # noqa: E402
+                          similar_artist_scores, closest_seed)
 
 
 def _env_float(name, default):
@@ -122,9 +123,17 @@ SEED_DAYS = _env_int("SEED_DAYS", 30)
 SEED_HALF_LIFE_DAYS = _env_float("SEED_HALF_LIFE_DAYS", 14)
 SEED_RECENT = _env_int("SEED_RECENT", 20)
 SEED_ALLTIME = _env_int("SEED_ALLTIME", 5)
-TASTE_HALF_LIFE_DAYS = _env_float("TASTE_HALF_LIFE_DAYS", 90)
+TASTE_HALF_LIFE_DAYS = _env_float("TASTE_HALF_LIFE_DAYS", 180)   # long-term side (Discover Weekly: 90)
+SEED_LONG = _env_int("SEED_LONG", 20)          # long-term sonic seeds: most-played songs of all time
 SEED_ARTISTS = _env_int("SEED_ARTISTS", 10)
 SONIC_LIMIT = _env_int("SONIC_LIMIT", 40)
+# Recency bias (0..1): how much Unheard / Rarely played follow what you've
+# been playing lately. Every taste signal has a recent version (half-life
+# RECENT_HALF_LIFE_DAYS) and a long-term one (TASTE_HALF_LIFE_DAYS, plus
+# all-time seed tracks); the score uses bias x recent + (1 - bias) x long-term.
+# 0 = your whole history counts the same as last month, 1 = only recent hits.
+RECENCY_BIAS = min(1.0, max(0.0, _env_float("RECENCY_BIAS", 0.6)))
+RECENT_HALF_LIFE_DAYS = _env_float("RECENT_HALF_LIFE_DAYS", 14)
 MIN_LISTEN_SECONDS = _env_int("MIN_LISTEN_SECONDS", 30)
 
 # Selection and order
@@ -187,22 +196,26 @@ class Profile:
                                  min_listen_seconds=MIN_LISTEN_SECONDS,
                                  taste_half_life_days=TASTE_HALF_LIFE_DAYS,
                                  seed_days=SEED_DAYS, seed_half_life_days=SEED_HALF_LIFE_DAYS,
-                                 seed_recent=SEED_RECENT, seed_alltime=SEED_ALLTIME)
+                                 seed_recent=SEED_RECENT, seed_alltime=SEED_ALLTIME,
+                                 recent_half_life_days=RECENT_HALF_LIFE_DAYS)
         style = self.taste.style
         self.multipliers, self.banned = compute_feedback(feedback_runs, tracks, albums, style)
-        neighbours = sonic_neighbours(plex, self.taste.seeds, SONIC_LIMIT, log=log)
-        self.sonic = sonic_scores(neighbours, self.taste.seeds, SONIC_LIMIT)
+        # Two seed sets: recent (most played in the last SEED_DAYS, decayed) and
+        # long-term (most played of all time, max 2 per artist, log-weighted).
+        self.long_seeds = self._long_seeds(tracks)
+        neighbours = sonic_neighbours(plex, {**self.long_seeds, **self.taste.recent}, SONIC_LIMIT, log=log)
+        self.sonic = sonic_scores(neighbours, self.long_seeds, SONIC_LIMIT)
         self.sonic_now = sonic_scores(neighbours, self.taste.recent, SONIC_LIMIT)
+        self.seed_of = closest_seed(neighbours, self.long_seeds, SONIC_LIMIT)
+        self.seed_of_now = closest_seed(neighbours, self.taste.recent, SONIC_LIMIT)
         self.link = similar_artist_scores(similar, self.taste.artist_aff, SEED_ARTISTS)
+        self.link_now = similar_artist_scores(similar, self.taste.artist_recent, SEED_ARTISTS)
         self.album_style = album_style_scores(albums, style)
+        self.album_style_now = album_style_scores(albums, self.taste.style_recent)
 
         self.album_cluster, self.cluster_names = load_album_clusters(CLUSTER_REGISTRY_PATH, log=log)
-        per_cluster = defaultdict(float)
-        for album, w in self.taste.album_aff.items():
-            cid = self.album_cluster.get(album)
-            if cid:
-                per_cluster[cid] += w
-        self.cluster_profile = normalize(per_cluster)
+        self.cluster_profile = self._cluster_profile(self.taste.album_aff)
+        self.cluster_profile_now = self._cluster_profile(self.taste.album_recent)
 
         self.songs = aggregate_songs(tracks)
         played = [s["views"] for s in self.songs.values() if s["views"] > 0]
@@ -223,17 +236,56 @@ class Profile:
             for i, t in enumerate(ranked):
                 self.album_rank[t["rk"]] = i / (n - 1) if n > 1 else 0.5
 
+    @staticmethod
+    def _long_seeds(tracks):
+        ranked = sorted((t for t in tracks.values() if t["views"]), key=lambda t: (-t["views"], t["rk"]))
+        per_artist, seen_songs, seeds = defaultdict(int), set(), {}
+        top = math.log1p(ranked[0]["views"]) if ranked else 1
+        for t in ranked:
+            if len(seeds) >= SEED_LONG:
+                break
+            if per_artist[t["artist_key"]] >= 2 or t["song"] in seen_songs:
+                continue
+            per_artist[t["artist_key"]] += 1
+            seen_songs.add(t["song"])
+            seeds[t["rk"]] = math.log1p(t["views"]) / top
+        return seeds
+
+    def _cluster_profile(self, album_weights):
+        per_cluster = defaultdict(float)
+        for album, w in album_weights.items():
+            cid = self.album_cluster.get(album)
+            if cid:
+                per_cluster[cid] += w
+        return normalize(per_cluster)
+
     def cluster_of(self, t):
         return self.album_cluster.get(t["album_key"])
 
-    def signals(self, bucket, t, song):
-        """{signal: 0..1} for one candidate; a signal without data is absent."""
-        s = {}
+    def parts(self, bucket, t, song):
+        """(recent, long-term) values of the taste signals of one candidate,
+        before blending: {signal: (now, long)}."""
+        a = t["artist_key"]
+        p = {}
         if bucket in ("unheard", "rare"):
-            s["sonic"] = max(self.sonic.get(c["rk"], 0) for c in song["copies"])
-            s["artist"] = max(self.taste.artist_aff.get(t["artist_key"], 0), self.link.get(t["artist_key"], 0))
+            p["sonic"] = (max(self.sonic_now.get(c["rk"], 0) for c in song["copies"]),
+                          max(self.sonic.get(c["rk"], 0) for c in song["copies"]))
+            p["artist"] = (max(self.taste.artist_recent.get(a, 0), self.link_now.get(a, 0)),
+                           max(self.taste.artist_aff.get(a, 0), self.link.get(a, 0)))
             if t["album_key"] in self.album_style:
-                s["style"] = self.album_style[t["album_key"]]
+                p["style"] = (self.album_style_now.get(t["album_key"], 0), self.album_style[t["album_key"]])
+        if self.cluster_profile:
+            cid = self.cluster_of(t)
+            p["cluster"] = ((self.cluster_profile_now.get(cid, 0.0), self.cluster_profile.get(cid, 0.0))
+                            if cid else (0.0, 0.0))
+        return p
+
+    def signals(self, bucket, t, song, bias=None):
+        """{signal: 0..1} for one candidate; a signal without data is absent.
+        Taste signals blend recent and long-term: bias x now + (1 - bias) x long."""
+        bias = RECENCY_BIAS if bias is None else bias
+        s = {k: bias * now + (1 - bias) * long for k, (now, long) in self.parts(bucket, t, song).items()}
+        if bucket in ("unheard", "rare"):
             pop_global = math.log1p(t["pop"] or 0) / self.log_max_pop if self.log_max_pop else 0
             if bucket == "unheard":
                 s["pop"] = 0.5 * pop_global + 0.5 * self.album_rank.get(t["rk"], 0.5)
@@ -244,9 +296,6 @@ class Profile:
             s["track_aff"] = math.log1p(song["views"]) / math.log1p(self.max_song_views)
             days = (self.now_ts - song["last"]) / 86400 if song["last"] else 3650
             s["forgotten"] = 1 - math.exp(-days / FORGOTTEN_SCALE_DAYS)
-        if self.cluster_profile:
-            cid = self.cluster_of(t)
-            s["cluster"] = self.cluster_profile.get(cid, 0.0) if cid else 0.0
         return s
 
 
@@ -256,13 +305,31 @@ def weighted_score(bucket, signals):
     return sum(w * signals[k] for k, w in weights.items()) / total
 
 
-def reason(bucket, t, song, signals, now_ts):
+def reason(p, bucket, t, song, signals):
+    """Short human explanation of a pick: its strongest weighted signal,
+    with the seed track it sounds like and whether that's recent taste."""
     if bucket == "classic":
-        days = int((now_ts - song["last"]) / 86400) if song["last"] else None
+        days = int((p.now_ts - song["last"]) / 86400) if song["last"] else None
         return f"{song['views']} plays, last {days} days ago" if days is not None else f"{song['views']} plays"
     contrib = {k: WEIGHTS[bucket][k] * v for k, v in signals.items() if k in WEIGHTS[bucket]}
     top = max(contrib, key=contrib.get) if contrib else None
-    text = SIGNAL_LABELS.get(top, "")
+    parts = p.parts(bucket, t, song)
+    recent = top in parts and RECENCY_BIAS * parts[top][0] >= (1 - RECENCY_BIAS) * parts[top][1]
+    if top == "sonic":
+        rks = [c["rk"] for c in song["copies"]]
+        seed = next((p.seed_of_now[r] for r in rks if recent and r in p.seed_of_now), None) \
+            or next((p.seed_of[r] for r in rks if r in p.seed_of), None)
+        st = p.tracks.get(seed)
+        text = (f"sounds like {st['artist']} - {st['title']}" if st else SIGNAL_LABELS["sonic"])
+        text += " (recent)" if recent else ""
+    elif top == "artist":
+        own = p.taste.artist_recent if recent else p.taste.artist_aff
+        text = ("artist you play" if own.get(t["artist_key"]) else "similar to artists you play")
+        text += " lately" if recent else ""
+    elif top in ("style", "cluster"):
+        text = SIGNAL_LABELS[top] + (" lately" if recent else "")
+    else:
+        text = SIGNAL_LABELS.get(top, "")
     if bucket == "rare":
         text = f"{song['views']} play{'s' if song['views'] != 1 else ''}; {text}"
     return text
@@ -290,7 +357,7 @@ def classify(p, song, classic_min, classic_min_days):
     return None
 
 
-def build_candidates(p, exclude_rks, blocked_songs):
+def build_candidates(p, exclude_rks, blocked_songs, bias=None):
     """{bucket: [(score, track)]} and {rk: reason}. When fewer than 2 x the
     Classics quota qualify, the Classic thresholds are relaxed step by step
     (CLASSIC_RELAX), never below the rarely-played range."""
@@ -312,7 +379,7 @@ def build_candidates(p, exclude_rks, blocked_songs):
             t = max(copies, key=lambda c: (c["pop"] or 0, c["rk"]))      # best-known copy
         else:
             t = max(copies, key=lambda c: (c["views"], c["rk"]))         # the copy you play
-        signals = p.signals(bucket, t, song)
+        signals = p.signals(bucket, t, song, bias)
         if bucket == "unheard" and not (signals.get("sonic") or signals.get("artist")
                                         or signals.get("style", 0) >= 0.3 or signals.get("cluster")):
             return            # nothing links it to your taste
@@ -323,7 +390,7 @@ def build_candidates(p, exclude_rks, blocked_songs):
             score *= 0.5
         seen.add(key)
         buckets[bucket].append((score, t))
-        reasons[t["rk"]] = reason(bucket, t, song, signals, p.now_ts)
+        reasons[t["rk"]] = reason(p, bucket, t, song, signals)
 
     played = [s["views"] for s in p.songs.values() if s["views"] > 0]
     p.classic_level = None
@@ -509,7 +576,11 @@ def run_once(state):
           f"classic >= {p.classic_level[0]} plays (not in {p.classic_level[1]:g} days); "
           f"{sum(1 for s in p.songs.values() if s['views'])} played songs")
     print("  candidates: " + ", ".join(f"{BUCKET_LABELS[b]} {len(c)}" for b, c in buckets.items()))
-    print(f"  {len(p.taste.seeds)} seeds ({len(p.taste.recent)} recent), {len(p.sonic)} sonic neighbours, "
+    top_recent = sorted(p.taste.artist_recent.items(), key=lambda x: x[1], reverse=True)[:5]
+    names = {t["artist_key"]: t["artist"] for t in tracks.values()}
+    print(f"  recency bias {RECENCY_BIAS:g} (half-life {RECENT_HALF_LIFE_DAYS:g} days); lately: "
+          + ", ".join(names.get(a, a) for a, _ in top_recent))
+    print(f"  {len(p.taste.recent)} recent + {len(p.long_seeds)} all-time seeds, {len(p.sonic)} sonic neighbours, "
           f"{len(p.multipliers)} artists re-weighted, {len(p.banned)} benched; "
           f"excluded {len(on_repeat)} On Repeat, {len(discover | discover_recent)} Discover Weekly, "
           f"{len(cooldown)} cooling down"
@@ -638,25 +709,30 @@ def backtest(days, ks=(50, 200)):
             t["last"] = last_train.get(rk, 0) or (cutoff - 365 * 86400 if t["views"] else 0)
 
     p = Profile(plex, tracks, albums, similar, train, cutoff, [], log=lambda *_: None)
-    buckets, _ = build_candidates(p, set(), set())
     played_songs = {tracks[rk]["song"] for rk in later if rk in tracks}
     print(f"Backtest: profile as of {datetime.fromtimestamp(cutoff):%Y-%m-%d}, "
-          f"{len(holdout)} qualifying plays in the last {days:g} days.")
+          f"{len(holdout)} qualifying plays in the last {days:g} days. "
+          f"RECENCY_BIAS is {RECENCY_BIAS:g}; other values for comparison.")
+    biases = sorted({0.0, 0.3, 0.6, 0.9, RECENCY_BIAS})
+    ranked = {bias: build_candidates(p, set(), set(), bias)[0] for bias in biases}
     for b in ("unheard", "rare"):
-        cands = buckets[b]
+        cands = ranked[RECENCY_BIAS][b]
         targets = {t["song"] for _, t in cands} & played_songs
         if not cands or not targets:
             print(f"  {BUCKET_LABELS[b]}: {len(cands)} candidates, {len(targets)} played since — nothing to measure.")
             continue
-        engine = [t["song"] for _, t in sorted(cands, key=lambda x: x[0], reverse=True)]
+        print(f"  {BUCKET_LABELS[b]}: {len(cands)} candidates, {len(targets)} played since.")
         popular = [t["song"] for _, t in sorted(cands, key=lambda x: (x[1]["pop"] or 0), reverse=True)]
-        parts = []
-        for k in ks:
-            rec = lambda ranked: len(set(ranked[:k]) & targets) / len(targets)  # noqa: E731
-            rand = min(1.0, k / len(cands))
-            parts.append(f"recall@{k}: engine {rec(engine):.0%}, popularity {rec(popular):.0%}, "
-                         f"random {rand:.0%}")
-        print(f"  {BUCKET_LABELS[b]}: {len(cands)} candidates, {len(targets)} played since. " + "; ".join(parts))
+
+        def row(label, order):
+            cells = [f"@{k} {len(set(order[:k]) & targets) / len(targets):4.0%}" for k in ks]
+            print(f"    {label:<22}" + "   ".join(cells))
+
+        for bias in biases:
+            order = [t["song"] for _, t in sorted(ranked[bias][b], key=lambda x: x[0], reverse=True)]
+            row(f"engine, bias {bias:g}" + (" *" if bias == RECENCY_BIAS else ""), order)
+        row("popularity only", popular)
+        print(f"    {'random':<22}" + "   ".join(f"@{k} {min(1.0, k / len(cands)):4.0%}" for k in ks))
 
 
 # --- Schedule ---------------------------------------------------------------
